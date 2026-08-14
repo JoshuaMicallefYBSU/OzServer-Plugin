@@ -1,4 +1,5 @@
 using System.ComponentModel.Composition;
+using System.Drawing;
 using System.Linq;
 using System.Windows.Forms;
 using vatsys;
@@ -43,6 +44,69 @@ public class Plugin : IPlugin
             new ToolStripMenuItem("OzServer Sectors"));
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
+
+        // Hidden until there's an incoming sector request to show. There's no plugin API for a
+        // standalone top-menu-bar button (MMI.AddCustomMenuItem only adds *into* an existing
+        // dropdown, e.g. CustomToolStripMenuItemCategory.Settings adds under Settings - there's no
+        // "Custom" dropdown of its own for CustomToolStripMenuItemCategory.Custom to land in,
+        // which is why an earlier attempt at this never actually appeared anywhere), so this is
+        // inserted directly into vatSys's own top menu strip instead - see InsertRequestNotificationItem
+        // below. _ownershipTracker.PendingRequestCountChanged (not OzServerSectorsWindow's own
+        // _requestsFromMe) drives it, so it lights up even if that window has never been opened.
+        //
+        // BackColor alone does nothing here - vatSys's own menu strip renderer ignores it entirely
+        // for top-level items (confirmed against RealLeviticus/vatsys-mumble-reconnect's
+        // MenuInjector, which hits the exact same wall for its own connection-status colour and
+        // works around it the same way below: paint the fill and text manually).
+        var requestNotificationItem = new ToolStripMenuItem { Visible = false };
+        requestNotificationItem.Click += (_, _) => OpenSectorsWindow();
+        requestNotificationItem.Paint += (sender, e) =>
+        {
+            var item = (ToolStripMenuItem)sender!;
+            var rect = new Rectangle(Point.Empty, item.Size);
+            using var brush = new SolidBrush(Color.Orange);
+            e.Graphics.FillRectangle(brush, rect);
+            TextRenderer.DrawText(e.Graphics, item.Text, item.Font, rect, Color.Black,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        };
+
+        _ownershipTracker.PendingRequestCountChanged += (_, count) =>
+        {
+            void Apply()
+            {
+                requestNotificationItem.Text = $"[{count} SECTOR REQUEST]";
+                requestNotificationItem.Visible = count > 0;
+                requestNotificationItem.Invalidate();
+            }
+
+            if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
+                mainForm.BeginInvoke((MethodInvoker)Apply);
+            else
+                Apply();
+        };
+
+        // Form.MainMenuStrip is a public, standard WinForms property (vatSys assigns it in
+        // MainForm's own designer code - this isn't a private-field reflection hack), so this reads
+        // as: find the real "Messages" header among the top menu bar's own top-level items, and
+        // insert requestNotificationItem immediately after it. Deferred the same way as the
+        // repositioning below - the menu strip may not exist the instant the plugin constructs.
+        // Relies on "Messages" still being that header's literal text; if a future vatSys build
+        // changes it, this just never finds an anchor and the button silently never appears, rather
+        // than throwing.
+        EventHandler? insertNotificationItem = null;
+        insertNotificationItem = (_, _) =>
+        {
+            if (Application.OpenForms["MainForm"] is not Form mainForm || mainForm.MainMenuStrip == null)
+                return;
+
+            var messagesItem = mainForm.MainMenuStrip.Items.OfType<ToolStripItem>().FirstOrDefault(i => i.Text == "Messages");
+            if (messagesItem == null)
+                return;
+
+            Application.Idle -= insertNotificationItem;
+            mainForm.MainMenuStrip.Items.Insert(mainForm.MainMenuStrip.Items.IndexOf(messagesItem) + 1, requestNotificationItem);
+        };
+        Application.Idle += insertNotificationItem;
 
         var settingsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,

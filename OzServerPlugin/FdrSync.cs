@@ -76,6 +76,11 @@ public class FdrSync
 
     async Task FlushAsync()
     {
+        // Leaves whatever's pending queued rather than dropping it - not connected right now just
+        // means nothing gets pushed yet, not that this update never happened.
+        if (!Network.IsConnected)
+            return;
+
         List<OzServerFdrUpdateDto> batch;
 
         lock (_lock)

@@ -61,6 +61,19 @@ public class OzServerMyRequestsDto
     [JsonProperty("from_me")] public List<OzServerSectorOwnershipRequestDto> FromMe { get; set; } = new();
 }
 
+public class OzServerAcceptBatchResultDto
+{
+    [JsonProperty("request_id")] public int RequestId { get; set; }
+    [JsonProperty("sector")] public string? Sector { get; set; }
+    [JsonProperty("accepted")] public bool Accepted { get; set; }
+    [JsonProperty("message")] public string Message { get; set; } = "";
+}
+
+public class OzServerAcceptBatchResponseDto
+{
+    [JsonProperty("results")] public List<OzServerAcceptBatchResultDto> Results { get; set; } = new();
+}
+
 public class OzServerControlledSectorOwnerDto
 {
     [JsonProperty("cid")] public int Cid { get; set; }
@@ -206,6 +219,14 @@ public class OzServerApiClient
 
     public Task AcceptRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/accept");
 
+    // SectorOwnershipController::acceptBatch - accepts several incoming requests in one call,
+    // processed sequentially server-side. Prefer this over calling AcceptRequestAsync in a loop for
+    // more than one request: firing separate accept calls back-to-back left a window where each
+    // one's own claim/refresh cascade could still be in flight when the next landed, occasionally
+    // leaving a request row undeleted even though its sector's authority had already moved on.
+    public Task<OzServerAcceptBatchResponseDto> AcceptRequestsBatchAsync(IEnumerable<int> requestIds) =>
+        PostAsync<OzServerAcceptBatchResponseDto>("/sector-requests/accept-batch", new { request_ids = requestIds.ToArray() });
+
     public Task RejectRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/reject");
 
     public Task CancelRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/cancel");
@@ -274,6 +295,12 @@ public class OzServerApiClient
     async Task<T> PostAsync<T>(string path)
     {
         var body = await PostRawAsync(path).ConfigureAwait(false);
+        return JsonConvert.DeserializeObject<T>(body) ?? throw new OzServerApiException("Empty response from OzServer.");
+    }
+
+    async Task<T> PostAsync<T>(string path, object requestBody)
+    {
+        var body = await PostRawAsync(path, requestBody).ConfigureAwait(false);
         return JsonConvert.DeserializeObject<T>(body) ?? throw new OzServerApiException("Empty response from OzServer.");
     }
 

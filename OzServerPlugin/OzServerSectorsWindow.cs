@@ -62,6 +62,7 @@ public class OzServerSectorsWindow : BaseForm
     readonly OzServerOwnershipTracker _tracker;
     readonly System.Windows.Forms.Timer _pollTimer;
     bool _ownedFirstPopulate = true;
+    bool _isCascadingCheck;
 
     readonly TableLayoutPanel _tableLayoutPanel1;
     readonly TextLabel _currentSectorsLabel;
@@ -155,6 +156,12 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView = new TreeViewEx
         {
             BorderStyle = BorderStyle.None,
+            // Lets the controller select several incoming ("Requested From Me") requests at once
+            // and accept them all in a single call - see the Accept button's own click handler and
+            // OzServerOwnershipTracker.AcceptRequestsBatchAsync. Category headers and "Requested By
+            // Me" leaves get a checkbox too (TreeView has no per-node opt-out), but nothing reacts
+            // to checking them - only a "Requested From Me" leaf's checked state is ever read.
+            CheckBoxes = true,
             DrawMode = TreeViewDrawMode.OwnerDrawText,
             HideSelection = false,
             Location = new Point(2, 2),
@@ -173,6 +180,18 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView.MouseWheel += RequestedChangesView_MouseWheel;
         _requestedChangesView.AfterSelect += SectorsView_AfterSelect;
         _requestedChangesView.AfterSelect += (_, _) => UpdateRequestActionButtons();
+        // Checking/unchecking the "Requested From Me" category header cascades to every incoming
+        // request nested under it, so a controller can select "accept everything" in one click
+        // rather than checking each request individually. _isCascadingCheck guards against this
+        // itself re-entering AfterCheck once per child it sets (TreeView raises AfterCheck for a
+        // programmatic Checked assignment exactly the same as a real click).
+        _requestedChangesView.AfterCheck += (_, e) =>
+        {
+            if (!_isCascadingCheck && e.Node?.Name == RequestedFromMeName && ReferenceEquals(e.Node.Tag, CategoryTag))
+                CascadeCheckToChildren(e.Node);
+
+            UpdateRequestActionButtons();
+        };
         _requestedChangesView.AfterCollapse += RequestedChangesView_AfterExpandCollapse;
         _requestedChangesView.AfterExpand += RequestedChangesView_AfterExpandCollapse;
 
@@ -300,10 +319,17 @@ public class OzServerSectorsWindow : BaseForm
         _requestedListRow.Controls.Add(_requestedScrollBar);
 
         _acceptButton = CreateRequestActionButton("Accept");
+        // Checked "Requested From Me" leaves take priority over the plain single selection - a
+        // controller who never bothered checking anything (the common case: accept just the one
+        // thing they clicked) still gets that single request accepted.
         _acceptButton.Click += async (_, _) =>
         {
-            if (_requestedChangesView.SelectedNode?.Tag is SectorChangeRequest request)
-                await AcceptRequestAsync(request);
+            var requests = GetCheckedFromMeRequests();
+            if (requests.Count == 0 && _requestedChangesView.SelectedNode?.Tag is SectorChangeRequest selected)
+                requests.Add(selected);
+
+            if (requests.Count > 0)
+                await AcceptRequestsAsync(requests);
         };
 
         _rejectButton = CreateRequestActionButton("Reject");
@@ -509,7 +535,7 @@ public class OzServerSectorsWindow : BaseForm
         // Owned itself doesn't need polling any more - the tracker keeps it current on its own,
         // independent of this window - but a nudge here still catches up faster than waiting on
         // whatever last triggered the tracker's own refresh.
-        _pollTimer = new System.Windows.Forms.Timer { Interval = 30000 };
+        _pollTimer = new System.Windows.Forms.Timer { Interval = 10000 };
         _pollTimer.Tick += (_, _) =>
         {
             _ = _tracker.RefreshFromServerAsync();
@@ -717,6 +743,9 @@ public class OzServerSectorsWindow : BaseForm
     sealed class TreeViewState
     {
         public readonly HashSet<string> ExpandedKeys = new();
+        // Only ever populated/consulted for _requestedChangesView (the only tree with CheckBoxes
+        // on), but harmless to carry for the others too - always empty there.
+        public readonly HashSet<string> CheckedKeys = new();
         public string? SelectedKey;
         public int ScrollValue;
     }
@@ -724,27 +753,31 @@ public class OzServerSectorsWindow : BaseForm
     static TreeViewState CaptureTreeState(TreeViewEx view, ScrollBar scrollBar)
     {
         var state = new TreeViewState { ScrollValue = scrollBar.Value };
-        CaptureExpanded(view.Nodes, state.ExpandedKeys);
+        CaptureExpandedAndChecked(view.Nodes, state.ExpandedKeys, state.CheckedKeys);
         state.SelectedKey = view.SelectedNode == null ? null : NodeKey(view.SelectedNode);
         return state;
     }
 
-    static void CaptureExpanded(TreeNodeCollection nodes, HashSet<string> into)
+    static void CaptureExpandedAndChecked(TreeNodeCollection nodes, HashSet<string> expandedInto, HashSet<string> checkedInto)
     {
         foreach (TreeNode node in nodes)
         {
-            if (node.IsExpanded)
+            var key = NodeKey(node);
+            if (key != null)
             {
-                var key = NodeKey(node);
-                if (key != null)
-                    into.Add(key);
+                if (node.IsExpanded)
+                    expandedInto.Add(key);
+                if (node.Checked)
+                    checkedInto.Add(key);
             }
-            CaptureExpanded(node.Nodes, into);
+            CaptureExpandedAndChecked(node.Nodes, expandedInto, checkedInto);
         }
     }
 
-    // Re-expands whatever was open before the rebuild and re-selects the same logical item if it
-    // still exists post-refresh. Must run inside the caller's BeginUpdate/EndUpdate.
+    // Re-expands whatever was open before the rebuild, re-checks whatever was checked, and
+    // re-selects the same logical item if it still exists post-refresh - so a poll tick (every 10s
+    // now) can't silently discard a controller's in-progress multi-select. Must run inside the
+    // caller's BeginUpdate/EndUpdate.
     static void RestoreExpandedAndSelection(TreeViewEx view, TreeViewState state)
     {
         TreeNode? selected = null;
@@ -761,6 +794,8 @@ public class OzServerSectorsWindow : BaseForm
                         node.Expand();
                         RefreshDropdownNodeText(node);
                     }
+                    if (state.CheckedKeys.Contains(key))
+                        node.Checked = true;
                     if (key == state.SelectedKey)
                         selected = node;
                 }
@@ -1008,6 +1043,9 @@ public class OzServerSectorsWindow : BaseForm
     // own tree-building does.
     async Task PopulateControlledListAsync()
     {
+        if (!Network.IsConnected)
+            return;
+
         List<OzServerControlledSectorDto> controlled;
         try
         {
@@ -1258,6 +1296,9 @@ public class OzServerSectorsWindow : BaseForm
     // response's own shape.
     async Task RefreshRequestedChangesAsync()
     {
+        if (!Network.IsConnected)
+            return;
+
         try
         {
             var response = await _api.GetMyRequestsAsync();
@@ -1317,10 +1358,52 @@ public class OzServerSectorsWindow : BaseForm
         }
 
         foreach (var request in requests)
+            parent.Nodes.Add(BuildRequestNode(request));
+    }
+
+    // Mirrors BuildOwnedSectorNode's own nesting - a request against a primary sector that bundles
+    // its own sub-sectors (e.g. WOL) shows them nested underneath, same as Owned/Available already
+    // do, rather than as one flat line. Only the node this returns carries Tag = request - that's
+    // what GetCheckedFromMeRequests/UpdateRequestActionButtons/CascadeCheckToChildren key off of -
+    // every nested descendant is purely informational (see BuildRequestDescendantNode).
+    TreeNode BuildRequestNode(SectorChangeRequest request)
+    {
+        var text = $"{request.Sector.Name} - {request.Sector.FullName} ({request.Controller})";
+        var node = new TreeNode { Tag = request, NodeFont = _requestedChangesView.Font };
+
+        if (request.Sector.SubSectors.Count > 0)
         {
-            var text = $"{request.Sector.Name} - {request.Sector.FullName} ({request.Controller})";
-            parent.Nodes.Add(new TreeNode(text) { Tag = request, ToolTipText = text, NodeFont = _requestedChangesView.Font });
+            foreach (var child in SectorsVolumes.SectorGroupings[request.Sector])
+            {
+                node.Nodes.Add(ReferenceEquals(child, request.Sector)
+                    ? new TreeNode(FormatSectorText(child)) { NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
+                    : BuildRequestDescendantNode(child));
+            }
         }
+
+        ApplySectorNodeText(node, text);
+        return node;
+    }
+
+    // Same recursion (and same self-reference/depth guard) as BuildOwnedSectorNode, but never
+    // carries a Tag - these exist purely to show what a primary's request also covers, not as
+    // their own checkable/actionable request rows.
+    TreeNode BuildRequestDescendantNode(SectorsVolumes.Sector sector, int depth = 0)
+    {
+        var node = new TreeNode { NodeFont = _requestedChangesView.Font };
+
+        if (sector.SubSectors.Count > 0 && depth < 8)
+        {
+            foreach (var child in SectorsVolumes.SectorGroupings[sector])
+            {
+                node.Nodes.Add(ReferenceEquals(child, sector)
+                    ? new TreeNode(FormatSectorText(child)) { NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
+                    : BuildRequestDescendantNode(child, depth + 1));
+            }
+        }
+
+        ApplySectorNodeText(node, FormatSectorText(sector));
+        return node;
     }
 
     void UpdateRequestActionButtons()
@@ -1329,20 +1412,72 @@ public class OzServerSectorsWindow : BaseForm
         var isByMe = selectedNode?.Tag is SectorChangeRequest && selectedNode.Parent?.Name == RequestedByMeName;
         var isFromMe = selectedNode?.Tag is SectorChangeRequest && selectedNode.Parent?.Name == RequestedFromMeName;
 
-        _acceptButton.Enabled = isFromMe;
+        _acceptButton.Enabled = isFromMe || GetCheckedFromMeRequests().Count > 0;
         _rejectButton.Enabled = isFromMe;
         _cancelRequestButton.Enabled = isByMe;
     }
 
-    async Task AcceptRequestAsync(SectorChangeRequest request)
+    void CascadeCheckToChildren(TreeNode categoryNode)
+    {
+        _isCascadingCheck = true;
+        try
+        {
+            foreach (TreeNode child in categoryNode.Nodes)
+            {
+                if (child.Tag is SectorChangeRequest)
+                    child.Checked = categoryNode.Checked;
+            }
+        }
+        finally
+        {
+            _isCascadingCheck = false;
+        }
+    }
+
+    // Every checked "Requested From Me" leaf - what the Accept button acts on when anything's
+    // checked. Category headers and "Requested By Me" leaves can end up checked too (TreeView's
+    // CheckBoxes applies to every node, no per-node opt-out), but only this specific subset is ever
+    // read - checking anything else is inert.
+    List<SectorChangeRequest> GetCheckedFromMeRequests()
+    {
+        var result = new List<SectorChangeRequest>();
+
+        void Walk(TreeNodeCollection nodes)
+        {
+            foreach (TreeNode node in nodes)
+            {
+                if (node.Checked && node.Tag is SectorChangeRequest request && node.Parent?.Name == RequestedFromMeName)
+                    result.Add(request);
+
+                Walk(node.Nodes);
+            }
+        }
+
+        Walk(_requestedChangesView.Nodes);
+        return result;
+    }
+
+    // Accepts one or several incoming requests as a single batch (see
+    // OzServerOwnershipTracker.AcceptRequestsBatchAsync) rather than one call per request - firing
+    // separate accepts back-to-back for a multi-select could leave a request row behind even though
+    // its sector's authority had already moved on, since each one's own claim/refresh cascade could
+    // still be in flight when the next one landed.
+    async Task AcceptRequestsAsync(List<SectorChangeRequest> requests)
     {
         SetRequestButtonsEnabled(false);
         try
         {
             // Accepting means ownership just transferred away from me - the tracker re-derives
             // Owned from the server rather than this window guessing locally what happened.
-            await _tracker.AcceptRequestAsync(request.Id);
+            var results = await _tracker.AcceptRequestsBatchAsync(requests.Select(r => r.Id));
             UpdateArrowButton();
+
+            var failed = results.Where(r => !r.Accepted).ToList();
+            if (failed.Count > 0)
+            {
+                var summary = string.Join("; ", failed.Select(f => $"{f.Sector ?? $"#{f.RequestId}"}: {f.Message}"));
+                Errors.Add(new Exception($"Couldn't accept: {summary}"), "OzServer");
+            }
 
             await RefreshRequestedChangesAsync();
         }
@@ -1355,6 +1490,9 @@ public class OzServerSectorsWindow : BaseForm
 
     async Task RejectRequestAsync(SectorChangeRequest request)
     {
+        if (!Network.IsConnected)
+            return;
+
         SetRequestButtonsEnabled(false);
         try
         {
@@ -1370,6 +1508,9 @@ public class OzServerSectorsWindow : BaseForm
 
     async Task CancelRequestAsync(SectorChangeRequest request)
     {
+        if (!Network.IsConnected)
+            return;
+
         SetRequestButtonsEnabled(false);
         try
         {

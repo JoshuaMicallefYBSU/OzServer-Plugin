@@ -20,6 +20,9 @@ public static class ControllerInfoUpdater
     // a controller working e.g. a TWR or GND position isn't the one this line is meant for.
     public static void Update()
     {
+        if (!Network.IsConnected)
+            return;
+
         var callsign = Network.Me.Callsign;
         if (string.IsNullOrEmpty(callsign))
             return;
