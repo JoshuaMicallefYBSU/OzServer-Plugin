@@ -1,3 +1,4 @@
 .csproj
 .reference-plugin
 .vs
+OzServerPlugin/Secrets.cs

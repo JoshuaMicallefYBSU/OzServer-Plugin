@@ -1,0 +1,10 @@
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.csproj.AssemblyReference.cache
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.GeneratedMSBuildEditorConfig.editorconfig
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.AssemblyInfoInputs.cache
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.AssemblyInfo.cs
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.csproj.CoreCompileInputs.cache
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.sourcelink.json
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\bin\Debug\net472\OzServerPlugin.dll
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\bin\Debug\net472\OzServerPlugin.pdb
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.dll
+C:\xampp\htdocs\OzServer-Plugin\OzServerPlugin\obj\Debug\net472\OzServerPlugin.pdb

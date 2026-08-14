@@ -1,0 +1,60 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net472</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <LangVersion>latest</LangVersion>
+        <!-- vatSys.exe itself is built x86; match it so the plugin loads into the same process without an architecture mismatch. -->
+        <PlatformTarget>x86</PlatformTarget>
+
+        <AssemblyName>OzServerPlugin</AssemblyName>
+        <RootNamespace>OzServerPlugin</RootNamespace>
+        <Version>0.1.0</Version>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <VatSysPath Condition="'$(VatSysPath)' == ''">$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path)</VatSysPath>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!--
+          Reference the installed vatSys.exe so the plugin compiles against the
+          real vatsys/vatsys.Plugin types (BaseForm, Colours, MMI, IPlugin, etc).
+          Private=False is required: vatSys.exe must NOT be copied into the
+          plugin's output folder. If a second copy of vatSys.exe ships alongside
+          the plugin DLL, MEF composition inside the running vatSys process will
+          see two distinct IPlugin types (one per loaded copy of the assembly)
+          and silently fail to load the plugin.
+        -->
+        <Reference Include="vatSys">
+            <HintPath>$(VatSysPath)\bin\vatSys.exe</HintPath>
+            <Private>False</Private>
+        </Reference>
+        <!--
+          Same reasoning as vatSys.exe above: reference vatSys's own copy of the
+          control library (TreeViewEx, GenericButton, VATSYSControls.ScrollBar, ...)
+          rather than bundling one, so the Sectors window is built from the exact
+          same control types the real vatSys windows use.
+        -->
+        <Reference Include="VATSYSControls">
+            <HintPath>$(VatSysPath)\bin\VATSYSControls.dll</HintPath>
+            <Private>False</Private>
+        </Reference>
+        <!--
+          Reference the copy of Newtonsoft.Json vatSys itself already ships and loads
+          (vatSys\bin\Newtonsoft.Json.dll), rather than bundling our own via NuGet.
+          Private=False keeps our plugin from shipping a second, possibly different-version
+          copy that could conflict with the one already resident in the process.
+        -->
+        <Reference Include="Newtonsoft.Json">
+            <HintPath>$(VatSysPath)\bin\Newtonsoft.Json.dll</HintPath>
+            <Private>False</Private>
+        </Reference>
+        <Reference Include="System.ComponentModel.Composition" />
+        <Reference Include="System.Drawing" />
+        <Reference Include="System.Net.Http" />
+        <Reference Include="System.Windows.Forms" />
+    </ItemGroup>
+
+</Project>
