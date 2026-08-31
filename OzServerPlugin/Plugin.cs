@@ -1,6 +1,5 @@
 using System;
 using System.ComponentModel.Composition;
-using System.Drawing;
 using System.Linq;
 using System.Windows.Forms;
 using vatsys;
@@ -44,10 +43,8 @@ public class Plugin : IPlugin
     // can happen long before the Sectors window is ever opened.
     readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
 
-    // Incoming requests waiting on this controller, and the flash state driving the menu trail.
+    // Incoming requests waiting on this controller, driving the Settings header's flash.
     int _pendingRequests;
-    bool _requestFlashOn;
-    readonly System.Windows.Forms.Timer _requestFlashTimer = new() { Interval = 500 };
     ToolStripMenuItem? _settingsMenuHeader;
     ToolStripItem? _ozServerSectorsItem;
 
@@ -56,8 +53,10 @@ public class Plugin : IPlugin
         _ownershipTracker = new OzServerOwnershipTracker();
         _afvSectorClaimer = new AfvSectorClaimer();
         _fdrSync = new FdrSync();
-        // After the tracker, which it reads live subsector ownership through.
-        _tagOwnershipSync = new TagOwnershipSync(_ownershipTracker);
+        // After the tracker, which it reads live subsector ownership through, and after FdrSync,
+        // which it calls into to clear OzServer's own record of who holds a tag the moment this
+        // controller drops it to none (see TagOwnershipSync.OnFdrsChanged).
+        _tagOwnershipSync = new TagOwnershipSync(_ownershipTracker, _fdrSync);
         _atisSync = new AtisSync();
         _badVectorsAtisSync = new BadVectorsAtisSync();
         // After the tracker, which it releases through.
@@ -71,20 +70,23 @@ public class Plugin : IPlugin
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
 
-        // An incoming request flashes its way inward, one level at a time, so it is visible from
-        // wherever the controller happens to be looking without anything covering the radar:
+        // An incoming request is surfaced the same way vatSys's own "Messages" menu surfaces an
+        // unread one: the Settings header flashes (a solid colour flip, on vatSys's own menu-bar
+        // flash timer - see MenuRenderer.FlashTimer_Tick/PaintBackground) until Settings is opened,
+        // and OzServer Sectors carries a steady "[N]" badge underneath it until the request is
+        // actually dealt with - the same two-tier presentation Messages gives its own top-level
+        // flash plus each unread recipient's badge. The window's own title bar flashes too
+        // (BaseForm.FlashTitleBar, as the ATIS window does) for when it is already open but not
+        // focused. The Requested From Me heading itself is handled inside the window.
         //
-        //   Settings (menu bar)  ->  OzServer Sectors (inside Settings)  ->  Requested From Me
-        //
-        // Each level shows only while the level outside it is already open, which is what makes it
-        // a trail to follow rather than three things blinking at once. The window's own title bar
-        // flashes too (BaseForm.FlashTitleBar, as the ATIS window does) for when it is already open
-        // but not focused. The Requested From Me heading itself is handled inside the window.
-        //
-        // Replaces a popup, and before that a custom-painted menu-bar indicator. The popup also had
-        // a duplication bug: this event is raised from a poll, and two overlapping polls could both
-        // observe the old request set and both fire. Flashing is idempotent, so that class of
-        // problem does not arise.
+        // This used to paint its own ForeColor on a private timer, which never actually rendered:
+        // mainMenu's Renderer is vatSys's own MenuRenderer, and both
+        // OnRenderMenuItemBackground/OnRenderItemText recompute every item's colour from scratch
+        // (by Name, CheckState and whether a child carries a Tag) rather than ever reading the
+        // item's own ForeColor/BackColor - so setting it here was a no-op the whole time. Checked
+        // and Tag are the two properties that renderer actually looks at, so those are what this
+        // drives now, and vatSys's own already-running flash timer repaints them - no timer of our
+        // own needed any more.
         _ownershipTracker.IncomingRequestsChanged += (_, requests) =>
         {
             void Apply()
@@ -102,15 +104,6 @@ public class Plugin : IPlugin
             else
                 Apply();
         };
-
-        // Repaint on a timer, which is how the flash actually happens - a ToolStripItem only shows a
-        // colour change when it is asked to redraw.
-        _requestFlashTimer.Tick += (_, _) =>
-        {
-            _requestFlashOn = _pendingRequests > 0 && !_requestFlashOn;
-            RefreshRequestFlash();
-        };
-        _requestFlashTimer.Start();
 
         var settingsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
@@ -154,6 +147,12 @@ public class Plugin : IPlugin
             _settingsMenuHeader = settingsMenu;
             _ozServerSectorsItem = sectorsMenuItem.Item;
 
+            // Opening Settings is "clicked" for the header's own flash, exactly like vatSys's real
+            // Messages header stopping on its Click/MouseUp (see MainForm's
+            // messagesToolStripMenuItem_Click/_MouseUp) rather than waiting for the request itself
+            // to be dealt with - the OzServer Sectors badge underneath keeps showing until then.
+            settingsMenu.DropDownOpened += (_, _) => settingsMenu.Checked = false;
+
             // OzServer Sectors replaces the built-in Sectors window rather than sitting beside it:
             // both write MMI.SectorsControlled, but only this plugin's window also tells OzServer,
             // so a claim made through the built-in one is invisible to every other controller until
@@ -169,37 +168,31 @@ public class Plugin : IPlugin
         Application.Idle += repositionUnderSectors;
     }
 
-    // Paints the current step of the trail. Only one level is lit at a time: the Settings header
-    // until Settings is open, then the OzServer Sectors entry inside it. Colour comes from the
-    // profile's WindowWarning identity - the same "needs attention" role used for staged rows.
+    // Drives the two properties MenuRenderer itself actually keys its painting off - see the
+    // IncomingRequestsChanged comment above for why ForeColor/BackColor never worked here.
     void RefreshRequestFlash()
     {
-        var lit = _pendingRequests > 0 && _requestFlashOn;
-        var settingsOpen = _settingsMenuHeader?.DropDown is { Visible: true };
+        var pending = _pendingRequests > 0;
 
-        if (_settingsMenuHeader != null)
-        {
-            _settingsMenuHeader.ForeColor = lit && !settingsOpen
-                ? Colours.GetColour(Colours.Identities.WindowWarning)
-                : Color.Empty;
-        }
-
+        // A positive int Tag is what MenuRenderer.OnRenderItemText renders as a coloured "[N]"
+        // badge (via ShortcutKeyDisplayString - see its own comment) - the same steady per-item
+        // indicator vatSys gives an unread entry under Messages. It also satisfies the *other*
+        // thing that Tag drives: MenuRenderer only flashes an item whose DropDownItems contain a
+        // child with a non-null Tag (see its background/text colour checks), which is what makes
+        // Checked below actually flash the Settings header rather than silently doing nothing.
         if (_ozServerSectorsItem != null)
-        {
-            _ozServerSectorsItem.ForeColor = lit && settingsOpen
-                ? Colours.GetColour(Colours.Identities.WindowWarning)
-                : Color.Empty;
-        }
-    }
+            _ozServerSectorsItem.Tag = pending ? _pendingRequests : null;
 
-    // Black or white, whichever actually reads against the given fill. The indicator's background
-    // now comes from the profile (see the Paint handler above), and a profile is free to define
-    // WindowWarning as something dark - fixing the text at black would make the whole indicator
-    // unreadable in that case. ITU-R BT.601 luma, the usual weighting for this.
-    static Color ContrastingTextColour(Color background) =>
-        (0.299 * background.R + 0.587 * background.G + 0.114 * background.B) > 140
-            ? Color.Black
-            : Color.White;
+        // Checked is the flag MenuRenderer's own already-running flash timer keys off (see its
+        // "windowsToolStripMenuItem"/"messagesToolStripMenuItem"/hasTaggedChild check) - sets it
+        // true whenever something is pending, false the moment nothing is (mirroring
+        // messagesToolStripMenuItem.Checked being cleared once ChatWindow_Opened finds no
+        // recipient left Indeterminate). Opening Settings (see DropDownOpened above) can also
+        // clear it earlier, before the request itself is gone - exactly like Messages stopping its
+        // own flash on Click without waiting for every unread entry to be read.
+        if (_settingsMenuHeader != null)
+            _settingsMenuHeader.Checked = pending;
+    }
 
     void OpenSectorsWindow()
     {

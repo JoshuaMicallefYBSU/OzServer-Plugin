@@ -97,6 +97,28 @@ public class FdrSync
     // see the class comment.
     static bool ShouldPush(FDP2.FDR fdr) => fdr.IsTrackedByMe && fdr.ESTed;
 
+    // Called by TagOwnershipSync when this controller drops a tag to none. ShouldPush's "the moment
+    // IsTrackedByMe goes false, nothing more is pushed for that flight" (see the class comment)
+    // otherwise leaves OzServer's own record of who holds it exactly as it was the instant before
+    // the drop - stale, and actively misleading, since nobody is pushing anything to correct it
+    // until (if ever) some controller picks the flight back up, or the 10-minute idle drop mentioned
+    // in the class comment eventually clears the row. This pushes the correction immediately instead
+    // of waiting on either.
+    //
+    // Goes through the same batched _pending/flush path as every other update rather than firing its
+    // own request - one more field changing for a flight already due to go out on the next tick is
+    // exactly what merging into _pending is for. ControllingCid/ControllingCallsign are the two
+    // fields marked NullValueHandling.Include on OzServerFdrUpdateDto specifically so a deliberate
+    // null like this one actually reaches the server instead of being skipped like every other unset
+    // field - see CopyNonNull's own comment.
+    public void ClearControllingAuthority(string callsign)
+    {
+        if (string.IsNullOrEmpty(callsign))
+            return;
+
+        Merge(new OzServerFdrUpdateDto { Callsign = callsign, ControllingCid = null, ControllingCallsign = null });
+    }
+
     void Merge(OzServerFdrUpdateDto dto)
     {
         lock (_lock)
