@@ -127,10 +127,6 @@ public class OzServerSectorsWindow : BaseForm
     // menus down with it, so there must be nothing here that ever gets disposed.
     readonly ContextMenuStrip _nodeMenu = VatSysContextMenu.Create();
 
-    // Initialised at the end of the constructor, once the designer sizes are in place.
-    readonly ListViewport _availViewport = new();
-    readonly ListViewport _currViewport = new();
-    readonly ListViewport _requestedViewport = new();
 
     readonly TableLayoutPanel _tableLayoutPanel1;
     readonly TextLabel _currentSectorsLabel;
@@ -552,24 +548,6 @@ public class OzServerSectorsWindow : BaseForm
             _ = RefreshControlledSnapshotAsync();
         };
 
-        // Captured from the designer values before LayoutViewport ever resizes a tree: from here on
-        // the tree's own Height tracks its content, so it can no longer tell us how tall the visible
-        // window is.
-        _availViewport.View = _availSectorsView;
-        _availViewport.Bar = _availScrollBar;
-        _availViewport.Height = _availSectorsView.Height;
-        _availViewport.RestingTop = _availSectorsView.Top;
-
-        _currViewport.View = _currSectorsView;
-        _currViewport.Bar = _currScrollBar;
-        _currViewport.Height = _currSectorsView.Height;
-        _currViewport.RestingTop = _currSectorsView.Top;
-
-        _requestedViewport.View = _requestedChangesView;
-        _requestedViewport.Bar = _requestedScrollBar;
-        _requestedViewport.Height = _requestedChangesView.Height;
-        _requestedViewport.RestingTop = _requestedChangesView.Top;
-
         ConfigureCurrScrollbar();
         ConfigureAvailScrollbar();
         ConfigureRequestedScrollbar();
@@ -677,14 +655,10 @@ public class OzServerSectorsWindow : BaseForm
 
     void CurrSectorsView_MouseWheel(object? sender, MouseEventArgs e)
     {
-        if (e.Delta == 0)
-            return;
-
-        // Assigned through the guard so the bar's own Scroll handler doesn't re-enter; the clamp
-        // and the tree move both happen in LayoutViewport.
-        var step = _currSectorsView.ItemHeight * (e.Delta > 0 ? -1 : 1);
-        SetScrollBarValue(_currScrollBar, _currScrollBar.Value + step);
-        LayoutViewport(ViewportFor(_currSectorsView));
+        if (e.Delta > 0)
+            _currScrollBar.Value -= _currSectorsView.ItemHeight;
+        else if (e.Delta < 0)
+            _currScrollBar.Value += _currSectorsView.ItemHeight;
     }
 
     void CurrSectorsView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
@@ -719,26 +693,18 @@ public class OzServerSectorsWindow : BaseForm
 
     void AvailSectorsView_MouseWheel(object? sender, MouseEventArgs e)
     {
-        if (e.Delta == 0)
-            return;
-
-        // Assigned through the guard so the bar's own Scroll handler doesn't re-enter; the clamp
-        // and the tree move both happen in LayoutViewport.
-        var step = _availSectorsView.ItemHeight * (e.Delta > 0 ? -1 : 1);
-        SetScrollBarValue(_availScrollBar, _availScrollBar.Value + step);
-        LayoutViewport(ViewportFor(_availSectorsView));
+        if (e.Delta > 0)
+            _availScrollBar.Value -= _availSectorsView.ItemHeight;
+        else if (e.Delta < 0)
+            _availScrollBar.Value += _availSectorsView.ItemHeight;
     }
 
     void RequestedChangesView_MouseWheel(object? sender, MouseEventArgs e)
     {
-        if (e.Delta == 0)
-            return;
-
-        // Assigned through the guard so the bar's own Scroll handler doesn't re-enter; the clamp
-        // and the tree move both happen in LayoutViewport.
-        var step = _requestedChangesView.ItemHeight * (e.Delta > 0 ? -1 : 1);
-        SetScrollBarValue(_requestedScrollBar, _requestedScrollBar.Value + step);
-        LayoutViewport(ViewportFor(_requestedChangesView));
+        if (e.Delta > 0)
+            _requestedScrollBar.Value -= _requestedChangesView.ItemHeight;
+        else if (e.Delta < 0)
+            _requestedScrollBar.Value += _requestedChangesView.ItemHeight;
     }
 
     void RequestedChangesView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
@@ -1077,28 +1043,6 @@ public class OzServerSectorsWindow : BaseForm
     static string ChildKey(string parentKey, TreeNode node) =>
         parentKey.Length == 0 ? NodeSegment(node) : parentKey + "" + NodeSegment(node);
 
-    // One list's visible window onto its tree.
-    //
-    // The tree is sized to hold *every* visible row and scrolled by moving it inside its clipping
-    // InsetPanel, rather than by letting the native control scroll itself. That is not a style
-    // choice: TreeViewEx.WndProc intercepts WM_NCCALCSIZE and, whenever the native tree has added
-    // WS_VSCROLL or WS_HSCROLL, calls SetWindowLong to strip the style straight back off (it hides
-    // the native bar in favour of vatSys's own ScrollBar control). Changing a window's style from
-    // inside a frame calculation forces the frame to be recalculated again, so every expand - which
-    // is exactly when content height crosses the control height - cost a full non-client and client
-    // repaint. That was the flicker, and it is unreachable from managed code as long as the tree
-    // scrolls natively. A tree that always fits its own content never asks for a scrollbar, so the
-    // strip never runs.
-    sealed class ListViewport
-    {
-        public TreeViewEx View = null!;
-        public ScrollBar Bar = null!;
-        // Height of the visible window, and the tree's resting position inside the panel - both
-        // captured from the designer values before anything resizes the tree.
-        public int Height;
-        public int RestingTop;
-    }
-
     sealed class TreeViewState
     {
         public readonly HashSet<string> ExpandedKeys = new();
@@ -1173,14 +1117,27 @@ public class OzServerSectorsWindow : BaseForm
     // ActualHeight reflect the new node structure before the old offset is reapplied to it.
     void RestoreScroll(TreeViewEx view, ScrollBar scrollBar, TreeViewState state)
     {
+        var itemHeight = Math.Max(view.ItemHeight, 1);
+        // Guarded so the bar's own Scroll handler doesn't also push this position into the tree -
+        // the next line does that itself, and letting both run scrolled it twice.
         SetScrollBarValue(scrollBar, state.ScrollValue);
-        LayoutViewport(ViewportFor(view));
+        view.SetScrollPosVert((state.ScrollValue + itemHeight - 1) / itemHeight);
     }
 
-    // The bar raises Scroll for a value assigned from code exactly as it does for a drag, and its
-    // handler re-lays the viewport - so syncing the bar would otherwise recurse. The flag makes the
-    // assignment one-directional: bar follows content here, content follows bar only for real user
-    // scrolling.
+    // Maps the tree's current row offset back to a scrollbar value, the inverse of RestoreScroll's
+    // value-to-row conversion: pos*h - h + 1 is the smallest value that rounds back to the same row.
+    // Clamped at zero, which the raw expression is not - at row 0 it evaluates to 1 - ItemHeight.
+    void SyncScrollValue(TreeViewEx view, ScrollBar scrollBar)
+    {
+        var itemHeight = Math.Max(view.ItemHeight, 1);
+        var value = Math.Max(0, view.GetScrollPos().Y * itemHeight - itemHeight + 1);
+        if (scrollBar.Value != value)
+            SetScrollBarValue(scrollBar, value);
+    }
+
+    // The bar raises Scroll for a value assigned from code exactly as it does for a drag, and that
+    // handler scrolls the tree - so syncing the bar after an expand would scroll it a second time.
+    // One-directional: bar follows tree here, tree follows bar only for real user scrolling.
     void SetScrollBarValue(ScrollBar scrollBar, int value)
     {
         _syncingScrollBar = true;
@@ -1194,40 +1151,23 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
-    ListViewport ViewportFor(TreeViewEx view) =>
-        ReferenceEquals(view, _currSectorsView) ? _currViewport
-        : ReferenceEquals(view, _availSectorsView) ? _availViewport
-        : _requestedViewport;
-
-    void SyncScrollbarFor(TreeViewEx view) => LayoutViewport(ViewportFor(view));
-
-    // Sizes the tree to its content, points the scrollbar at that content, and positions the tree so
-    // the requested offset is the row showing at the top of the panel. Everything that changes what
-    // is on screen - a rebuild, an expand, a collapse, a scroll, a wheel tick - ends here.
-    void LayoutViewport(ListViewport viewport)
+    void SyncScrollbarFor(TreeViewEx view)
     {
-        if (viewport.View == null || viewport.Height <= 0)
-            return;
-
-        var content = Math.Max(VisibleContentHeight(viewport.View), viewport.Height);
-        if (viewport.View.Height != content)
-            viewport.View.Height = content;
-
-        viewport.Bar.PreferredHeight = content;
-        viewport.Bar.ActualHeight = viewport.Height;
-        viewport.Bar.Change = Math.Max(viewport.View.ItemHeight, 1);
-
-        // Clamped rather than trusted: a collapse can shrink the content underneath an offset that
-        // was valid a moment ago, and scrolling past the end leaves a blank panel.
-        var maxOffset = Math.Max(0, content - viewport.Height);
-        var offset = Math.Min(Math.Max(viewport.Bar.Value, 0), maxOffset);
-
-        if (viewport.Bar.Value != offset)
-            SetScrollBarValue(viewport.Bar, offset);
-
-        var top = viewport.RestingTop - offset;
-        if (viewport.View.Top != top)
-            viewport.View.Top = top;
+        if (ReferenceEquals(view, _currSectorsView))
+        {
+            ConfigureCurrScrollbar();
+            SyncScrollValue(_currSectorsView, _currScrollBar);
+        }
+        else if (ReferenceEquals(view, _availSectorsView))
+        {
+            ConfigureAvailScrollbar();
+            SyncScrollValue(_availSectorsView, _availScrollBar);
+        }
+        else
+        {
+            ConfigureRequestedScrollbar();
+            SyncScrollValue(_requestedChangesView, _requestedScrollBar);
+        }
     }
 
     // What TreeViewEx.GetPreferredHeight() computes, without the cost of computing it.
@@ -1237,7 +1177,7 @@ public class OzServerSectorsWindow : BaseForm
     // Bounds is not a managed value: it round-trips to the native control (TVM_GETITEMRECT) per
     // node, and returns an empty rectangle for anything not currently visible. So the result is
     // simply the visible rows' combined height, arrived at via one SendMessage for every node in
-    // the dataset - several hundred of them here, on every expand and every rebuild.
+    // the dataset - several hundred of them, on every expand and every rebuild.
     //
     // Same answer, walked in managed code, and only descending into branches that are actually
     // open - a collapsed tree costs a handful of checks instead of hundreds of messages.
@@ -1257,32 +1197,55 @@ public class OzServerSectorsWindow : BaseForm
         return count;
     }
 
-    // The three Configure*Scrollbar entry points now all mean the same thing - re-lay that list's
-    // viewport - and are kept only because they are called from a dozen places each.
-    void ConfigureCurrScrollbar() => LayoutViewport(_currViewport);
+    // The tree's own Height is never touched. An earlier version sized each tree to its full content
+    // and scrolled it by moving it inside its panel, to dodge the repaint TreeViewEx causes when it
+    // strips WS_VSCROLL during WM_NCCALCSIZE. That resizing re-entered the same handler: changing a
+    // window's style from inside a frame calculation makes Windows send another WM_NCCALCSIZE, and
+    // it recursed until the stack was gone - an uncatchable 0xC00000FD inside comctl32 that took
+    // vatSys down the moment the window opened. The flicker it was chasing is cosmetic; this is not.
+    void ConfigureCurrScrollbar()
+    {
+        _currScrollBar.PreferredHeight = VisibleContentHeight(_currSectorsView);
+        _currScrollBar.ActualHeight = _currSectorsView.Height;
+        _currScrollBar.Change = Math.Max(_currSectorsView.ItemHeight, 1);
+    }
 
-    void ConfigureAvailScrollbar() => LayoutViewport(_availViewport);
+    void ConfigureAvailScrollbar()
+    {
+        _availScrollBar.PreferredHeight = VisibleContentHeight(_availSectorsView);
+        _availScrollBar.ActualHeight = _availSectorsView.Height;
+        _availScrollBar.Change = Math.Max(_availSectorsView.ItemHeight, 1);
+    }
 
-    void ConfigureRequestedScrollbar() => LayoutViewport(_requestedViewport);
+    void ConfigureRequestedScrollbar()
+    {
+        _requestedScrollBar.PreferredHeight = VisibleContentHeight(_requestedChangesView);
+        _requestedScrollBar.ActualHeight = _requestedChangesView.Height;
+        _requestedScrollBar.Change = Math.Max(_requestedChangesView.ItemHeight, 1);
+    }
 
-    // A real user drag or click on the bar. LayoutViewport reads Bar.Value and moves the tree to
-    // match, so there is nothing to compute here.
     void CurrScrollBar_Scroll(object? sender, EventArgs e)
     {
-        if (!_syncingScrollBar)
-            LayoutViewport(_currViewport);
+        if (_syncingScrollBar)
+            return;
+
+        _currSectorsView.SetScrollPosVert((_currScrollBar.Value + _currSectorsView.ItemHeight - 1) / _currSectorsView.ItemHeight);
     }
 
     void AvailScrollBar_Scroll(object? sender, EventArgs e)
     {
-        if (!_syncingScrollBar)
-            LayoutViewport(_availViewport);
+        if (_syncingScrollBar)
+            return;
+
+        _availSectorsView.SetScrollPosVert((_availScrollBar.Value + _availSectorsView.ItemHeight - 1) / _availSectorsView.ItemHeight);
     }
 
     void RequestedScrollBar_Scroll(object? sender, EventArgs e)
     {
-        if (!_syncingScrollBar)
-            LayoutViewport(_requestedViewport);
+        if (_syncingScrollBar)
+            return;
+
+        _requestedChangesView.SetScrollPosVert((_requestedScrollBar.Value + _requestedChangesView.ItemHeight - 1) / _requestedChangesView.ItemHeight);
     }
 
     void UpdateArrowButton()
