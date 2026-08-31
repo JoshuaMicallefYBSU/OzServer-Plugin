@@ -97,21 +97,12 @@ public class AfvSectorClaimer
 
         _lastPrimaryCallsign = Network.Me.Callsign;
 
-        var primarySector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == Network.Me.Callsign);
-        if (primarySector == null)
+        // PrimaryPosition, not an open-coded copy of the same rule: PrimaryPositionWatcher applies
+        // it on the *other* controller's side to decide what to release to this session, and the
+        // two have to agree exactly or a sector is either released to nobody or never handed over.
+        var sectors = PrimaryPosition.DefaultSectorsFor(Network.Me.Callsign);
+        if (sectors.Count == 0)
             return;
-
-        var sectors = new List<SectorsVolumes.Sector> { primarySector };
-
-        foreach (var subsector in primarySector.SubSectors.ToList())
-        {
-            var onlineAtc = (Network.GetOnlineATCs ?? new List<NetworkATC>())
-                .FirstOrDefault(a => a.Callsign == subsector.Callsign && a.IsRealATC);
-            if (onlineAtc != null)
-                continue;
-
-            sectors.Add(subsector);
-        }
 
         MMI.SetControlledSectors(sectors);
     }

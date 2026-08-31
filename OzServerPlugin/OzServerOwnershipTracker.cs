@@ -52,6 +52,11 @@ public class OzServerOwnershipTracker
     // etc.), not something *newly* gained just now, so it's recorded without also seizing
     // MMI/VSCS for it - only actual changes from here on do that.
     bool _hasBaseline;
+    // Until the first refresh lands, Owned is an empty list that means "not known yet", not "you
+    // own nothing" - a distinction OzServerSectorsWindow has to make, because rendering the second
+    // reading puts every sector the controller actually owns into Available. See its
+    // SyncOwnedFromTracker.
+    public bool HasBaseline => _hasBaseline;
     int _pendingRequestCount = -1;
     // Coalesces MMI.SectorsControlledChanged - see OnMmiSectorsControlledChanged's own comment for
     // why running ClaimMmiControlledSectorsAsync re-entrantly (a second, overlapping call starting
@@ -91,6 +96,16 @@ public class OzServerOwnershipTracker
     // same question again a moment later, and queueing them just builds a backlog).
     readonly SemaphoreSlim _refreshGate = new(1, 1);
 
+    // Sectors this session is the primary for that were already owned by someone else at the moment
+    // it logged on - see HandleConflictAsync. Keyed by sector name, valued by how many poll ticks
+    // are left to keep trying. Bounded rather than infinite: the previous holder might not be
+    // running this plugin at all, or might have crashed out still holding the position, and quietly
+    // re-POSTing a doomed claim forever is worse than stopping and leaving it to be claimed by hand.
+    const int PrimaryClaimRetryTicks = 12; // ~2 minutes at PollInterval
+    readonly object _primaryClaimGate = new();
+    readonly Dictionary<string, int> _pendingPrimaryClaims = new(StringComparer.OrdinalIgnoreCase);
+    bool _primaryClaimRetryRunning;
+
     public IReadOnlyList<SectorsVolumes.Sector> Owned => _owned;
 
     public OzServerOwnershipTracker()
@@ -103,6 +118,13 @@ public class OzServerOwnershipTracker
             _ = RefreshFromServerIfIdleAsync();
             _ = RefreshPendingRequestCountAsync();
         };
+        // Nothing to take back once this session is over, and a stale entry would otherwise be
+        // retried against whatever position it reconnects as.
+        Network.Disconnected += (_, _) =>
+        {
+            lock (_primaryClaimGate)
+                _pendingPrimaryClaims.Clear();
+        };
         _pollTimer = new System.Threading.Timer(_ =>
         {
             if (!Network.IsConnected)
@@ -110,6 +132,7 @@ public class OzServerOwnershipTracker
 
             _ = RefreshFromServerIfIdleAsync();
             _ = RefreshPendingRequestCountAsync();
+            _ = RetryPendingPrimaryClaimsAsync();
         }, null, PollInterval, PollInterval);
 
         if (Network.IsConnected)
@@ -503,13 +526,30 @@ public class OzServerOwnershipTracker
     // than sit in MMI as if this controller owns it when OzServer disagrees.
     async Task HandleConflictAsync(SectorsVolumes.Sector sector, IReadOnlyList<OzServerSectorConflictDto> conflicts)
     {
-        var question = conflicts.Count == 1
-            ? $"{conflicts[0].Sector} is already owned by {conflicts[0].Owner?.Callsign}. Request it from them?"
-            : $"These are already owned by someone else: {string.Join(", ", conflicts.Select(c => $"{c.Sector} ({c.Owner?.Callsign})"))}. Request them?";
+        // A sector this session is the primary for is not something to ask about. The position is
+        // this controller's by right the moment they log on, and the controller holding it is
+        // already being told to hand it back - PrimaryPositionWatcher does exactly that on their
+        // side as soon as their client sees this logon. "Request it from them?" is the wrong
+        // question to put to someone about their own position, and answering "no" would leave them
+        // permanently locked out of it.
+        //
+        // The catch is timing: this claim fires on Network.Connected, while the holder only finds
+        // out on their next OnlineATCChanged, which follows VATSIM's own update cycle a few seconds
+        // later. So these are split out of the question and retried in the background instead (see
+        // RetryPendingPrimaryClaimsAsync) until the release lands.
+        var myDefaults = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
+        var mineByRight = conflicts.Where(c => myDefaults.Any(s => s.Name == c.Sector)).ToList();
+        var contestedByOthers = conflicts.Where(c => !mineByRight.Contains(c)).ToList();
 
-        if (AskYesNo(question, "Sector already owned"))
+        QueuePrimaryClaimRetries(mineByRight);
+
+        var question = contestedByOthers.Count == 1
+            ? $"{contestedByOthers[0].Sector} is already owned by {contestedByOthers[0].Owner?.Callsign}. Request it from them?"
+            : $"These are already owned by someone else: {string.Join(", ", contestedByOthers.Select(c => $"{c.Sector} ({c.Owner?.Callsign})"))}. Request them?";
+
+        if (contestedByOthers.Count > 0 && AskYesNo(question, "Sector already owned"))
         {
-            foreach (var conflict in conflicts)
+            foreach (var conflict in contestedByOthers)
             {
                 var conflictSector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == conflict.Sector);
                 if (conflictSector == null)
@@ -562,6 +602,97 @@ public class OzServerOwnershipTracker
     // access inside vatSys itself. Invoke (not BeginInvoke) since the caller needs the answer back
     // before deciding what to do next - safe to block on here since the calling thread is never the
     // UI thread itself (that's exactly the case this branch exists for).
+    void QueuePrimaryClaimRetries(IEnumerable<OzServerSectorConflictDto> conflicts)
+    {
+        lock (_primaryClaimGate)
+        {
+            foreach (var conflict in conflicts)
+                _pendingPrimaryClaims[conflict.Sector] = PrimaryClaimRetryTicks;
+        }
+    }
+
+    // Re-attempts the claims parked by HandleConflictAsync, once per poll tick, until the previous
+    // holder's release lands. Runs on the tracker's own existing timer rather than a delay loop of
+    // its own: the poll is already the heartbeat for "has anything changed on the server", and a
+    // claim that succeeds here reaches MMI and the VSCS panel through the same
+    // RefreshFromServerAsync -> ReconcileMmiWithOwned path every other ownership gain uses.
+    async Task RetryPendingPrimaryClaimsAsync()
+    {
+        List<string> names;
+        lock (_primaryClaimGate)
+        {
+            if (_primaryClaimRetryRunning || _pendingPrimaryClaims.Count == 0)
+                return;
+
+            _primaryClaimRetryRunning = true;
+            names = _pendingPrimaryClaims.Keys.ToList();
+        }
+
+        try
+        {
+            // Re-derived every tick, not captured when the conflict happened: a position change, or
+            // someone logging in directly on one of the sub-sectors, means it is no longer this
+            // session's to take and the retry should stop rather than fight them for it.
+            var stillMine = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
+            var claimedAny = false;
+
+            foreach (var name in names)
+            {
+                if (!Network.IsConnected)
+                    return;
+
+                if (!stillMine.Any(s => s.Name == name) || _owned.Any(o => o.Name == name))
+                {
+                    Drop(name);
+                    continue;
+                }
+
+                try
+                {
+                    await _api.ClaimSectorAsync(name);
+                    claimedAny = true;
+                    Drop(name);
+                    continue;
+                }
+                catch (OzServerApiException ex) when (ex.StatusCode == 409)
+                {
+                    // Still held - the previous holder hasn't released yet. Spend a tick.
+                }
+                catch (Exception ex)
+                {
+                    Errors.Add(new Exception($"Couldn't take {name} back for this position: {ex.Message}", ex), "OzServer");
+                }
+
+                lock (_primaryClaimGate)
+                {
+                    if (!_pendingPrimaryClaims.TryGetValue(name, out var ticksLeft))
+                        continue;
+
+                    if (ticksLeft <= 1)
+                        _pendingPrimaryClaims.Remove(name);
+                    else
+                        _pendingPrimaryClaims[name] = ticksLeft - 1;
+                }
+            }
+
+            // Only when something actually changed hands - this runs every tick, and the plain
+            // refresh the timer already fires covers the no-op case.
+            if (claimedAny)
+                await RefreshFromServerAsync();
+        }
+        finally
+        {
+            lock (_primaryClaimGate)
+                _primaryClaimRetryRunning = false;
+        }
+
+        void Drop(string name)
+        {
+            lock (_primaryClaimGate)
+                _pendingPrimaryClaims.Remove(name);
+        }
+    }
+
     static bool AskYesNo(string message, string caption)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)

@@ -15,6 +15,8 @@ public class Plugin : IPlugin
     // Text of the built-in "Sectors..." entry in the Settings menu (vatsys.MainForm.sectorsToolStripMenuItem)
     // that our own entry gets slotted in underneath.
     const string SectorsMenuItemText = "Sectors...";
+    // The same item's designer-assigned control name (vatsys.MainForm::sectorsToolStripMenuItem).
+    const string SectorsMenuItemName = "sectorsToolStripMenuItem";
 
     string IPlugin.Name => Name;
 
@@ -33,6 +35,9 @@ public class Plugin : IPlugin
     readonly FdrSync _fdrSync;
     readonly AtisSync _atisSync;
     readonly BadVectorsAtisSync _badVectorsAtisSync;
+    // Held for the same reason as the two above: it lives entirely off Network's own events, and a
+    // position has to be handed back whether or not the Sectors window was ever opened.
+    readonly PrimaryPositionWatcher _primaryPositionWatcher;
 
     public Plugin()
     {
@@ -41,6 +46,8 @@ public class Plugin : IPlugin
         _fdrSync = new FdrSync();
         _atisSync = new AtisSync();
         _badVectorsAtisSync = new BadVectorsAtisSync();
+        // After the tracker, which it releases through.
+        _primaryPositionWatcher = new PrimaryPositionWatcher(_ownershipTracker);
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
@@ -137,8 +144,13 @@ public class Plugin : IPlugin
 
             Application.Idle -= repositionUnderSectors;
 
+            // Name first, Text only as a fallback: vatSys assigns this item the name
+            // "sectorsToolStripMenuItem" in MainForm's designer code, which is far less likely to
+            // change between builds than the displayed "Sectors..." label.
             var sectorsItem = settingsMenu.DropDownItems.OfType<ToolStripItem>()
-                .FirstOrDefault(i => i.Text == SectorsMenuItemText);
+                .FirstOrDefault(i => i.Name == SectorsMenuItemName)
+                ?? settingsMenu.DropDownItems.OfType<ToolStripItem>()
+                    .FirstOrDefault(i => i.Text == SectorsMenuItemText);
             if (sectorsItem == null)
                 return;
 
@@ -148,6 +160,18 @@ public class Plugin : IPlugin
 
             settingsMenu.DropDownItems.Remove(settingsMenuItem.Item);
             settingsMenu.DropDownItems.Insert(insertAt + 1, settingsMenuItem.Item);
+
+            // OzServer Sectors replaces the built-in Sectors window rather than sitting beside it:
+            // both write MMI.SectorsControlled, but only this plugin's window also tells OzServer,
+            // so a claim made through the built-in one is invisible to every other controller until
+            // something happens to nudge the tracker. Two windows that look equivalent and aren't is
+            // the worse outcome, so the built-in entry is hidden while the plugin is loaded.
+            //
+            // Visible=false, not Remove: MainForm still holds the field and its click handler, so
+            // hiding leaves vatSys's own state entirely intact and is trivially reversible - and
+            // vatSys can still open the window itself (MMI.SectorsWindow) if it ever needs to.
+            // Left in place in the collection so the indices computed above stay meaningful.
+            sectorsItem.Visible = false;
         };
         Application.Idle += repositionUnderSectors;
     }
