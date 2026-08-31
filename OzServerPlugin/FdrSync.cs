@@ -29,12 +29,25 @@ namespace OzServerPlugin;
 public class FdrSync
 {
     static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(5);
-    static readonly PropertyInfo[] DtoProperties = typeof(OzServerFdrUpdateDto).GetProperties();
+
+    // Everything except the two datalink-authority fields, which CopyNonNull handles separately -
+    // see its own comment for why they can't go through the same "skip nulls" merge as the rest.
+    static readonly PropertyInfo[] MergeProperties = typeof(OzServerFdrUpdateDto).GetProperties()
+        .Where(p => p.Name != nameof(OzServerFdrUpdateDto.ControllingCid)
+                    && p.Name != nameof(OzServerFdrUpdateDto.ControllingCallsign))
+        .ToArray();
 
     readonly OzServerApiClient _api = new();
     readonly object _lock = new();
     readonly Dictionary<string, OzServerFdrUpdateDto> _pending = new();
     readonly Timer _flushTimer;
+    // 0 = idle, 1 = a flush is in flight. The timer keeps ticking every FlushInterval regardless of
+    // whether the previous flush has come back, so without this a backend slower than the interval
+    // accumulates overlapping batches - and because each one takes its own snapshot of _pending and
+    // clears it, they carry *different* data and can land out of order, letting an older batch
+    // overwrite a newer one's positions server-side. A tick that finds a flush already running just
+    // skips; nothing is lost, since whatever accumulates meanwhile goes out on the next one.
+    int _flushing;
 
     public FdrSync()
     {
@@ -81,24 +94,35 @@ public class FdrSync
         if (!Network.IsConnected)
             return;
 
-        List<OzServerFdrUpdateDto> batch;
-
-        lock (_lock)
-        {
-            if (_pending.Count == 0)
-                return;
-
-            batch = _pending.Values.ToList();
-            _pending.Clear();
-        }
+        // See _flushing - one batch in flight at a time, no overlapping pushes.
+        if (Interlocked.CompareExchange(ref _flushing, 1, 0) != 0)
+            return;
 
         try
         {
-            await _api.UpdateFdrBatchAsync(batch);
+            List<OzServerFdrUpdateDto> batch;
+
+            lock (_lock)
+            {
+                if (_pending.Count == 0)
+                    return;
+
+                batch = _pending.Values.ToList();
+                _pending.Clear();
+            }
+
+            try
+            {
+                await _api.UpdateFdrBatchAsync(batch);
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't push FDR batch to OzServer: {ex.Message}", ex), "OzServer");
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            Errors.Add(new Exception($"Couldn't push FDR batch to OzServer: {ex.Message}"), "OzServer");
+            Interlocked.Exchange(ref _flushing, 0);
         }
     }
 
@@ -187,9 +211,21 @@ public class FdrSync
     // without blanking out fields the newer update simply doesn't know about. Reflection-based
     // rather than a hand-written field list so a new OzServerFdrUpdateDto property is merged
     // correctly without this having to be updated to match.
+    //
+    // The two datalink-authority fields are the exception, and are copied as a unit *including*
+    // their nulls: null there means "free, nobody has authority" (see OzServerFdrUpdateDto - they
+    // are the only two marked NullValueHandling.Include for exactly this reason), not "this update
+    // doesn't know". Letting them through the skip-nulls loop below meant a flight going untracked
+    // could never clear the authority a previous update in the same flush window had set, so the
+    // batch went on asserting a controller who had already dropped the track. Both producers
+    // (BuildFdrDto and the radar path) always run FillAuthority, so source's answer is always the
+    // current one - there is no case where source simply hasn't looked.
     static void CopyNonNull(OzServerFdrUpdateDto source, OzServerFdrUpdateDto target)
     {
-        foreach (var prop in DtoProperties)
+        target.ControllingCid = source.ControllingCid;
+        target.ControllingCallsign = source.ControllingCallsign;
+
+        foreach (var prop in MergeProperties)
         {
             var value = prop.GetValue(source);
             if (value != null)

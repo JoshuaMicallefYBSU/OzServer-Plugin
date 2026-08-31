@@ -53,6 +53,12 @@ public class OzServerSectorOwnershipRequestDto
     [JsonProperty("target_callsign")] public string TargetCallsign { get; set; } = "";
     // Only populated by GET /sector-requests, not by POST .../request's own response.
     [JsonProperty("sector")] public OzServerSectorDto? Sector { get; set; }
+    // Set once the owner has denied this request. A rejected request is kept server-side purely so
+    // the controller who asked can be told (SectorOwnershipController::reject) - nothing else would
+    // ever tell them, since the row otherwise just disappears from their list exactly as it does on
+    // an accept, a cancel or a stale prune. Null on every request still awaiting a decision, and
+    // only ever seen in `by_me`: `from_me` is filtered to pending server-side.
+    [JsonProperty("rejected_at")] public DateTimeOffset? RejectedAt { get; set; }
 }
 
 public class OzServerMyRequestsDto
@@ -154,6 +160,19 @@ public class OzServerFdrUpdateDto
     [JsonProperty("on_ground")] public bool? OnGround { get; set; }
 }
 
+// AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
+// vatsys.ATIS's own content/letter actually changes (there is deliberately no periodic heartbeat -
+// see AtisSync's own comment), so this always represents a real broadcast update, not a liveness
+// ping.
+public class OzServerAtisUpdateDto
+{
+    [JsonProperty("icao")] public string Icao { get; set; } = "";
+    [JsonProperty("atis_letter")] public string AtisLetter { get; set; } = "";
+    // Field name (WIND, VIS, QNH, ...) -> value, straight from vatsys.ATIS.Content.
+    [JsonProperty("content")] public Dictionary<string, string> Content { get; set; } = new();
+    [JsonProperty("frequency")] public int? Frequency { get; set; }
+}
+
 // Talks to the OzServer backend's sector-ownership API (app/Http/Controllers/SectorOwnershipController.php),
 // authenticated as this plugin via a shared bearer token (Secrets.PluginToken, checked server-side
 // by app/Http/Middleware/VerifyPluginToken.php) rather than by cross-checking the caller against
@@ -165,6 +184,12 @@ public class OzServerFdrUpdateDto
 // settings file - see Secrets.cs (gitignored; Secrets.cs.example is the checked-in template).
 public class OzServerApiClient
 {
+    static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+
+    // Enough that the background traffic (FDR batch, two polls, ATIS) can never occupy every slot
+    // and leave a controller-initiated request waiting for one - see CreateClient.
+    const int TargetConnectionLimit = 8;
+
     static readonly HttpClient Http = CreateClient();
 
     // Null properties are left out of a POST body entirely by default (recursively, so this
@@ -187,7 +212,36 @@ public class OzServerApiClient
             // Best-effort - older Windows builds may not define Tls12 in this enum at all.
         }
 
-        var client = new HttpClient();
+        // .NET Framework caps outbound connections per host at 2 by default (the old RFC 2616
+        // recommendation), and every call in this plugin shares the one HttpClient below - so it
+        // shares one ServicePoint and that one cap. FdrSync flushes a batch every 5s, the ownership
+        // tracker polls every 10s, the Sectors window polls requests on its own 10s timer, and ATIS
+        // pushes on change: between them the two slots are routinely busy, and anything the
+        // controller actually *waits* on queues behind them. That is what made pressing Controlled
+        // take seconds - the GET wasn't slow, it hadn't started yet, stuck behind an FDR batch
+        // upload on a connection that wouldn't free up.
+        //
+        // Raised, never lowered: this property is process-wide, so it belongs to vatSys as much as
+        // to this plugin, and clamping down something the host (or another plugin) had deliberately
+        // raised would be the same bug in reverse.
+        try
+        {
+            if (ServicePointManager.DefaultConnectionLimit < TargetConnectionLimit)
+                ServicePointManager.DefaultConnectionLimit = TargetConnectionLimit;
+        }
+        catch
+        {
+            // Not worth failing construction over - the cap only costs latency, never correctness.
+        }
+
+        // HttpClient's own default is 100 seconds - long enough that a backend which accepts a
+        // connection and then stops answering leaves a controller staring at a dead Sectors window
+        // for over a minute with nothing in the error log. Not set anywhere near the 5s/10s timer
+        // intervals, though: those callers already refuse to stack up on their own (FdrSync's
+        // _flushing flag, the tracker's RefreshFromServerIfIdleAsync), so this only has to bound
+        // how long any single request can hang, and needs enough headroom for a genuinely large
+        // FDR batch on a slow connection.
+        var client = new HttpClient { Timeout = RequestTimeout };
         // Without this, Laravel's exception handler can't tell this apart from a browser
         // navigation and falls back to rendering its HTML error page instead of the
         // {"message": "..."} JSON body every error path here is written to expect - confirmed by
@@ -231,6 +285,13 @@ public class OzServerApiClient
 
     public Task CancelRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/cancel");
 
+    // Confirms this controller has been shown a rejection of their own request, which is what
+    // finally deletes it server-side - see SectorOwnershipController::acknowledgeRejection. Until
+    // this is called the rejection keeps coming back in every `by_me`, so it survives the plugin
+    // being closed before the controller ever saw it.
+    public Task AcknowledgeRejectionAsync(int requestId) =>
+        PostAsync($"/sector-requests/{requestId}/acknowledge-rejection");
+
     public Task<OzServerMyRequestsDto> GetMyRequestsAsync() =>
         GetAsync<OzServerMyRequestsDto>("/sector-requests", () => new OzServerMyRequestsDto());
 
@@ -241,6 +302,12 @@ public class OzServerApiClient
     // was never claimed through here, correctly never shows up).
     public Task<List<OzServerControlledSectorDto>> GetControlledSectorsAsync() =>
         GetAsync<List<OzServerControlledSectorDto>>("/sectors/controlled", () => new List<OzServerControlledSectorDto>());
+
+    // Gives up everything this controller owns in one call - see
+    // SectorOwnershipController::releaseAll. Only ever sent on a *graceful* disconnect: staying
+    // silent is what tells the backend a disconnect was ungraceful, and buys the 5-minute window to
+    // reconnect into the same sectors.
+    public Task ReleaseAllSectorsAsync() => PostAsync("/sectors/release-all");
 
     // The authoritative "what do I actually own" check (SectorOwnershipController::mine) - used to
     // refresh Owned from OzServer's own record every time the Sectors window opens, rather than
@@ -262,6 +329,9 @@ public class OzServerApiClient
     public Task UpdateFdrBatchAsync(IEnumerable<OzServerFdrUpdateDto> flights) =>
         PostAsync("/fdr/batch", new { flights = flights.ToArray() });
 
+    // AtisController::update - upserts this ICAO's current ATIS state, keyed by icao.
+    public Task UpdateAtisAsync(OzServerAtisUpdateDto atis) => PostAsync("/atis", atis);
+
     async Task<T> GetAsync<T>(string path, Func<T> empty)
     {
         var (cid, callsign) = GetCredentials();
@@ -274,7 +344,7 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException($"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}");
+            throw new OzServerApiException(DescribeTransportFailure(ex));
         }
 
         using (response)
@@ -326,7 +396,7 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException($"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}");
+            throw new OzServerApiException(DescribeTransportFailure(ex));
         }
 
         using (response)
@@ -341,6 +411,14 @@ public class OzServerApiClient
             return responseBody;
         }
     }
+
+    // HttpClient reports its own Timeout as a bare TaskCanceledException whose Message is just
+    // "A task was canceled." - indistinguishable, to anyone reading the vatSys error log, from a
+    // cancellation this plugin asked for (it never does). Name the real cause instead.
+    static string DescribeTransportFailure(Exception ex) =>
+        ex is OperationCanceledException // TaskCanceledException, which is what a timeout raises, derives from this
+            ? $"OzServer at {OzServerSettings.BaseUrl} didn't respond within {RequestTimeout.TotalSeconds:0.#}s."
+            : $"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}";
 
     static (string Message, List<OzServerSectorConflictDto> Conflicts) ParseError(string body, int statusCode)
     {

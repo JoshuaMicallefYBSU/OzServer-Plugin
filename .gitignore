@@ -1,4 +1,17 @@
+# Build output. These were previously tracked, which is how a compiled copy of the plugin ended
+# up in the repository - and with it every `const` value the compiler inlines into the IL.
+bin/
+obj/
 .csproj
+
+# Visual Studio / Rider local state
+.vs/
+.idea/
+*.user
+*.suo
+
+# Local decompiled vatSys reference project, not ours to redistribute
 .reference-plugin
-.vs
+
+# The real plugin token - see Secrets.cs.example for the template to copy.
 OzServerPlugin/Secrets.cs

@@ -33,6 +33,41 @@ public static class OzServerSettings
         }
     }
 
+    // Every request carries the plugin's shared bearer token (see OzServerApiClient's class
+    // comment), so where the base URL points is a security decision, not just a convenience -
+    // whatever host is named here is handed that token. Two things are checked:
+    //   - The scheme must be http or https. Uri.TryCreate(..., UriKind.Absolute) on its own is far
+    //     too permissive for this: "mailto:x", "file:///c:/", and "foo:bar" are all absolute URIs
+    //     and all passed the old check, leaving every call to fail in a way that pointed nowhere
+    //     near the actual cause.
+    //   - Plain http is allowed only for a loopback host, so a dev server on localhost still
+    //     works while a typo'd or hand-edited "http://someone-elses-host" can't put the token on
+    //     the wire in cleartext.
+    public static bool IsValidBaseUrl(string? url, out string error)
+    {
+        error = "";
+
+        if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url, UriKind.Absolute, out var parsed))
+        {
+            error = "That doesn't look like a valid URL.";
+            return false;
+        }
+
+        if (parsed.Scheme != Uri.UriSchemeHttps && parsed.Scheme != Uri.UriSchemeHttp)
+        {
+            error = "The URL must start with https:// (or http:// for a local dev server).";
+            return false;
+        }
+
+        if (parsed.Scheme == Uri.UriSchemeHttp && !parsed.IsLoopback)
+        {
+            error = "Plain http:// is only allowed for localhost - use https:// for a remote server.";
+            return false;
+        }
+
+        return true;
+    }
+
     static void Load()
     {
         try
@@ -40,10 +75,22 @@ public static class OzServerSettings
             if (File.Exists(SettingsPath))
             {
                 var data = JsonConvert.DeserializeObject<StoredSettings>(File.ReadAllText(SettingsPath));
+                // Validated on the way in, not just on the way out through the settings window -
+                // settings.json is a plain file under %AppData% that anything can edit, so a value
+                // that never went through the window still has to clear the same bar before the
+                // token gets sent to it.
                 if (!string.IsNullOrWhiteSpace(data?.BaseUrl))
                 {
-                    _baseUrl = data!.BaseUrl!.TrimEnd('/');
-                    return;
+                    var stored = data!.BaseUrl!.TrimEnd('/');
+                    if (IsValidBaseUrl(stored, out var error))
+                    {
+                        _baseUrl = stored;
+                        return;
+                    }
+
+                    vatsys.Errors.Add(
+                        new Exception($"Ignoring the OzServer base URL in {SettingsPath} ('{stored}'): {error} Falling back to {DefaultBaseUrl}."),
+                        "OzServer Settings");
                 }
             }
         }
