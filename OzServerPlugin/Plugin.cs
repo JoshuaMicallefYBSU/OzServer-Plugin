@@ -31,12 +31,16 @@ public class Plugin : IPlugin
     readonly AfvSectorClaimer _afvSectorClaimer;
     readonly OzServerOwnershipTracker _ownershipTracker;
     readonly FdrSync _fdrSync;
+    readonly AtisSync _atisSync;
+    readonly BadVectorsAtisSync _badVectorsAtisSync;
 
     public Plugin()
     {
         _ownershipTracker = new OzServerOwnershipTracker();
         _afvSectorClaimer = new AfvSectorClaimer();
         _fdrSync = new FdrSync();
+        _atisSync = new AtisSync();
+        _badVectorsAtisSync = new BadVectorsAtisSync();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,

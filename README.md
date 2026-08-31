@@ -210,6 +210,8 @@ Four rules if you touch the styling:
 | `AfvSectorClaimer.cs` | Turns VSCS transmit state into `MMI.SectorsControlled` changes |
 | `ControllerInfoUpdater.cs` | Maintains the `Extending ...` Controller Info line |
 | `FdrSync.cs` | Batches FDR and radar-track pushes |
+| `AtisSync.cs` | Pushes vatSys's own built-in ATIS (`vatsys.ATIS`, slot 0) on change |
+| `BadVectorsAtisSync.cs` | Same, but for [badvectors/ATISPlugin](https://github.com/badvectors/ATISPlugin)'s up-to-4 broadcasts, via reflection |
 | `OzServerSettings.cs` | Base-URL persistence and validation |
 | `ToggleGenericButton.cs` | A `GenericButton` that can be held visually depressed |
 
@@ -232,6 +234,7 @@ All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` at
 | `POST /sector-requests/accept-batch` | Accept several at once, processed sequentially |
 | `POST /sector-requests/{id}/accept`, `/reject`, `/cancel` | Single-request actions |
 | `POST /fdr`, `POST /fdr/batch` | Flight data upserts, keyed by callsign |
+| `POST /atis` | ATIS upsert, keyed by ICAO; dropped 90 minutes after the last update |
 
 ### Timings
 

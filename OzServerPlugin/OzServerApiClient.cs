@@ -154,6 +154,19 @@ public class OzServerFdrUpdateDto
     [JsonProperty("on_ground")] public bool? OnGround { get; set; }
 }
 
+// AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
+// vatsys.ATIS's own content/letter actually changes (there is deliberately no periodic heartbeat -
+// see AtisSync's own comment), so this always represents a real broadcast update, not a liveness
+// ping.
+public class OzServerAtisUpdateDto
+{
+    [JsonProperty("icao")] public string Icao { get; set; } = "";
+    [JsonProperty("atis_letter")] public string AtisLetter { get; set; } = "";
+    // Field name (WIND, VIS, QNH, ...) -> value, straight from vatsys.ATIS.Content.
+    [JsonProperty("content")] public Dictionary<string, string> Content { get; set; } = new();
+    [JsonProperty("frequency")] public int? Frequency { get; set; }
+}
+
 // Talks to the OzServer backend's sector-ownership API (app/Http/Controllers/SectorOwnershipController.php),
 // authenticated as this plugin via a shared bearer token (Secrets.PluginToken, checked server-side
 // by app/Http/Middleware/VerifyPluginToken.php) rather than by cross-checking the caller against
@@ -270,6 +283,9 @@ public class OzServerApiClient
     // themselves; FdrSync currently just fires this and moves on.
     public Task UpdateFdrBatchAsync(IEnumerable<OzServerFdrUpdateDto> flights) =>
         PostAsync("/fdr/batch", new { flights = flights.ToArray() });
+
+    // AtisController::update - upserts this ICAO's current ATIS state, keyed by icao.
+    public Task UpdateAtisAsync(OzServerAtisUpdateDto atis) => PostAsync("/atis", atis);
 
     async Task<T> GetAsync<T>(string path, Func<T> empty)
     {

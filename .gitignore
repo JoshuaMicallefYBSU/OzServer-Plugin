@@ -2,6 +2,7 @@
 # up in the repository - and with it every `const` value the compiler inlines into the IL.
 bin/
 obj/
+.csproj
 
 # Visual Studio / Rider local state
 .vs/
