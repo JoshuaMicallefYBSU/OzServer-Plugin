@@ -67,6 +67,17 @@ public class OzServerMyRequestsDto
     [JsonProperty("from_me")] public List<OzServerSectorOwnershipRequestDto> FromMe { get; set; } = new();
 }
 
+// Everything the Sectors window's poll needs, in one response - see SectorOwnershipController::sync.
+// The three members are exactly the payloads GET /sectors/mine, /sectors/controlled and
+// /sector-requests return individually, so they deserialise into the same DTOs and nothing
+// downstream has to care which route the data arrived by.
+public class OzServerSyncDto
+{
+    [JsonProperty("mine")] public List<OzServerSectorDto> Mine { get; set; } = new();
+    [JsonProperty("controlled")] public List<OzServerControlledSectorDto> Controlled { get; set; } = new();
+    [JsonProperty("requests")] public OzServerMyRequestsDto Requests { get; set; } = new();
+}
+
 public class OzServerAcceptBatchResultDto
 {
     [JsonProperty("request_id")] public int RequestId { get; set; }
@@ -299,6 +310,12 @@ public class OzServerApiClient
     // being closed before the controller ever saw it.
     public Task AcknowledgeRejectionAsync(int requestId) =>
         PostAsync($"/sector-requests/{requestId}/acknowledge-rejection");
+
+    // One round trip for owned + controlled + requests. The Sectors window polls every two seconds
+    // while open and used to make three separate GETs per tick, each paying the framework's own
+    // per-request cost for data that is always consumed together.
+    public Task<OzServerSyncDto> GetSyncAsync() =>
+        GetAsync("/sectors/sync", () => new OzServerSyncDto());
 
     public Task<OzServerMyRequestsDto> GetMyRequestsAsync() =>
         GetAsync<OzServerMyRequestsDto>("/sector-requests", () => new OzServerMyRequestsDto());

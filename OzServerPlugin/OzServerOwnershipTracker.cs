@@ -79,6 +79,11 @@ public class OzServerOwnershipTracker
     // Fires whenever Owned actually gains or loses a sector - see SectorOwnershipDiff. Consumed by
     // TagOwnershipSync to hand tags off the moment their subsector changes owner on OzServer.
     public event EventHandler<SectorOwnershipDiff>? OwnershipChanged;
+    // The full requests payload from the last sync, for the Sectors window - which renders both
+    // directions and needs the rejected rows too, not just a changed/unchanged signal.
+    public event EventHandler<OzServerMyRequestsDto>? RequestsChanged;
+
+    public OzServerMyRequestsDto MyRequests { get; private set; } = new();
 
     readonly OzServerApiClient _api = new();
     readonly System.Threading.Timer _pollTimer;
@@ -195,7 +200,6 @@ public class OzServerOwnershipTracker
         Network.Connected += (_, _) =>
         {
             _ = RefreshFromServerIfIdleAsync();
-            _ = RefreshPendingRequestCountAsync();
         };
         // Nothing to take back once this session is over, and a stale entry would otherwise be
         // retried against whatever position it reconnects as.
@@ -210,14 +214,12 @@ public class OzServerOwnershipTracker
                 return;
 
             _ = RefreshFromServerIfIdleAsync();
-            _ = RefreshPendingRequestCountAsync();
             _ = RetryPendingPrimaryClaimsAsync();
         }, null, PollInterval, PollInterval);
 
         if (Network.IsConnected)
         {
             _ = RefreshFromServerIfIdleAsync();
-            _ = RefreshPendingRequestCountAsync();
         }
     }
 
@@ -287,18 +289,13 @@ public class OzServerOwnershipTracker
         }
     }
 
-    async Task RefreshPendingRequestCountAsync()
+    // Applies the requests half of a sync. Raised as two separate events because the two consumers
+    // want different things: Plugin only cares that the incoming set changed (to flash), while the
+    // Sectors window renders both directions including this controller's own rejections.
+    void ApplyRequests(OzServerMyRequestsDto requests)
     {
-        OzServerMyRequestsDto requests;
-        try
-        {
-            requests = await _api.GetMyRequestsAsync();
-        }
-        catch (Exception ex)
-        {
-            Errors.Add(new Exception($"Couldn't refresh pending sector requests: {ex.Message}", ex), "OzServer");
-            return;
-        }
+        MyRequests = requests;
+        RequestsChanged?.Invoke(this, requests);
 
         // Compared on request ids, not on the count: one request being accepted while another
         // arrives between polls leaves the count identical while the actual requests differ, and
@@ -361,35 +358,38 @@ public class OzServerOwnershipTracker
         }
     }
 
+    // One GET for all three of this plugin's read-only views of server state - owned, everyone
+    // else's ownership, and this controller's requests in both directions.
+    //
+    // These were three separate calls, made together on the same tick from two different places
+    // (this class's poll, and the Sectors window's faster one). None of them was expensive for the
+    // database; the cost was paying the framework's per-request overhead three times over, from
+    // every connected client, every couple of seconds. They are always consumed together, so they
+    // are now fetched together - see SectorOwnershipController::sync.
+    //
+    // A failed sync leaves every one of the three exactly as it was rather than half-updating: the
+    // previous values staying briefly stale is always better than one view moving while the others
+    // do not, which is what made the lists disagree with each other during a blip.
     async Task RefreshFromServerCoreAsync()
     {
-        List<OzServerSectorDto> mine;
+        OzServerSyncDto sync;
         try
         {
-            mine = await _api.GetMySectorsAsync();
+            sync = await _api.GetSyncAsync();
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't refresh Owned from OzServer: {ex.Message}", ex), "OzServer");
+            Errors.Add(new Exception($"Couldn't refresh sector state from OzServer: {ex.Message}", ex), "OzServer");
             return;
         }
 
-        try
-        {
-            var controlled = await _api.GetControlledSectorsAsync();
-            _controlled = controlled
-                .Where(c => c.Owner != null)
-                .ToDictionary(c => c.Name, c => c.Owner!, StringComparer.OrdinalIgnoreCase);
-        }
-        catch (Exception ex)
-        {
-            // Owned is still refreshed below even if this leg fails - Controlled going briefly
-            // stale (rather than being wiped to empty here) is far less disruptive than an
-            // unrelated transient failure blocking Owned, which every other caller here already
-            // depends on being current by the time this returns.
-            Errors.Add(new Exception($"Couldn't refresh Controlled from OzServer: {ex.Message}", ex), "OzServer");
-        }
+        _controlled = sync.Controlled
+            .Where(c => c.Owner != null)
+            .ToDictionary(c => c.Name, c => c.Owner!, StringComparer.OrdinalIgnoreCase);
 
+        ApplyRequests(sync.Requests);
+
+        var mine = sync.Mine;
         var previous = _owned;
         var current = mine
             .Select(dto => SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == dto.Name))

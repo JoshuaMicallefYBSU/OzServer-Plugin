@@ -15,16 +15,17 @@ OzServer flows back into vatSys and onto your VSCS panel automatically.
 | | |
 | --- | --- |
 | **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer. A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. |
-| **Sector requests** | Ask another controller for a sector they own. Incoming requests can be multi-selected and accepted in one batch. |
-| **Conflict handling** | Claiming a primary that bundles sub-sectors someone else already holds asks once, then claims everything that *isn't* contested rather than failing the whole thing. |
-| **Request indicator** | A `[n SECTOR REQUEST]` button, in the profile's own warning colour, appears in the main menu bar when someone wants a sector from you — whether or not the Sectors window has ever been opened. |
+| **Sector requests** | Ask another controller for a sector they own. Accepting the `Requested From Me` heading accepts every incoming request in one batch; accepting a row accepts just that one. A denial is reported back to whoever asked. |
+| **Conflict handling** | Claiming a primary that bundles sub-sectors someone else already holds takes everything that *isn't* contested and leaves the rest with their owner, reporting which. It never turns those into requests behind your back — asking is something you do explicitly, by staging the sector you want. |
+| **Primary inheritance** | Logging in under a position's own callsign takes that position's sectors regardless of who was holding them. Whoever had them is told, and gives them up. A primary is never kept from its own controller. |
+| **Disconnect handling** | A deliberate exit (closing vatSys, or pressing Disconnect) releases your sectors immediately. A crash or dropped connection says nothing at all, and that silence is what holds them for 5 minutes so reconnecting picks up where you left off. |
+| **Request indicator** | An incoming request flashes a trail inward — `Settings`, then `OzServer Sectors` once that menu is open, then the `Requested From Me` heading — plus the window's own title bar, the way the ATIS window does. |
 | **Extending line** | Keeps an `Extending ...` line in your Controller Info in step with the extra VSCS lines you're transmitting on. APP/DEP and CTR positions only. |
 | **Tag ownership** | An aircraft's tag follows the live geographic subsector it's physically in: sitting in one you own, on OzServer, gets it activated (if its flight plan hasn't been) and assumed (if nobody holds it) automatically; losing that subsector on OzServer hands off whatever you were tracking there. |
 | **Flight data** | Pushes FDR and radar-track updates to OzServer in 5-second batches, only for flights you currently hold (`IsTrackedByMe`) and have activated, attributing datalink authority as your own session's identity. Each push also reports the real geographic subsector the aircraft is physically inside of right now, independent of who (if anyone) owns it. |
 
-Ownership has exactly one source of truth: **OzServer's own record**. Every action calls the
-relevant endpoint and then re-reads `/sectors/mine` rather than guessing locally what the result must
-have been.
+Ownership has exactly one source of truth: **OzServer's own record**. Every action calls the relevant
+endpoint and then re-reads it rather than guessing locally what the result must have been.
 
 ---
 
@@ -54,7 +55,7 @@ Three panes, left to right:
 | Pane | Shows |
 | --- | --- |
 | **Owned** | What OzServer says you currently own. Grouping sectors nest their covered sub-sectors underneath, with a `*` on any sector that bundles others. |
-| **Requested Changes** | `Requested By Me` (outgoing) and `Requested From Me` (incoming). Tick several incoming rows — or the `Requested From Me` header itself — to accept them all at once. |
+| **Requested Changes** | `Requested By Me` (outgoing) and `Requested From Me` (incoming). Both are plain headings rather than dropdowns — they never fold away. Select the `Requested From Me` heading to accept every incoming request at once, or a single row for just that one. |
 | **Available / Controlled** | Toggles between two genuinely different data sets, described below. |
 
 Sectors are grouped under **Flow / Centre / Approach / Tower / Other**, derived from the callsign
@@ -62,22 +63,35 @@ suffix in your profile's `Sectors.xml`.
 
 **Available vs Controlled** is not one list filtered two ways:
 
-- **Available** — nobody is live on that frequency on VATSIM right now. Checked locally against the
-  live feed, so it is meaningful even for a sector OzServer has never heard of.
+- **Available** — claimable right now: nobody is live on that frequency on VATSIM *and* OzServer has
+  no ownership record for it. Both checks are needed — a controller who reached a sector by
+  *extending* into it is not logged in under that sector's callsign at all, so the live-frequency
+  test alone never sees them and the sector looked claimable when it was not.
 - **Controlled** — OzServer holds an active ownership record for it, owned by someone else, with
   their callsign shown. A stray callsign somebody is logged into but never claimed through the
   plugin correctly does *not* appear here.
 
+Nothing is sent to OzServer until **Apply**. Moving a sector across only *stages* it: the row turns
+yellow (the profile's `WindowWarning` identity) and stays that way until it is committed.
+
 | Control | What it does |
 | --- | --- |
-| `<<` | Claims the selected Available sector, or requests the selected Controlled one from its owner. |
-| `>>` | Releases the selected Owned sector. |
-| **Accept** | Accepts the ticked incoming requests, or the single selected one if nothing is ticked. |
-| **Reject** / **Cancel** | Rejects an incoming request; cancels one you sent. |
-| **Apply** / **Cancel** | Pushes the current selection into `MMI.SectorsControlled`, or reloads it from there. Enabled only when the two actually differ. |
+| `<<` | Stages the selected Available sector into Owned. |
+| `>>` | Stages the selected Owned sector out. |
+| `<<>>` | Shown, disabled, when neither list has a selection — matching `vatsys.SectorsWindow`'s own button exactly. |
+| **Apply** | Commits every staged move: claims what is free, releases what you unpicked, and sends a request for anything another controller owns. |
+| **Cancel** | Throws the staged selection away and goes back to what OzServer says you own. |
 
-Requested Changes and Controlled are polled every 10 seconds while the window is open. Owned does not
-need polling — the tracker keeps it current whether the window is open or not.
+The arrow button acts only on **Owned** and **Available**. A row in Requested Changes is a request in
+flight, not a sector sitting somewhere it can be moved out of — everything you can do to one
+(Accept, Reject, Add, Remove) is on its **middle-click menu**, which is also where Expand/Collapse
+lives for every other row. Left click selects; left click on a category heading opens it.
+
+Staging a sector another controller owns puts it straight under `Requested By Me` in yellow, rather
+than pretending it is yours until Apply reveals otherwise.
+
+While the window is open it polls once every 2 seconds. Owned does not need polling — the tracker
+keeps it current whether the window is open or not.
 
 ### Claiming by transmitting
 
@@ -88,8 +102,9 @@ Pressing Transmit on a VSCS line is the normal way to claim:
 - A **primary's** line (e.g. `WOL`) adds it *and its whole group*, matching what "extend" means on
   the scope. Whether each sub-sector is actually claimable is then resolved once, on OzServer.
 
-Releasing is never inferred from a sector merely disappearing from `MMI.SectorsControlled` — only an
-explicit `>>` or a genuine conflict releases anything.
+Releasing is never inferred from a sector merely disappearing from `MMI.SectorsControlled`. There are
+exactly four things that release: an applied `>>`, a genuine conflict, a position's own controller
+logging on (`PrimaryPositionWatcher`), and a deliberate disconnect (`GracefulDisconnectReleaser`).
 
 ---
 
@@ -188,7 +203,7 @@ the loaded profile defines:
 | Window backgrounds | `WindowBackground` |
 | Labels | `GenericText` |
 | Text boxes, trees, the message pane | `InteractiveText` (matches `vatsys.TextField`) |
-| Request indicator | `WindowWarning`, with black or white text chosen by luminance |
+| Staged rows, flashing headings, the request trail | `WindowWarning` (BrightYellow in the Australia profile) |
 | Buttons | left entirely to `GenericButton`'s own defaults |
 
 Four rules if you touch the styling:
@@ -204,8 +219,11 @@ Four rules if you touch the styling:
 - **Show windows with `ShowWithPlacement(owner)`, not `Show()`.** It restores the position and size
   the controller last left the window at, keyed on `Control.Name` — which is why each form sets a
   unique `Name`. An owner also keeps the window above the maximised main form.
-- **Use `SectorConflictPromptWindow`, not `MessageBox`.** An OS message box is the one thing on
-  screen that ignores the profile entirely.
+- **Use `SectorConflictPromptWindow` / `SectorNoticeWindow`, not `MessageBox`.** An OS message box is
+  the one thing on screen that ignores the profile entirely.
+- **Menus borrow vatSys's own renderer.** `ComboField.DefaultMenuRenderer` is the instance `MainForm`
+  builds and every built-in dropdown uses, so the middle-click menu is identical to a native one by
+  construction rather than being a close repaint of it (`vatsys.MenuRenderer` is itself private).
 
 ---
 
@@ -213,12 +231,19 @@ Four rules if you touch the styling:
 
 | File | Role |
 | --- | --- |
-| `Plugin.cs` | MEF entry point; menu items and the request indicator |
+| `Plugin.cs` | MEF entry point; menu items and the incoming-request flash trail |
 | `OzServerOwnershipTracker.cs` | Source of truth for owned sectors; syncs both ways with MMI/VSCS |
 | `OzServerApiClient.cs` | HTTP client and DTOs for the backend API |
 | `OzServerSectorsWindow.cs` | The Owned / Available / Controlled / Requested Changes window |
 | `OzServerSettingsWindow.cs` | Base-URL settings window |
 | `SectorConflictPromptWindow.cs` | vatSys-styled Yes/No prompt, in place of `MessageBox` |
+| `SectorMessageWindow.cs` | Shared chat-styled chrome for the two dialogs below it |
+| `SectorNoticeWindow.cs` | One-way notice (OK only) — position relinquished, request denied |
+| `PrimaryPosition.cs` | The one definition of which sectors a position takes when its controller logs on |
+| `PrimaryPositionWatcher.cs` | Hands those sectors back when a position's own controller appears |
+| `GracefulDisconnectReleaser.cs` | Releases everything on a deliberate exit, and stays silent on a crash |
+| `VatSysContextMenu.cs` | Middle-click menu, drawn with vatSys's own `MenuRenderer` |
+| `SectorChangeRequest.cs` | One pending request, as the window renders it |
 | `AfvSectorClaimer.cs` | Turns VSCS transmit state into `MMI.SectorsControlled` changes |
 | `ControllerInfoUpdater.cs` | Maintains the `Extending ...` Controller Info line |
 | `FdrSync.cs` | Batches FDR and radar-track pushes, gated on currently holding and having activated the flight |
@@ -242,11 +267,14 @@ All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` at
 | `POST /sectors/{name}/claim` | Claim, optionally with an `exclude` list after a conflict |
 | `POST /sectors/{name}/release` | Release |
 | `POST /sectors/{name}/request` | Request from the current owner |
-| `GET /sectors/mine` | The authoritative "what do I own" check |
-| `GET /sectors/controlled` | Sectors owned by someone else, pre-flattened server-side; polled continuously (not just while the Sectors window is open) so `TagOwnershipSync` always has the full picture |
-| `GET /sector-requests` | Both directions of pending requests |
+| `GET /sectors/sync` | **The only GET the plugin makes.** Owned + controlled + requests in one response — the three below, which the poll used to fetch separately every tick |
+| `POST /sectors/release-all` | Give up everything, on a *graceful* disconnect only; staying silent is what marks a disconnect ungraceful |
+| `GET /sectors/mine` | The authoritative "what do I own" check — still routed, no longer called by the plugin |
+| `GET /sectors/controlled` | Sectors owned by someone else, pre-flattened server-side — still routed, no longer called by the plugin |
+| `GET /sector-requests` | Both directions of pending requests — still routed, no longer called by the plugin |
 | `POST /sector-requests/accept-batch` | Accept several at once, processed sequentially |
 | `POST /sector-requests/{id}/accept`, `/reject`, `/cancel` | Single-request actions |
+| `POST /sector-requests/{id}/acknowledge-rejection` | Confirms a denial has been shown to the requester, which is what finally deletes it |
 | `POST /fdr`, `POST /fdr/batch` | Flight data upserts, keyed by callsign |
 | `POST /atis` | ATIS upsert, keyed by ICAO; dropped 90 minutes after the last update |
 
@@ -254,10 +282,14 @@ All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` at
 
 | | |
 | --- | --- |
-| Ownership + pending-request poll | 10s |
-| Sectors window poll (requests, Controlled) | 10s, only while visible |
+| Ownership / controlled / requests sync | 10s (always), 2s while the Sectors window is visible |
 | FDR batch flush | 5s |
+| ATISPlugin rescan (looking for its slots) | 5s |
 | HTTP request timeout | 20s |
+| Max concurrent HTTP connections | 8 (raised from .NET's default of 2) |
+
+All three views arrive in one `GET /sectors/sync`, so a poll tick is a single request rather than
+three. A failed sync leaves all three as they were rather than half-updating them.
 
 ---
 

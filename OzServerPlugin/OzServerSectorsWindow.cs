@@ -109,8 +109,6 @@ public class OzServerSectorsWindow : BaseForm
     List<OzServerControlledSectorDto> _controlledSnapshot = new();
     string? _controlledSignature;
     bool _hasControlledSnapshot;
-    Task? _requestedRefreshTask;
-    bool _requestedRefreshQueued;
     bool _requestActionRunning;
     // True from the first staged move until Apply or Cancel resolves it. While set, the Owned list
     // is the controller's working selection rather than a view of _tracker.Owned, so background
@@ -534,6 +532,9 @@ public class OzServerSectorsWindow : BaseForm
         // RunOnUiThread since OwnedChanged can fire off the UI thread, and can fire before this
         // window has a handle to post to at all - see that method.
         _tracker.OwnedChanged += (_, _) => RunOnUiThread(SyncOwnedFromTracker);
+        // Requests now arrive with the same sync that carries ownership, so this window no longer
+        // polls for them separately - see RefreshRequestedChangesAsync.
+        _tracker.RequestsChanged += (_, requests) => RunOnUiThread(() => ApplyRequests(requests));
         Network.OnlineATCChanged += (_, _) => RefreshAvailableList();
 
         // Requested Changes has no local signal for an incoming request another controller just
@@ -553,8 +554,10 @@ public class OzServerSectorsWindow : BaseForm
         _pollTimer = new System.Windows.Forms.Timer { Interval = 2000 };
         _pollTimer.Tick += (_, _) =>
         {
+            // One sync per tick, and only if one is not already in flight. It carries owned,
+            // controlled and requests together, so asking separately for any of them here would be
+            // the same round trip twice.
             _ = _tracker.RefreshFromServerIfIdleAsync();
-            _ = RefreshRequestedChangesAsync();
             // Regardless of mode: Available filters against this too, so it has to stay current
             // even while Controlled isn't the list being shown.
             RefreshControlledSnapshot();
@@ -1335,8 +1338,10 @@ public class OzServerSectorsWindow : BaseForm
     // filters against all change together when a claim, release, request or accept lands.
     void RefreshAllListsAsync()
     {
-        _ = _tracker.RefreshFromServerIfIdleAsync();
-        _ = RefreshRequestedChangesAsync();
+        // A single sync covers all three views - see OzServerOwnershipTracker.RefreshFromServerCoreAsync.
+        // Queueing rather than dropping: this runs straight after an action of this controller's, so
+        // it has to reflect what that action just did rather than give up because a poll was mid-flight.
+        _ = _tracker.RefreshFromServerAsync();
         RefreshControlledSnapshot();
     }
 
@@ -2253,87 +2258,53 @@ public class OzServerSectorsWindow : BaseForm
     // every 10s while visible (see the poll timer in the constructor), and after every action below
     // succeeds, rather than trying to patch _requestsByMe/_requestsFromMe by hand from each
     // response's own shape.
+    // Asks the tracker to refresh, which is what actually fetches the requests now - they arrive on
+    // its RequestsChanged event and are applied by ApplyRequests below.
+    //
+    // This used to own its own GET /sector-requests, complete with a queue-and-coalesce loop to stop
+    // overlapping polls stacking up. All of that moved: the tracker fetches owned, controlled and
+    // requests in a single sync call (SectorOwnershipController::sync), and its _refreshGate already
+    // serialises exactly the way this loop was reimplementing.
     Task RefreshRequestedChangesAsync()
     {
         if (!Network.IsConnected)
             return Task.CompletedTask;
 
-        _requestedRefreshQueued = true;
-        return _requestedRefreshTask ??= RunRequestedChangesRefreshLoopAsync();
+        return _tracker.RefreshFromServerAsync();
     }
 
-    async Task RunRequestedChangesRefreshLoopAsync()
+    // Applies a requests payload from the tracker. Runs on the UI thread - the tracker raises this
+    // from wherever its refresh continuation resumes, which is not the UI thread.
+    void ApplyRequests(OzServerMyRequestsDto response)
     {
-        // Ensure RefreshRequestedChangesAsync assigns _requestedRefreshTask before this runner can
-        // reach its finally block, even if the API fails/completes synchronously.
-        await Task.Yield();
-
-        try
-        {
-            do
-            {
-                _requestedRefreshQueued = false;
-                await RefreshRequestedChangesOnceAsync();
-            }
-            while (_requestedRefreshQueued && Network.IsConnected);
-        }
-        catch (Exception ex)
-        {
-            // The timer/open paths deliberately do not await this task, so contain any unexpected
-            // rendering/lifecycle failure here rather than leaking an unobserved exception.
-            Errors.Add(new Exception($"Couldn't refresh sector requests: {ex.Message}", ex), "OzServer");
-        }
-        finally
-        {
-            _requestedRefreshTask = null;
-            _requestedRefreshQueued = false;
-        }
-    }
-
-    async Task RefreshRequestedChangesOnceAsync()
-    {
-        try
-        {
-            var response = await _api.GetMyRequestsAsync();
-
-            if (IsDisposed || !IsHandleCreated)
-                return;
-
-            // A rejected request comes back in by_me exactly once per rejection, purely so this
-            // controller can be told (see OzServerSectorOwnershipRequestDto.RejectedAt). It is not a
-            // pending request and must not be rendered as one - it is already decided, and Cancel
-            // would have nothing to act on.
-            var rejected = response.ByMe.Where(dto => dto.RejectedAt != null).ToList();
-
-            // Map both halves before changing either field so a malformed response cannot leave a
-            // half-new/half-old Requested Changes snapshot on screen.
-            var byMe = response.ByMe
-                .Where(dto => dto.RejectedAt == null)
-                .Select(dto => MapRequest(dto, dto.TargetCallsign))
-                .OfType<SectorChangeRequest>()
-                .ToList();
-            var fromMe = response.FromMe
-                .Select(dto => MapRequest(dto, dto.RequestingCallsign))
-                .OfType<SectorChangeRequest>()
-                .ToList();
-
-            _requestsByMe.Clear();
-            _requestsByMe.AddRange(byMe);
-
-            _requestsFromMe.Clear();
-            _requestsFromMe.AddRange(fromMe);
-
-            ReportRejections(rejected);
-        }
-        catch (Exception ex)
-        {
-            if (!IsDisposed && IsHandleCreated)
-                Errors.Add(new Exception(ex.Message, ex), "OzServer");
-        }
-
         if (IsDisposed || !IsHandleCreated)
             return;
 
+        // A rejected request comes back in by_me exactly once per rejection, purely so this
+        // controller can be told (see OzServerSectorOwnershipRequestDto.RejectedAt). It is not a
+        // pending request and must not be rendered as one - it is already decided, and Cancel would
+        // have nothing to act on.
+        var rejected = response.ByMe.Where(dto => dto.RejectedAt != null).ToList();
+
+        // Map both halves before changing either field so a malformed response cannot leave a
+        // half-new/half-old Requested Changes snapshot on screen.
+        var byMe = response.ByMe
+            .Where(dto => dto.RejectedAt == null)
+            .Select(dto => MapRequest(dto, dto.TargetCallsign))
+            .OfType<SectorChangeRequest>()
+            .ToList();
+        var fromMe = response.FromMe
+            .Select(dto => MapRequest(dto, dto.RequestingCallsign))
+            .OfType<SectorChangeRequest>()
+            .ToList();
+
+        _requestsByMe.Clear();
+        _requestsByMe.AddRange(byMe);
+
+        _requestsFromMe.Clear();
+        _requestsFromMe.AddRange(fromMe);
+
+        ReportRejections(rejected);
         PopulateRequestedChanges();
     }
 
