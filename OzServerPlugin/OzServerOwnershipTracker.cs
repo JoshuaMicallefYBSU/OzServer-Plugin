@@ -162,6 +162,14 @@ public class OzServerOwnershipTracker
             .Select(s => s!))
         .Distinct();
 
+    // Everyone else's ownership as the window renders it, straight from the last refresh.
+    //
+    // The window used to GET /sectors/controlled on its own 2s poll as well, which - once this
+    // class started fetching the same endpoint for TagOwnershipSync - meant every tick pulled that
+    // response twice. Reading the copy already in hand costs nothing and halves the traffic on the
+    // heaviest of the three queries.
+    public IReadOnlyDictionary<string, OzServerControlledSectorOwnerDto> ControlledByOthers => _controlled;
+
     public bool IsMine(SectorsVolumes.Sector sector) => _owned.Any(o => o.Equals(sector));
 
     // Whoever OzServer currently says holds sector - a synthetic "me" when it's in Owned (Owned

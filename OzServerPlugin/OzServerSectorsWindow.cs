@@ -50,6 +50,10 @@ public class OzServerSectorsWindow : BaseForm
     // this exact left/right-move meaning.
     const string ArrowLeft = "<<"; // points at Owned - claim/request an Available/Controlled selection
     const string ArrowRight = ">>"; // points at Available/Controlled - release an Owned selection
+    // Shown, disabled, when neither list has a selection - exactly what vatsys.SectorsWindow's own
+    // addButton does (see its UpdateChangeButtons: "<<" with Available selected, ">>" with
+    // Controlled selected, otherwise "<<>>" and disabled).
+    const string ArrowIdle = "<<>>";
     const string CollapsedPrefix = "> ";
     const string ExpandedPrefix = "v ";
 
@@ -67,6 +71,12 @@ public class OzServerSectorsWindow : BaseForm
     readonly List<SectorChangeRequest> _requestsByMe = new();
     // Rejections already shown to this controller, by request id - see ReportRejections.
     readonly HashSet<int> _reportedRejections = new();
+    // Drives the Requested From Me heading's flash. A plain on/off toggle on a timer rather than
+    // anything cleverer: vatSys flashes by repainting on a timer too (see MenuRenderer's own), and
+    // the heading is a single row, so invalidating it is cheap.
+    bool _fromMeHasPending;
+    bool _flashOn;
+    readonly System.Windows.Forms.Timer _flashTimer = new() { Interval = 500 };
     SectorListMode _sectorListMode = SectorListMode.Available;
     readonly OzServerApiClient _api = new();
     readonly OzServerOwnershipTracker _tracker;
@@ -99,7 +109,6 @@ public class OzServerSectorsWindow : BaseForm
     List<OzServerControlledSectorDto> _controlledSnapshot = new();
     string? _controlledSignature;
     bool _hasControlledSnapshot;
-    bool _controlledRefreshRunning;
     Task? _requestedRefreshTask;
     bool _requestedRefreshQueued;
     bool _requestActionRunning;
@@ -383,9 +392,12 @@ public class OzServerSectorsWindow : BaseForm
             Enabled = false,
             Margin = new Padding(3, 8, 3, 3),
             Name = "arrowButton",
-            Size = new Size(80, 30),
+            // 90x28, matching vatsys.SectorsWindow's own addButton exactly - every other metric in
+            // this window (inset panels 270x331, trees 265x324, scrollbars 20x331, column panels
+            // 298x337, Apply/Cancel 80x30) already matches it; this button did not.
+            Size = new Size(90, 28),
             TabIndex = 16,
-            Text = ArrowLeft,
+            Text = ArrowIdle,
         };
         _arrowButton.Click += ArrowButton_Click;
 
@@ -545,8 +557,25 @@ public class OzServerSectorsWindow : BaseForm
             _ = RefreshRequestedChangesAsync();
             // Regardless of mode: Available filters against this too, so it has to stay current
             // even while Controlled isn't the list being shown.
-            _ = RefreshControlledSnapshotAsync();
+            RefreshControlledSnapshot();
         };
+
+        _flashTimer.Tick += (_, _) =>
+        {
+            if (!_fromMeHasPending)
+            {
+                if (!_flashOn)
+                    return;
+
+                _flashOn = false;
+                _requestedChangesView.Invalidate();
+                return;
+            }
+
+            _flashOn = !_flashOn;
+            _requestedChangesView.Invalidate();
+        };
+        _flashTimer.Start();
 
         ConfigureCurrScrollbar();
         ConfigureAvailScrollbar();
@@ -555,7 +584,7 @@ public class OzServerSectorsWindow : BaseForm
         PopulateRequestedChanges();
 
         _ = _tracker.RefreshFromServerIfIdleAsync();
-        _ = RefreshControlledSnapshotAsync();
+        RefreshControlledSnapshot();
     }
 
     // Looking at the window is what acknowledges the flash - the same way vatSys stops flashing its
@@ -578,7 +607,7 @@ public class OzServerSectorsWindow : BaseForm
             // OzServer's own record in case a while has passed since the tracker last refreshed.
             _ = _tracker.RefreshFromServerIfIdleAsync();
             _ = RefreshRequestedChangesAsync();
-            _ = RefreshControlledSnapshotAsync();
+            RefreshControlledSnapshot();
         }
         else
         {
@@ -750,11 +779,18 @@ public class OzServerSectorsWindow : BaseForm
         // the only thing it could sensibly mean. Everything else keeps expansion on the middle-click
         // menu: those rows are selectable targets first, and reflowing the list underneath the
         // pointer as one is selected is the behaviour this window was moved away from.
-        if (IsCategoryNode(e.Node))
+        // A heading with no Name is one of the Requested ones - not collapsible, so a left click on
+        // it only selects (which is still meaningful: selecting "Requested From Me" is the
+        // accept-everything-incoming gesture).
+        if (IsCategoryNode(e.Node) && !string.IsNullOrEmpty(e.Node.Name))
             ToggleNodeExpansion(treeView, e.Node);
     }
 
     static bool IsCategoryNode(TreeNode node) => ReferenceEquals(node.Tag, CategoryTag);
+
+    // The Requested From Me heading, on the lit half of its flash cycle, while requests are waiting.
+    bool IsFlashingHeading(TreeNode node) =>
+        _fromMeHasPending && _flashOn && IsCategoryNode(node) && node.Text == RequestedFromMeName;
 
     // Middle click deliberately comes off MouseUp rather than NodeMouseClick. NodeMouseClick is
     // raised from the native tree control's NM_CLICK/NM_RCLICK notifications, and WinForms derives
@@ -962,7 +998,7 @@ public class OzServerSectorsWindow : BaseForm
         // wins over it, so a staged row the controller is pointing at still reads as selected.
         var color = selected
             ? Colours.GetColour(Colours.Identities.HighlightedText)
-            : IsStagedNode(e.Node)
+            : IsStagedNode(e.Node) || IsFlashingHeading(e.Node)
                 ? Colours.GetColour(Colours.Identities.WindowWarning)
                 : Colours.GetColour(Colours.Identities.InteractiveText);
 
@@ -1253,7 +1289,12 @@ public class OzServerSectorsWindow : BaseForm
         var ownedSelected = _currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
         var availSelected = _availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
 
-        _arrowButton.Text = ownedSelected ? ArrowRight : ArrowLeft;
+        // Deliberately reads only the Owned and Available trees. A row in Requested is a request in
+        // flight, not a sector sitting somewhere it can be moved out of - Accept, Reject, Add and
+        // Remove there are all decisions about that request, which is what the middle-click menu is
+        // for. Letting the arrow act on it broke the flow: the button means "move between these two
+        // lists", and Requested is neither of them.
+        _arrowButton.Text = ownedSelected ? ArrowRight : availSelected ? ArrowLeft : ArrowIdle;
         _arrowButton.Enabled = !_applyRunning && (ownedSelected || availSelected);
     }
 
@@ -1296,7 +1337,7 @@ public class OzServerSectorsWindow : BaseForm
     {
         _ = _tracker.RefreshFromServerIfIdleAsync();
         _ = RefreshRequestedChangesAsync();
-        _ = RefreshControlledSnapshotAsync();
+        RefreshControlledSnapshot();
     }
 
     void RefreshStagedHighlight()
@@ -1324,7 +1365,7 @@ public class OzServerSectorsWindow : BaseForm
         // Draws from the cached snapshot immediately (RenderControlledList), so the press is never
         // waiting on the network, and only asks for a fresher one behind it.
         PopulateAvailableList();
-        _ = RefreshControlledSnapshotAsync();
+        RefreshControlledSnapshot();
         UpdateArrowButton();
     }
 
@@ -1588,62 +1629,57 @@ public class OzServerSectorsWindow : BaseForm
     //
     // Refreshed on the window's own poll regardless of which mode is showing, so switching to
     // Controlled has an answer ready rather than starting a request the controller waits on.
-    async Task RefreshControlledSnapshotAsync()
-    {
-        if (!Network.IsConnected || _controlledRefreshRunning)
-            return;
-
-        _controlledRefreshRunning = true;
-        try
-        {
-            var controlled = await _api.GetControlledSectorsAsync();
-
-            if (IsDisposed || !IsHandleCreated)
-                return;
-
-            var signature = ControlledSignature(controlled);
-            var firstAnswer = !_hasControlledSnapshot;
-
-            _controlledSnapshot = controlled;
-            _controlledNames.Clear();
-            foreach (var dto in controlled)
-                _controlledNames.Add(dto.Name);
-            _hasControlledSnapshot = true;
-
-            // Only re-render when the answer actually changed. This runs on every poll tick, and
-            // rebuilding the node tree each time is what made switching modes stutter: the switch
-            // drew from cache, then this landed a moment later and redrew the identical list on top
-            // of it. Ownership rarely changes between ticks, so in the normal case this now does
-            // nothing at all.
-            if (firstAnswer || signature != _controlledSignature)
-            {
-                _controlledSignature = signature;
-
-                // Both lists depend on this, not just Controlled - Available's claimable set
-                // changes whenever somebody else's ownership does.
-                PopulateAvailableList();
-            }
-        }
-        catch (Exception ex)
-        {
-            // Deliberately fire-and-forget from the poll, so nothing escapes as an unobserved task
-            // exception. The previous snapshot stays up rather than blanking the list on a blip.
-            if (!IsDisposed && IsHandleCreated)
-                Errors.Add(new Exception($"Couldn't refresh controlled sectors: {ex.Message}", ex), "OzServer");
-        }
-        finally
-        {
-            _controlledRefreshRunning = false;
-        }
-    }
-
     // Sector name plus owner, so a handover between two controllers counts as a change even though
-    // the set of controlled sectors did not move. Ordered, because the endpoint makes no promise
-    // about row order and an unstable fingerprint would defeat the whole point of comparing it.
+    // the set of controlled sectors did not move. Ordered, because nothing guarantees a stable
+    // order and an unstable fingerprint would defeat the point of comparing it at all.
     static string ControlledSignature(IEnumerable<OzServerControlledSectorDto> controlled) =>
         string.Join("|", controlled
             .Select(dto => dto.Name + ">" + (dto.Owner?.Callsign ?? ""))
             .OrderBy(v => v, StringComparer.Ordinal));
+
+    // Rebuilds the Controlled snapshot from the tracker's own last refresh instead of issuing a
+    // second GET /sectors/controlled.
+    //
+    // The tracker already fetches that endpoint (TagOwnershipSync needs everyone else's ownership),
+    // and this window was fetching it again on the same 2s tick - so the heaviest of the three
+    // queries was being pulled twice per tick, per client. Nothing here needs to be async any more:
+    // the data is already in hand by the time the tracker has refreshed.
+    void RefreshControlledSnapshot()
+    {
+        if (IsDisposed || !IsHandleCreated)
+            return;
+
+        var controlled = _tracker.ControlledByOthers
+            .Select(pair => new OzServerControlledSectorDto
+            {
+                Name = pair.Key,
+                FullName = SectorsVolumes.Sectors.FirstOrDefault(x => x.Name == pair.Key)?.FullName ?? pair.Key,
+                Owner = pair.Value,
+            })
+            .ToList();
+
+        var signature = ControlledSignature(controlled);
+        var firstAnswer = !_hasControlledSnapshot;
+
+        _controlledSnapshot = controlled;
+        _controlledNames.Clear();
+        foreach (var dto in controlled)
+            _controlledNames.Add(dto.Name);
+        _hasControlledSnapshot = true;
+
+        // Only re-render when the answer actually changed. This runs on every poll tick, and
+        // rebuilding the node tree each time is what made switching modes stutter: the switch drew
+        // from cache, then this landed a moment later and redrew the identical list on top of it.
+        // Ownership rarely changes between ticks, so in the normal case this does nothing at all.
+        if (!firstAnswer && signature == _controlledSignature)
+            return;
+
+        _controlledSignature = signature;
+
+        // Both lists depend on this, not just Controlled - Available's claimable set changes
+        // whenever somebody else's ownership does.
+        PopulateAvailableList();
+    }
 
     // Whether OzServer records this sector as someone else's right now. Distinct from the live
     // VATSIM presence test in TryMatchAvailable, and the reason both are needed: a controller who
@@ -1859,12 +1895,19 @@ public class OzServerSectorsWindow : BaseForm
         return bold;
     }
 
-    static TreeNode CreateCategoryNode(TreeViewEx view, string name)
+    static TreeNode CreateCategoryNode(TreeViewEx view, string name) => CreateCategoryNode(view, name, collapsible: true);
+
+    // collapsible:false makes a plain heading rather than a dropdown - no >/v prefix, and
+    // RefreshDropdownNodeText leaves it alone because that keys off Name. Used for Requested By/From
+    // Me, which are labels for the two halves of one short list rather than groups worth folding
+    // away: there are only ever two of them, and hiding either hides the thing the controller opened
+    // the window to act on.
+    static TreeNode CreateCategoryNode(TreeViewEx view, string name, bool collapsible)
     {
-        var node = new TreeNode(CollapsedPrefix + name)
+        var node = new TreeNode(collapsible ? CollapsedPrefix + name : name)
         {
             Tag = CategoryTag,
-            Name = name,
+            Name = collapsible ? name : string.Empty,
             NodeFont = GetCategoryFont(view.Font)
         };
         node.ToolTipText = node.Text;
@@ -2345,10 +2388,13 @@ public class OzServerSectorsWindow : BaseForm
 
     void PopulateRequestedChanges()
     {
-        var byMeNode = CreateCategoryNode(_requestedChangesView, RequestedByMeName);
+        var byMeNode = CreateCategoryNode(_requestedChangesView, RequestedByMeName, collapsible: false);
         AddRequestNodes(byMeNode, _requestsByMe, NoRequestsByMe, _stagedRequests);
 
-        var fromMeNode = CreateCategoryNode(_requestedChangesView, RequestedFromMeName);
+        var fromMeNode = CreateCategoryNode(_requestedChangesView, RequestedFromMeName, collapsible: false);
+        // Marked so DrawNode can flash it - the last step of the chain that starts at the Settings
+        // menu: something is waiting, and this is the half of the list it is waiting in.
+        _fromMeHasPending = _requestsFromMe.Count > 0;
         AddRequestNodes(fromMeNode, _requestsFromMe, NoRequestsFromMe);
 
         var rootNodes = new[] { byMeNode, fromMeNode };
@@ -2369,6 +2415,11 @@ public class OzServerSectorsWindow : BaseForm
             {
                 _requestedChangesView.Nodes.Clear();
                 _requestedChangesView.Nodes.AddRange(rootNodes);
+
+                // Always open: they are headings, not dropdowns, so their contents are simply the
+                // list. Expanded during the rebuild, where _rebuildingTree already permits it.
+                foreach (var root in rootNodes)
+                    root.Expand();
                 RestoreExpandedAndSelection(_requestedChangesView, state);
             }
             finally
@@ -2491,7 +2542,7 @@ public class OzServerSectorsWindow : BaseForm
         // used to provide. Read off the rendered nodes rather than _requestsFromMe so it can only
         // ever act on what the controller is actually looking at - notably, the "No incoming
         // requests" placeholder carries no Tag and so contributes nothing.
-        if (ReferenceEquals(selected.Tag, CategoryTag) && selected.Name == RequestedFromMeName)
+        if (ReferenceEquals(selected.Tag, CategoryTag) && selected.Text == RequestedFromMeName)
             return selected.Nodes.Cast<TreeNode>()
                 .Select(n => n.Tag as SectorChangeRequest)
                 .Where(r => r != null)
@@ -2529,7 +2580,10 @@ public class OzServerSectorsWindow : BaseForm
         while (top?.Parent != null)
             top = top.Parent;
 
-        return top?.Name;
+        // Text, not Name: the Requested headings are plain (non-collapsible) headers and carry no
+        // Name, and Text is exactly the heading for those. A collapsible category's Text has the
+        // >/v prefix, so its Name is still preferred where it has one.
+        return top == null ? null : string.IsNullOrEmpty(top.Name) ? top.Text : top.Name;
     }
 
     // Accepts one or several incoming requests as a single batch - one when a request row is

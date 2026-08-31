@@ -44,6 +44,13 @@ public class Plugin : IPlugin
     // can happen long before the Sectors window is ever opened.
     readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
 
+    // Incoming requests waiting on this controller, and the flash state driving the menu trail.
+    int _pendingRequests;
+    bool _requestFlashOn;
+    readonly System.Windows.Forms.Timer _requestFlashTimer = new() { Interval = 500 };
+    ToolStripMenuItem? _settingsMenuHeader;
+    ToolStripItem? _ozServerSectorsItem;
+
     public Plugin()
     {
         _ownershipTracker = new OzServerOwnershipTracker();
@@ -64,27 +71,29 @@ public class Plugin : IPlugin
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
 
-        // An incoming request flashes the OzServer Sectors window's title bar - the same
-        // BaseForm.FlashTitleBar the ATIS window uses - rather than putting anything on screen.
+        // An incoming request flashes its way inward, one level at a time, so it is visible from
+        // wherever the controller happens to be looking without anything covering the radar:
         //
-        // It was a popup, and before that a custom-painted indicator injected into vatSys's own menu
-        // bar. The popup was worse than the indicator: this event is raised from a poll, and two
-        // polls overlapping (the timer and a Connected refresh, say) could both observe the old
-        // request set and both fire, so the same request produced two dialogs on top of each other.
-        // Flashing is idempotent - setting it twice looks identical to setting it once - so that
-        // whole class of duplicate goes away rather than being guarded against.
+        //   Settings (menu bar)  ->  OzServer Sectors (inside Settings)  ->  Requested From Me
+        //
+        // Each level shows only while the level outside it is already open, which is what makes it
+        // a trail to follow rather than three things blinking at once. The window's own title bar
+        // flashes too (BaseForm.FlashTitleBar, as the ATIS window does) for when it is already open
+        // but not focused. The Requested From Me heading itself is handled inside the window.
+        //
+        // Replaces a popup, and before that a custom-painted menu-bar indicator. The popup also had
+        // a duplication bug: this event is raised from a poll, and two overlapping polls could both
+        // observe the old request set and both fire. Flashing is idempotent, so that class of
+        // problem does not arise.
         _ownershipTracker.IncomingRequestsChanged += (_, requests) =>
         {
             void Apply()
             {
-                // Only meaningful once the window exists; if it has never been opened there is
-                // nothing to flash, and the requests are still waiting when it is.
-                if (_sectorsWindow is not { IsDisposed: false } window)
-                    return;
+                _pendingRequests = requests.Count;
+                RefreshRequestFlash();
 
-                // Not while they are already looking at it - same ContainsFocus test vatSys applies
-                // to its own flashing windows.
-                window.FlashTitleBar = requests.Count > 0 && !window.ContainsFocus;
+                if (_sectorsWindow is { IsDisposed: false } window)
+                    window.FlashTitleBar = _pendingRequests > 0 && !window.ContainsFocus;
             }
 
             // The poll this comes from runs on a background timer thread.
@@ -93,6 +102,15 @@ public class Plugin : IPlugin
             else
                 Apply();
         };
+
+        // Repaint on a timer, which is how the flash actually happens - a ToolStripItem only shows a
+        // colour change when it is asked to redraw.
+        _requestFlashTimer.Tick += (_, _) =>
+        {
+            _requestFlashOn = _pendingRequests > 0 && !_requestFlashOn;
+            RefreshRequestFlash();
+        };
+        _requestFlashTimer.Start();
 
         var settingsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
@@ -131,6 +149,11 @@ public class Plugin : IPlugin
             settingsMenu.DropDownItems.Remove(settingsMenuItem.Item);
             settingsMenu.DropDownItems.Insert(insertAt + 1, settingsMenuItem.Item);
 
+            // Captured here rather than earlier: this is the first point at which both the Settings
+            // header and our own entry inside it definitely exist.
+            _settingsMenuHeader = settingsMenu;
+            _ozServerSectorsItem = sectorsMenuItem.Item;
+
             // OzServer Sectors replaces the built-in Sectors window rather than sitting beside it:
             // both write MMI.SectorsControlled, but only this plugin's window also tells OzServer,
             // so a claim made through the built-in one is invisible to every other controller until
@@ -144,6 +167,29 @@ public class Plugin : IPlugin
             sectorsItem.Visible = false;
         };
         Application.Idle += repositionUnderSectors;
+    }
+
+    // Paints the current step of the trail. Only one level is lit at a time: the Settings header
+    // until Settings is open, then the OzServer Sectors entry inside it. Colour comes from the
+    // profile's WindowWarning identity - the same "needs attention" role used for staged rows.
+    void RefreshRequestFlash()
+    {
+        var lit = _pendingRequests > 0 && _requestFlashOn;
+        var settingsOpen = _settingsMenuHeader?.DropDown is { Visible: true };
+
+        if (_settingsMenuHeader != null)
+        {
+            _settingsMenuHeader.ForeColor = lit && !settingsOpen
+                ? Colours.GetColour(Colours.Identities.WindowWarning)
+                : Color.Empty;
+        }
+
+        if (_ozServerSectorsItem != null)
+        {
+            _ozServerSectorsItem.ForeColor = lit && settingsOpen
+                ? Colours.GetColour(Colours.Identities.WindowWarning)
+                : Color.Empty;
+        }
     }
 
     // Black or white, whichever actually reads against the given fill. The indicator's background
