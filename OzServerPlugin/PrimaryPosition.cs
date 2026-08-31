@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using vatsys;
@@ -34,7 +35,16 @@ public static class PrimaryPosition
 
         foreach (var subsector in primary.SubSectors.ToList())
         {
-            if (online.Any(a => a.Callsign == subsector.Callsign))
+            // Someone *else* logged in directly on the sub-sector keeps it - that is their position,
+            // not part of what the primary picks up.
+            //
+            // Compared against the position being computed rather than "is anyone online under this
+            // callsign", because a sub-sector very often carries the same callsign as its own
+            // primary: every one of INL's sub-sectors is BN-INL_CTR. An unqualified check therefore
+            // matched the very controller who was logging in, skipped their entire group, and handed
+            // them a bare primary sector with none of its airspace.
+            if (!string.Equals(subsector.Callsign, callsign, StringComparison.OrdinalIgnoreCase)
+                && online.Any(a => a.Callsign == subsector.Callsign))
                 continue;
 
             // Sector.Equals is callsign-based and == is not overridden, so two instances of the

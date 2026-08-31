@@ -61,44 +61,34 @@ public class Plugin : IPlugin
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
 
-        // An incoming request announces itself with a window on screen rather than an indicator
-        // painted into vatSys's own menu bar. The menu-bar item had to be injected directly into
-        // MainForm.MainMenuStrip (MMI.AddCustomMenuItem only adds *into* an existing dropdown) and
-        // custom-painted, because vatSys's renderer ignores BackColor on top-level items - a lot of
-        // machinery for something easy to miss while looking at the radar. A popup naming the sector
-        // and who asked is both simpler and harder to overlook.
+        // An incoming request flashes the OzServer Sectors window's title bar - the same
+        // BaseForm.FlashTitleBar the ATIS window uses - rather than putting anything on screen.
+        //
+        // It was a popup, and before that a custom-painted indicator injected into vatSys's own menu
+        // bar. The popup was worse than the indicator: this event is raised from a poll, and two
+        // polls overlapping (the timer and a Connected refresh, say) could both observe the old
+        // request set and both fire, so the same request produced two dialogs on top of each other.
+        // Flashing is idempotent - setting it twice looks identical to setting it once - so that
+        // whole class of duplicate goes away rather than being guarded against.
         _ownershipTracker.IncomingRequestsChanged += (_, requests) =>
         {
-            void Show()
+            void Apply()
             {
-                if (requests.Count == 0)
+                // Only meaningful once the window exists; if it has never been opened there is
+                // nothing to flash, and the requests are still waiting when it is.
+                if (_sectorsWindow is not { IsDisposed: false } window)
                     return;
 
-                var lines = requests.Select(r =>
-                    $"    {r.Sector?.Name ?? "Unknown"} - requested by {r.RequestingCallsign}");
-
-                var message = (requests.Count == 1
-                                  ? "A controller has requested a sector from you:"
-                                  : $"{requests.Count} controllers have requested sectors from you:")
-                              + Environment.NewLine + Environment.NewLine
-                              + string.Join(Environment.NewLine, lines)
-                              + Environment.NewLine + Environment.NewLine
-                              + "Open OzServer Sectors to accept or reject them.";
-
-                var notice = new SectorNoticeWindow(message, "Sector requested");
-                if (Application.OpenForms["MainForm"] is Form owner)
-                    notice.Show(owner);
-                else
-                    notice.Show();
-
-                notice.BringToFront();
+                // Not while they are already looking at it - same ContainsFocus test vatSys applies
+                // to its own flashing windows.
+                window.FlashTitleBar = requests.Count > 0 && !window.ContainsFocus;
             }
 
             // The poll this comes from runs on a background timer thread.
             if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-                mainForm.BeginInvoke((MethodInvoker)Show);
+                mainForm.BeginInvoke((MethodInvoker)Apply);
             else
-                Show();
+                Apply();
         };
 
         var settingsMenuItem = new CustomToolStripMenuItem(
