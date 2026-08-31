@@ -8,8 +8,9 @@ namespace OzServerPlugin;
 // "sector already owned - request it?" confirmation, styled to look like vatSys's own private
 // message chat window (a dark, bordered message pane) rather than a bare OS dialog box - vatsys's
 // own ChatWindow/ChatBox aren't public types a plugin can subclass or construct directly, so this
-// rebuilds the same look (InsetPanel-bordered read-only message area, same Terminus font/colour
-// scheme as every other OzServer window here) rather than reusing them.
+// rebuilds the same look (InsetPanel-bordered read-only message area, taking its font from
+// MMI.eurofont_* and its colours from Colours.GetColour exactly as every other OzServer window
+// here does) rather than reusing them.
 //
 // A one-shot dialog, not a reused singleton like OzServerSectorsWindow/OzServerSettingsWindow - a
 // new instance is created and shown modally (ShowDialog, exactly like the MessageBox.Show call it
@@ -51,7 +52,7 @@ public class SectorConflictPromptWindow : BaseForm
             ReadOnly = true,
             TabStop = false,
             ScrollBars = RichTextBoxScrollBars.Vertical,
-            Font = new Font("Terminus (TTF)", 14f, FontStyle.Regular, GraphicsUnit.Pixel),
+            Font = MMI.eurofont_winverysml,
             BackColor = Colours.GetColour(Colours.Identities.WindowBackground),
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText),
             Text = message
@@ -60,12 +61,9 @@ public class SectorConflictPromptWindow : BaseForm
 
         var yesButton = new GenericButton
         {
-            Font = new Font("Terminus (TTF)", 18f, FontStyle.Bold, GraphicsUnit.Pixel),
             Location = new Point(90, 172),
             Size = new Size(80, 30),
-            SubText = "",
             Text = "Yes",
-            UseVisualStyleBackColor = true
         };
         yesButton.Click += (_, _) =>
         {
@@ -75,12 +73,9 @@ public class SectorConflictPromptWindow : BaseForm
 
         var noButton = new GenericButton
         {
-            Font = new Font("Terminus (TTF)", 18f, FontStyle.Bold, GraphicsUnit.Pixel),
             Location = new Point(190, 172),
             Size = new Size(80, 30),
-            SubText = "",
             Text = "No",
-            UseVisualStyleBackColor = true
         };
         noButton.Click += (_, _) => Close();
 

@@ -165,6 +165,8 @@ public class OzServerFdrUpdateDto
 // settings file - see Secrets.cs (gitignored; Secrets.cs.example is the checked-in template).
 public class OzServerApiClient
 {
+    static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+
     static readonly HttpClient Http = CreateClient();
 
     // Null properties are left out of a POST body entirely by default (recursively, so this
@@ -187,7 +189,14 @@ public class OzServerApiClient
             // Best-effort - older Windows builds may not define Tls12 in this enum at all.
         }
 
-        var client = new HttpClient();
+        // HttpClient's own default is 100 seconds - long enough that a backend which accepts a
+        // connection and then stops answering leaves a controller staring at a dead Sectors window
+        // for over a minute with nothing in the error log. Not set anywhere near the 5s/10s timer
+        // intervals, though: those callers already refuse to stack up on their own (FdrSync's
+        // _flushing flag, the tracker's RefreshFromServerIfIdleAsync), so this only has to bound
+        // how long any single request can hang, and needs enough headroom for a genuinely large
+        // FDR batch on a slow connection.
+        var client = new HttpClient { Timeout = RequestTimeout };
         // Without this, Laravel's exception handler can't tell this apart from a browser
         // navigation and falls back to rendering its HTML error page instead of the
         // {"message": "..."} JSON body every error path here is written to expect - confirmed by
@@ -274,7 +283,7 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException($"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}");
+            throw new OzServerApiException(DescribeTransportFailure(ex));
         }
 
         using (response)
@@ -326,7 +335,7 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException($"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}");
+            throw new OzServerApiException(DescribeTransportFailure(ex));
         }
 
         using (response)
@@ -341,6 +350,14 @@ public class OzServerApiClient
             return responseBody;
         }
     }
+
+    // HttpClient reports its own Timeout as a bare TaskCanceledException whose Message is just
+    // "A task was canceled." - indistinguishable, to anyone reading the vatSys error log, from a
+    // cancellation this plugin asked for (it never does). Name the real cause instead.
+    static string DescribeTransportFailure(Exception ex) =>
+        ex is OperationCanceledException // TaskCanceledException, which is what a timeout raises, derives from this
+            ? $"OzServer at {OzServerSettings.BaseUrl} didn't respond within {RequestTimeout.TotalSeconds:0.#}s."
+            : $"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}";
 
     static (string Message, List<OzServerSectorConflictDto> Conflicts) ParseError(string body, int statusCode)
     {

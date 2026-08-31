@@ -17,6 +17,20 @@
         <VatSysPath Condition="'$(VatSysPath)' == ''">$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path)</VatSysPath>
     </PropertyGroup>
 
+    <!--
+      Without this, a machine that simply doesn't have vatSys installed gets an empty VatSysPath,
+      every HintPath below resolves to a bare "\bin\vatSys.exe", and the build fails with a wall of
+      "the type or namespace 'vatsys' could not be found" errors that say nothing about the actual
+      cause. Fail early and say what's wrong instead. Set VatSysPath explicitly (e.g.
+      `dotnet build -p:VatSysPath="D:\vatSys"`) for a non-default install location.
+    -->
+    <Target Name="EnsureVatSysPath" BeforeTargets="ResolveAssemblyReferences">
+        <Error Condition="'$(VatSysPath)' == ''"
+               Text="Could not locate vatSys. It is normally found via HKLM\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path, which is unset or unreadable here - install vatSys, or build with -p:VatSysPath=&quot;C:\Path\To\vatSys&quot;." />
+        <Error Condition="'$(VatSysPath)' != '' AND !Exists('$(VatSysPath)\bin\vatSys.exe')"
+               Text="VatSysPath is '$(VatSysPath)' but '$(VatSysPath)\bin\vatSys.exe' does not exist. Point VatSysPath at the vatSys install root (the folder containing bin\vatSys.exe)." />
+    </Target>
+
     <ItemGroup>
         <!--
           Reference the installed vatSys.exe so the plugin compiles against the

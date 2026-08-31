@@ -64,9 +64,14 @@ public class Plugin : IPlugin
         {
             var item = (ToolStripMenuItem)sender!;
             var rect = new Rectangle(Point.Empty, item.Size);
-            using var brush = new SolidBrush(Color.Orange);
+            // WindowWarning rather than a hardcoded Color.Orange: this is exactly the "something
+            // needs your attention" role vatSys already has an identity for, so the indicator
+            // follows whatever the loaded profile defines instead of being the one element on the
+            // menu bar that ignores the theme.
+            var background = Colours.GetColour(Colours.Identities.WindowWarning);
+            using var brush = new SolidBrush(background);
             e.Graphics.FillRectangle(brush, rect);
-            TextRenderer.DrawText(e.Graphics, item.Text, item.Font, rect, Color.Black,
+            TextRenderer.DrawText(e.Graphics, item.Text, item.Font, rect, ContrastingTextColour(background),
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         };
 
@@ -143,30 +148,51 @@ public class Plugin : IPlugin
         Application.Idle += repositionUnderSectors;
     }
 
+    // Black or white, whichever actually reads against the given fill. The indicator's background
+    // now comes from the profile (see the Paint handler above), and a profile is free to define
+    // WindowWarning as something dark - fixing the text at black would make the whole indicator
+    // unreadable in that case. ITU-R BT.601 luma, the usual weighting for this.
+    static Color ContrastingTextColour(Color background) =>
+        (0.299 * background.R + 0.587 * background.G + 0.114 * background.B) > 140
+            ? Color.Black
+            : Color.White;
+
     void OpenSectorsWindow()
     {
         // OzServerSectorsWindow hides rather than closes, so once created the same
         // instance is reused (and its event subscriptions stay alive) for the plugin's lifetime.
         _sectorsWindow ??= new OzServerSectorsWindow(_ownershipTracker);
-
-        if (!_sectorsWindow.Visible)
-        {
-            _sectorsWindow.Show(Application.OpenForms["MainForm"]);
-        }
-
-        _sectorsWindow.BringToFront();
+        ShowWindow(_sectorsWindow);
     }
 
     void OpenSettingsWindow()
     {
         _settingsWindow ??= new OzServerSettingsWindow();
+        ShowWindow(_settingsWindow);
+    }
 
-        if (!_settingsWindow.Visible)
+    // ShowWithPlacement rather than Show: it is how every vatSys window is opened, and it restores
+    // the position and size the controller last left the window at, keyed on Control.Name (which is
+    // why both windows set a unique Name). Plain Show() ignores saved placement entirely, so the
+    // window reappeared at its StartPosition every single time it was opened.
+    //
+    // Falls back to Show() only if MainForm isn't there to own it - ShowWithPlacement needs a Form,
+    // and an owner is also what keeps the window above the maximised main form rather than dropping
+    // behind it the moment focus returns.
+    static void ShowWindow(BaseForm window)
+    {
+        if (window.Visible)
         {
-            _settingsWindow.Show(Application.OpenForms["MainForm"]);
+            window.BringToFront();
+            return;
         }
 
-        _settingsWindow.BringToFront();
+        if (Application.OpenForms["MainForm"] is Form mainForm)
+            window.ShowWithPlacement(mainForm);
+        else
+            window.Show();
+
+        window.BringToFront();
     }
 
     public void OnFDRUpdate(FDP2.FDR updated)

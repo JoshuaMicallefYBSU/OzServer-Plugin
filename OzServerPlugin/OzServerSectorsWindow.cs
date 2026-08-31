@@ -27,7 +27,7 @@ namespace OzServerPlugin;
 // built-in Sectors window, VSCS/AFV transmit via AfvSectorClaimer, ...) independent of whether this
 // window happens to be open, so Owned catches up immediately rather than only on this window's own
 // next poll or the next time it's opened. Requested Changes is refreshed from GET /sector-requests
-// on open and every 30s after that, since an incoming "Requested From Me" entry is something
+// on open and every 10s after that, since an incoming "Requested From Me" entry is something
 // another controller creates server-side with no local signal to react to otherwise.
 public class OzServerSectorsWindow : BaseForm
 {
@@ -35,15 +35,14 @@ public class OzServerSectorsWindow : BaseForm
     const string NoRequestsByMe = "No outgoing requests";
     const string RequestedByMeName = "Requested By Me";
     const string RequestedFromMeName = "Requested From Me";
-    // Plain ASCII, not a Unicode arrow glyph - Terminus (TTF), the font every button in this
-    // window uses, isn't guaranteed to include one, and the rest of vatsys's own UI (see
-    // vatsys.SectorsWindow) sticks to "<<"/">>"/"<<>>" for this exact left/right-move meaning.
+    // Plain ASCII, not a Unicode arrow glyph - vatSys's own UI font (Terminus, via
+    // MMI.eurofont_*, which is what GenericButton defaults to) isn't guaranteed to include one,
+    // and the rest of vatsys's own UI (see vatsys.SectorsWindow) sticks to "<<"/">>"/"<<>>" for
+    // this exact left/right-move meaning.
     const string ArrowLeft = "<<"; // points at Owned - claim/request an Available/Controlled selection
     const string ArrowRight = ">>"; // points at Available/Controlled - release an Owned selection
     const string CollapsedPrefix = "> ";
     const string ExpandedPrefix = "v ";
-    static readonly Font ButtonFont = new("Terminus (TTF)", 18f, FontStyle.Bold, GraphicsUnit.Pixel);
-    static readonly Font ButtonSubFont = new("Microsoft Sans Serif", 8.25f, FontStyle.Regular, GraphicsUnit.Point, 0);
 
     // Marks a TreeNode as a group header (Approach/Centre/.../Requested By Me/...) rather than a
     // selectable leaf, regardless of which tree it's in or what leaf-Tag type that tree otherwise
@@ -322,28 +321,53 @@ public class OzServerSectorsWindow : BaseForm
         // Checked "Requested From Me" leaves take priority over the plain single selection - a
         // controller who never bothered checking anything (the common case: accept just the one
         // thing they clicked) still gets that single request accepted.
+        // Guarded for the same reason as ArrowButton_Click - these lambdas are async void.
         _acceptButton.Click += async (_, _) =>
         {
-            var requests = GetCheckedFromMeRequests();
-            if (requests.Count == 0 && _requestedChangesView.SelectedNode?.Tag is SectorChangeRequest selected)
-                requests.Add(selected);
+            try
+            {
+                var requests = GetCheckedFromMeRequests();
+                if (requests.Count == 0 && _requestedChangesView.SelectedNode?.Tag is SectorChangeRequest selected)
+                    requests.Add(selected);
 
-            if (requests.Count > 0)
-                await AcceptRequestsAsync(requests);
+                if (requests.Count > 0)
+                    await AcceptRequestsAsync(requests);
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't accept that sector request: {ex.Message}", ex), "OzServer");
+                UpdateRequestActionButtons();
+            }
         };
 
         _rejectButton = CreateRequestActionButton("Reject");
         _rejectButton.Click += async (_, _) =>
         {
-            if (_requestedChangesView.SelectedNode?.Tag is SectorChangeRequest request)
-                await RejectRequestAsync(request);
+            try
+            {
+                if (_requestedChangesView.SelectedNode?.Tag is SectorChangeRequest request)
+                    await RejectRequestAsync(request);
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't reject that sector request: {ex.Message}", ex), "OzServer");
+                UpdateRequestActionButtons();
+            }
         };
 
         _cancelRequestButton = CreateRequestActionButton("Cancel");
         _cancelRequestButton.Click += async (_, _) =>
         {
-            if (_requestedChangesView.SelectedNode?.Tag is SectorChangeRequest request)
-                await CancelRequestAsync(request);
+            try
+            {
+                if (_requestedChangesView.SelectedNode?.Tag is SectorChangeRequest request)
+                    await CancelRequestAsync(request);
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't cancel that sector request: {ex.Message}", ex), "OzServer");
+                UpdateRequestActionButtons();
+            }
         };
 
         _requestActionsPanel = new FlowLayoutPanel
@@ -363,15 +387,11 @@ public class OzServerSectorsWindow : BaseForm
         {
             Anchor = AnchorStyles.None,
             Enabled = false,
-            Font = ButtonFont,
             Margin = new Padding(3, 8, 3, 3),
             Name = "arrowButton",
             Size = new Size(80, 30),
-            SubFont = ButtonSubFont,
-            SubText = "",
             TabIndex = 16,
             Text = ArrowLeft,
-            UseVisualStyleBackColor = true
         };
         _arrowButton.Click += ArrowButton_Click;
 
@@ -394,8 +414,7 @@ public class OzServerSectorsWindow : BaseForm
         {
             Anchor = AnchorStyles.None,
             AutoSize = true,
-            Font = new Font("Terminus (TTF)", 16f, FontStyle.Bold, GraphicsUnit.Pixel),
-            ForeColor = Colours.GetColour(Colours.Identities.InteractiveText),
+            ForeColor = Colours.GetColour(Colours.Identities.GenericText),
             HasBorder = false,
             InteractiveText = false,
             Location = new Point(76, 0),
@@ -410,8 +429,7 @@ public class OzServerSectorsWindow : BaseForm
         {
             Anchor = AnchorStyles.None,
             AutoSize = true,
-            Font = new Font("Terminus (TTF)", 16f, FontStyle.Bold, GraphicsUnit.Pixel),
-            ForeColor = Colours.GetColour(Colours.Identities.InteractiveText),
+            ForeColor = Colours.GetColour(Colours.Identities.GenericText),
             HasBorder = false,
             InteractiveText = false,
             Location = new Point(325, 0),
@@ -424,31 +442,23 @@ public class OzServerSectorsWindow : BaseForm
 
         _availableModeButton = new ToggleGenericButton
         {
-            Font = ButtonFont,
             Margin = new Padding(2),
             Name = "availableModeButton",
             Pressed = true,
             Size = new Size(120, 30),
-            SubFont = ButtonSubFont,
-            SubText = "",
             TabIndex = 17,
             Text = "Available",
-            UseVisualStyleBackColor = true
         };
         _availableModeButton.Click += (_, _) => SetSectorListMode(SectorListMode.Available);
 
         _controlledModeButton = new ToggleGenericButton
         {
-            Font = ButtonFont,
             Margin = new Padding(2),
             Name = "controlledModeButton",
             Pressed = false,
             Size = new Size(120, 30),
-            SubFont = ButtonSubFont,
-            SubText = "",
             TabIndex = 18,
             Text = "Controlled",
-            UseVisualStyleBackColor = true
         };
         _controlledModeButton.Click += (_, _) => SetSectorListMode(SectorListMode.Controlled);
 
@@ -490,30 +500,22 @@ public class OzServerSectorsWindow : BaseForm
         _applyButton = new GenericButton
         {
             Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-            Font = ButtonFont,
             Location = new Point(754, 430),
             Name = "applyButton",
             Size = new Size(80, 30),
-            SubFont = ButtonSubFont,
-            SubText = "",
             TabIndex = 2,
             Text = "Apply",
-            UseVisualStyleBackColor = true
         };
         _applyButton.Click += ApplyButton_Click;
 
         _cancelButton = new GenericButton
         {
             Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-            Font = ButtonFont,
             Location = new Point(840, 430),
             Name = "cancelButton",
             Size = new Size(80, 30),
-            SubFont = ButtonSubFont,
-            SubText = "",
             TabIndex = 3,
             Text = "Cancel",
-            UseVisualStyleBackColor = true
         };
         _cancelButton.Click += CancelButton_Click;
 
@@ -523,9 +525,10 @@ public class OzServerSectorsWindow : BaseForm
 
         // The tracker (not MMI.SectorsControlledChanged directly - see the class comment) is what
         // Owned actually follows, so it stays in sync with a change made through the tracker while
-        // this window isn't even open, not just changes made while it's visible. BeginInvoke since
-        // OwnedChanged can fire off the UI thread.
-        _tracker.OwnedChanged += (_, _) => _currSectorsView.BeginInvoke((MethodInvoker)SyncOwnedFromTracker);
+        // this window isn't even open, not just changes made while it's visible. Marshalled through
+        // RunOnUiThread since OwnedChanged can fire off the UI thread, and can fire before this
+        // window has a handle to post to at all - see that method.
+        _tracker.OwnedChanged += (_, _) => RunOnUiThread(SyncOwnedFromTracker);
         Network.OnlineATCChanged += (_, _) => RefreshAvailableList();
 
         // Requested Changes has no local signal for an incoming request another controller just
@@ -538,7 +541,7 @@ public class OzServerSectorsWindow : BaseForm
         _pollTimer = new System.Windows.Forms.Timer { Interval = 10000 };
         _pollTimer.Tick += (_, _) =>
         {
-            _ = _tracker.RefreshFromServerAsync();
+            _ = _tracker.RefreshFromServerIfIdleAsync();
             _ = RefreshRequestedChangesAsync();
             if (_sectorListMode == SectorListMode.Controlled)
                 PopulateAvailableList();
@@ -549,7 +552,7 @@ public class OzServerSectorsWindow : BaseForm
         SyncOwnedFromTracker();
         PopulateRequestedChanges();
 
-        _ = _tracker.RefreshFromServerAsync();
+        _ = _tracker.RefreshFromServerIfIdleAsync();
     }
 
     protected override void OnVisibleChanged(EventArgs e)
@@ -561,7 +564,7 @@ public class OzServerSectorsWindow : BaseForm
             _pollTimer.Start();
             // Every time the window is opened, not just the first time this session - a nudge for
             // OzServer's own record in case a while has passed since the tracker last refreshed.
-            _ = _tracker.RefreshFromServerAsync();
+            _ = _tracker.RefreshFromServerIfIdleAsync();
             _ = RefreshRequestedChangesAsync();
             if (_sectorListMode == SectorListMode.Controlled)
                 PopulateAvailableList();
@@ -569,6 +572,35 @@ public class OzServerSectorsWindow : BaseForm
         else
         {
             _pollTimer.Stop();
+        }
+    }
+
+    // Every background signal this window reacts to - the tracker's OwnedChanged, Network's
+    // OnlineATCChanged - can arrive off the UI thread, and can arrive before this window has ever
+    // been shown, i.e. before its handle exists. BeginInvoke on a handleless control throws, and
+    // because the tracker raises OwnedChanged outside its own try/catch that exception used to
+    // escape RefreshFromServerAsync entirely rather than being reported anywhere. Nothing is lost
+    // by skipping: OnVisibleChanged refreshes again on show, and the constructor populates
+    // directly.
+    void RunOnUiThread(MethodInvoker action)
+    {
+        if (IsDisposed || !IsHandleCreated)
+            return;
+
+        try
+        {
+            if (InvokeRequired)
+                BeginInvoke(action);
+            else
+                action();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Window went away between the check above and the post - nothing left to update.
+        }
+        catch (InvalidOperationException)
+        {
+            // Handle destroyed in that same gap - same story.
         }
     }
 
@@ -688,16 +720,25 @@ public class OzServerSectorsWindow : BaseForm
     static void SectorsView_DrawNode(object? sender, DrawTreeNodeEventArgs e)
     {
         var treeView = (TreeViewEx)sender!;
-        var clip = e.Graphics.Clip;
 
         var color = (e.State & TreeNodeStates.Selected) != 0
             ? Colours.GetColour(Colours.Identities.HighlightedText)
             : Colours.GetColour(Colours.Identities.InteractiveText);
 
-        e.Graphics.Clip = new Region(e.Bounds);
+        // Both of these are unmanaged GDI+ region handles, and this runs once per node per repaint
+        // across three trees - neither can be left to the finalizer. Graphics.Clip's *getter*
+        // allocates a fresh Region every call (it is not a borrowed reference), so the saved
+        // original needs disposing just as much as the replacement does. The setter copies the
+        // region it's given, which is what makes it safe to dispose the replacement immediately.
+        using var previousClip = e.Graphics.Clip;
+
+        using (var clip = new Region(e.Bounds))
+            e.Graphics.Clip = clip;
+
         e.Graphics.Clear(treeView.BackColor);
         TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, color);
-        e.Graphics.Clip = clip;
+
+        e.Graphics.Clip = previousClip;
     }
 
     // Group headers (Approach/Centre/.../Requested By Me/...) get the >/v expand-collapse prefix
@@ -864,9 +905,22 @@ public class OzServerSectorsWindow : BaseForm
         _arrowButton.Enabled = ownedSelected || availSelected;
     }
 
+    // Compares on exactly the footing ApplyButton_Click actually applies: non-dummy sectors, as a
+    // set. SequenceEqual against the raw MMI.SectorsControlled was both order-sensitive and
+    // dummy-sensitive, while _sectorsSelected arrives in OzServer's response order and never
+    // contains dummies (they're vatSys's own backfill for uncontrolled airspace, filtered out at
+    // every other site in this codebase) - so it reported "unsaved changes" essentially always,
+    // leaving Apply and Cancel permanently lit whether or not anything actually differed.
     void UpdateApplyCancelButtons()
     {
-        var upToDate = _sectorsSelected.SequenceEqual(MMI.SectorsControlled);
+        var applied = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
+        var selected = _sectorsSelected.Where(s => !s.IsDummy).ToList();
+
+        // Sector.Equals is callsign-based; == is not overloaded, so it must not be used here (the
+        // same trap AfvSectorClaimer.CheckActive documents).
+        var upToDate = selected.Count == applied.Count
+                       && selected.All(s => applied.Any(a => a.Equals(s)));
+
         _applyButton.Enabled = !upToDate;
         _cancelButton.Enabled = !upToDate;
     }
@@ -892,33 +946,41 @@ public class OzServerSectorsWindow : BaseForm
 
     void RefreshAvailableList()
     {
-        if (_availSectorsView.InvokeRequired)
-        {
-            _availSectorsView.BeginInvoke((MethodInvoker)RefreshAvailableList);
-            return;
-        }
-
+        // IsDisposed before InvokeRequired: reading InvokeRequired on a disposed control can throw
+        // ObjectDisposedException, and this is reached from Network.OnlineATCChanged, which keeps
+        // firing regardless of what has happened to this window.
         if (IsDisposed)
             return;
+
+        if (InvokeRequired)
+        {
+            RunOnUiThread(RefreshAvailableList);
+            return;
+        }
 
         PopulateAvailableList();
     }
 
     void LoadSectors()
     {
-        _sectorsSelected = MMI.SectorsControlled.ToList();
+        // Dummies filtered out: they are vatSys's own placeholder infill for airspace nobody
+        // controls, never something this window can claim, release or request. Taking
+        // MMI.SectorsControlled wholesale put them straight into _sectorsSelected, where they
+        // showed up as rows in Owned and skewed the Apply/Cancel comparison above.
+        _sectorsSelected = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
         PopulateLists();
         UpdateApplyCancelButtons();
     }
 
     void PopulateLists()
     {
+        // IsDisposed first - see RefreshAvailableList.
         if (IsDisposed)
             return;
 
-        if (_currSectorsView.InvokeRequired)
+        if (InvokeRequired)
         {
-            _currSectorsView.BeginInvoke((MethodInvoker)PopulateLists);
+            RunOnUiThread(PopulateLists);
             return;
         }
 
@@ -943,8 +1005,14 @@ public class OzServerSectorsWindow : BaseForm
         {
             // A grouping sector (e.g. AAE) owns AAW/AAR outright - if one of those is independently
             // in _sectorsSelected too it still belongs nested under its group, not at top level.
+            // !other.Equals(key), not other != key: Sector overrides Equals/GetHashCode but not the
+            // == operator, so two instances of the same real sector reached by different lookups
+            // compare unequal under != (see AfvSectorClaimer.CheckActive, which documents the same
+            // trap). One TryGetValue rather than ContainsKey plus an indexer, while here.
             var isSubordinate = _sectorsSelected.Any(other =>
-                other != key && SectorsVolumes.SectorGroupings.ContainsKey(other) && SectorsVolumes.SectorGroupings[other].Contains(key));
+                !other.Equals(key)
+                && SectorsVolumes.SectorGroupings.TryGetValue(other, out var covered)
+                && covered.Contains(key));
             if (isSubordinate)
                 continue;
 
@@ -985,9 +1053,13 @@ public class OzServerSectorsWindow : BaseForm
         // process (uncatchable - that's the clr.dll crash). Render the self-entry as a plain leaf
         // instead, same as vatsys.SectorsWindow's own "p == s" case. depth is a hard backstop
         // against any other cyclical grouping the real dataset might contain.
-        if (sector.SubSectors.Count > 0 && depth < 8)
+        // TryGetValue, not an indexer: SubSectors being non-empty is not a guarantee that this
+        // sector has a SectorGroupings entry - PopulateOwnedList already probes with ContainsKey
+        // before indexing, so the dataset evidently can disagree. Indexing directly turns that into
+        // a KeyNotFoundException in the middle of a tree rebuild.
+        if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in SectorsVolumes.SectorGroupings[sector])
+            foreach (var child in children)
             {
                 node.Nodes.Add(ReferenceEquals(child, sector)
                     ? new TreeNode(FormatSectorText(child)) { Tag = child, NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
@@ -1053,7 +1125,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message), "OzServer");
+            Errors.Add(new Exception(ex.Message, ex), "OzServer");
             controlled = new List<OzServerControlledSectorDto>();
         }
 
@@ -1104,9 +1176,10 @@ public class OzServerSectorsWindow : BaseForm
         // See BuildOwnedSectorNode for why the self-reference case (e.g. TBD listing itself in its
         // own SectorGroupings) has to be a leaf, not a recursive call - it would otherwise loop
         // forever and crash the whole process with a stack overflow.
-        if (sector.SubSectors.Count > 0 && depth < 8)
+        // See BuildOwnedSectorNode for why this is TryGetValue rather than an indexer.
+        if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in SectorsVolumes.SectorGroupings[sector])
+            foreach (var child in children)
             {
                 if (ReferenceEquals(child, sector))
                 {
@@ -1163,13 +1236,33 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
+    // Bold category-header fonts, cached against the view font they were derived from. A Font is an
+    // unmanaged GDI handle, and AddCategoryNode runs for every category in all three trees on every
+    // rebuild - a poll tick every 10s, every OnlineATCChanged, every claim or release - so
+    // allocating one per header and never disposing it churned handles for the plugin's whole
+    // lifetime. Keyed rather than a single static because the three views could in principle report
+    // different fonts; in practice they all inherit the form's, so this holds one entry.
+    // UI-thread-only, so no synchronisation.
+    static readonly Dictionary<Font, Font> CategoryFonts = new();
+
+    static Font GetCategoryFont(Font source)
+    {
+        if (!CategoryFonts.TryGetValue(source, out var bold))
+        {
+            bold = new Font(source, FontStyle.Bold);
+            CategoryFonts[source] = bold;
+        }
+
+        return bold;
+    }
+
     static TreeNode AddCategoryNode(TreeViewEx view, string name)
     {
         var node = new TreeNode(CollapsedPrefix + name)
         {
             Tag = CategoryTag,
             Name = name,
-            NodeFont = new Font(view.Font, FontStyle.Bold)
+            NodeFont = GetCategoryFont(view.Font)
         };
         node.ToolTipText = node.Text;
         view.Nodes.Add(node);
@@ -1227,18 +1320,31 @@ public class OzServerSectorsWindow : BaseForm
         UpdateArrowButton();
     }
 
+    // async void, so nothing may escape: an exception leaving this method is unhandled on the UI
+    // thread and takes vatSys down with it, rather than surfacing in the error log. The tracker
+    // handles the API calls themselves, but not everything downstream of them - conflict handling
+    // in particular marshals a modal dialog, and used to be raised from inside a catch clause where
+    // the sibling catch could not see it (see OzServerOwnershipTracker.ClaimAsync).
     async void ArrowButton_Click(object? sender, EventArgs e)
     {
-        if (_currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector ownedSector)
+        try
         {
-            await ReleaseSectorAsync(ownedSector);
+            if (_currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector ownedSector)
+            {
+                await ReleaseSectorAsync(ownedSector);
+            }
+            else if (_availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector availSector)
+            {
+                if (_sectorListMode == SectorListMode.Available)
+                    await ClaimSectorAsync(availSector);
+                else
+                    await RequestSectorAsync(availSector);
+            }
         }
-        else if (_availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector availSector)
+        catch (Exception ex)
         {
-            if (_sectorListMode == SectorListMode.Available)
-                await ClaimSectorAsync(availSector);
-            else
-                await RequestSectorAsync(availSector);
+            Errors.Add(new Exception($"Couldn't complete that sector change: {ex.Message}", ex), "OzServer");
+            UpdateArrowButton();
         }
     }
 
@@ -1270,7 +1376,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message), "OzServer");
+            Errors.Add(new Exception(ex.Message, ex), "OzServer");
         }
         finally
         {
@@ -1281,17 +1387,13 @@ public class OzServerSectorsWindow : BaseForm
     static GenericButton CreateRequestActionButton(string text) => new()
     {
         Enabled = false,
-        Font = ButtonFont,
         Margin = new Padding(2),
         Size = new Size(100, 30),
-        SubFont = ButtonSubFont,
-        SubText = "",
         Text = text,
-        UseVisualStyleBackColor = true
     };
 
     // Pulls the canonical list from GET /sector-requests and re-renders from it - called on open,
-    // every 30s while visible (see the poll timer in the constructor), and after every action below
+    // every 10s while visible (see the poll timer in the constructor), and after every action below
     // succeeds, rather than trying to patch _requestsByMe/_requestsFromMe by hand from each
     // response's own shape.
     async Task RefreshRequestedChangesAsync()
@@ -1311,7 +1413,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message), "OzServer");
+            Errors.Add(new Exception(ex.Message, ex), "OzServer");
         }
 
         PopulateRequestedChanges();
@@ -1371,9 +1473,10 @@ public class OzServerSectorsWindow : BaseForm
         var text = $"{request.Sector.Name} - {request.Sector.FullName} ({request.Controller})";
         var node = new TreeNode { Tag = request, NodeFont = _requestedChangesView.Font };
 
-        if (request.Sector.SubSectors.Count > 0)
+        // See BuildOwnedSectorNode for why this is TryGetValue rather than an indexer.
+        if (request.Sector.SubSectors.Count > 0 && SectorsVolumes.SectorGroupings.TryGetValue(request.Sector, out var children))
         {
-            foreach (var child in SectorsVolumes.SectorGroupings[request.Sector])
+            foreach (var child in children)
             {
                 node.Nodes.Add(ReferenceEquals(child, request.Sector)
                     ? new TreeNode(FormatSectorText(child)) { NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
@@ -1392,9 +1495,10 @@ public class OzServerSectorsWindow : BaseForm
     {
         var node = new TreeNode { NodeFont = _requestedChangesView.Font };
 
-        if (sector.SubSectors.Count > 0 && depth < 8)
+        // See BuildOwnedSectorNode for why this is TryGetValue rather than an indexer.
+        if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in SectorsVolumes.SectorGroupings[sector])
+            foreach (var child in children)
             {
                 node.Nodes.Add(ReferenceEquals(child, sector)
                     ? new TreeNode(FormatSectorText(child)) { NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
@@ -1464,6 +1568,15 @@ public class OzServerSectorsWindow : BaseForm
     // still be in flight when the next one landed.
     async Task AcceptRequestsAsync(List<SectorChangeRequest> requests)
     {
+        // Same offline guard RejectRequestAsync/CancelRequestAsync already had, and for a concrete
+        // reason: without it, an Accept while disconnected disabled all three buttons and then took
+        // a path that never re-enabled them. The tracker returns an empty result list when offline,
+        // so no failure is reported, and RefreshRequestedChangesAsync bails out before reaching
+        // PopulateRequestedChanges - which is what would have called UpdateRequestActionButtons.
+        // The buttons stayed greyed out until the next successful poll after reconnecting.
+        if (!Network.IsConnected)
+            return;
+
         SetRequestButtonsEnabled(false);
         try
         {
@@ -1483,7 +1596,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message), "OzServer");
+            Errors.Add(new Exception(ex.Message, ex), "OzServer");
             UpdateRequestActionButtons();
         }
     }
@@ -1501,7 +1614,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message), "OzServer");
+            Errors.Add(new Exception(ex.Message, ex), "OzServer");
             UpdateRequestActionButtons();
         }
     }
@@ -1519,7 +1632,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message), "OzServer");
+            Errors.Add(new Exception(ex.Message, ex), "OzServer");
             UpdateRequestActionButtons();
         }
     }
