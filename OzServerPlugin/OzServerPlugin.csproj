@@ -15,6 +15,18 @@
 
     <PropertyGroup>
         <VatSysPath Condition="'$(VatSysPath)' == ''">$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path)</VatSysPath>
+        <!--
+          vatSys discovers plugins by scanning the profile's Plugins folder, so the build output
+          needs to be a flat folder holding exactly one OzServerPlugin.dll - the same shape every
+          other installed plugin uses. The default bin\Debug\net472\ nesting would leave a second
+          copy of the assembly under the same plugin root, and MEF then sees two distinct IPlugin
+          types and silently fails to load the plugin (the same trap the Private=False notes below
+          guard against). To build straight into a vatSys profile rather than bin\, set OutputPath
+          in OzServerPlugin.csproj.user - per-developer and gitignored, so this shared project file
+          keeps no one machine's paths - or pass it on the command line:
+            dotnet build -p:OutputPath="C:\...\Profiles\Australia\Plugins\OzServerPlugin\"
+        -->
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     </PropertyGroup>
 
     <!--
@@ -25,10 +37,8 @@
       `dotnet build -p:VatSysPath="D:\vatSys"`) for a non-default install location.
     -->
     <Target Name="EnsureVatSysPath" BeforeTargets="ResolveAssemblyReferences">
-        <Error Condition="'$(VatSysPath)' == ''"
-               Text="Could not locate vatSys. It is normally found via HKLM\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path, which is unset or unreadable here - install vatSys, or build with -p:VatSysPath=&quot;C:\Path\To\vatSys&quot;." />
-        <Error Condition="'$(VatSysPath)' != '' AND !Exists('$(VatSysPath)\bin\vatSys.exe')"
-               Text="VatSysPath is '$(VatSysPath)' but '$(VatSysPath)\bin\vatSys.exe' does not exist. Point VatSysPath at the vatSys install root (the folder containing bin\vatSys.exe)." />
+        <Error Condition="'$(VatSysPath)' == ''" Text="Could not locate vatSys. It is normally found via HKLM\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path, which is unset or unreadable here - install vatSys, or build with -p:VatSysPath=&quot;C:\Path\To\vatSys&quot;." />
+        <Error Condition="'$(VatSysPath)' != '' AND !Exists('$(VatSysPath)\bin\vatSys.exe')" Text="VatSysPath is '$(VatSysPath)' but '$(VatSysPath)\bin\vatSys.exe' does not exist. Point VatSysPath at the vatSys install root (the folder containing bin\vatSys.exe)." />
     </Target>
 
     <ItemGroup>

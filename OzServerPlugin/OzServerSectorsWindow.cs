@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using vatsys;
@@ -61,6 +62,25 @@ public class OzServerSectorsWindow : BaseForm
     readonly OzServerOwnershipTracker _tracker;
     readonly System.Windows.Forms.Timer _pollTimer;
     bool _ownedFirstPopulate = true;
+    bool _hasOwnedSnapshot;
+    // RestoreExpandedAndSelection calls Expand while a Populate* method is rebuilding a tree.
+    // TreeView raises AfterExpand for those programmatic restores too, so suppress the scrollbar
+    // side effects until the rebuild has put the original state back in full.
+    bool _rebuildingTree;
+    bool _allowTreeToggle;
+    // Avoid clearing and recreating an unchanged tree. Owned is refreshed every ten seconds even
+    // when it has not changed, Available also reacts to every network-controller change, and
+    // Requested Changes is polled, so an unconditional rebuild makes the rows visibly twitch.
+    string? _ownedTreeSignature;
+    string? _availableTreeSignature;
+    string? _requestedTreeSignature;
+    int _controlledRefreshVersion;
+    bool _controlledRefreshRunning;
+    bool _controlledRefreshQueued;
+    Task? _requestedRefreshTask;
+    bool _requestedRefreshQueued;
+    bool _requestActionRunning;
+    bool _sectorActionRunning;
 
     readonly TableLayoutPanel _tableLayoutPanel1;
     readonly TextLabel _currentSectorsLabel;
@@ -123,8 +143,9 @@ public class OzServerSectorsWindow : BaseForm
         _availSectorsView.DrawNode += SectorsView_DrawNode;
         _availSectorsView.NodeMouseClick += TreeView_NodeMouseClick;
         _availSectorsView.MouseWheel += AvailSectorsView_MouseWheel;
-        _availSectorsView.AfterSelect += SectorsView_AfterSelect;
         _availSectorsView.AfterSelect += AvailSectorsView_AfterSelect;
+        _availSectorsView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
+        _availSectorsView.BeforeExpand += TreeView_BeforeMouseExpandCollapse;
         _availSectorsView.AfterCollapse += AvailSectorsView_AfterExpandCollapse;
         _availSectorsView.AfterExpand += AvailSectorsView_AfterExpandCollapse;
 
@@ -148,6 +169,8 @@ public class OzServerSectorsWindow : BaseForm
         _currSectorsView.NodeMouseClick += TreeView_NodeMouseClick;
         _currSectorsView.MouseWheel += CurrSectorsView_MouseWheel;
         _currSectorsView.AfterSelect += CurrSectorsView_AfterSelect;
+        _currSectorsView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
+        _currSectorsView.BeforeExpand += TreeView_BeforeMouseExpandCollapse;
         _currSectorsView.AfterCollapse += CurrSectorsView_AfterExpandCollapse;
         _currSectorsView.AfterExpand += CurrSectorsView_AfterExpandCollapse;
 
@@ -176,8 +199,9 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView.DrawNode += SectorsView_DrawNode;
         _requestedChangesView.NodeMouseClick += TreeView_NodeMouseClick;
         _requestedChangesView.MouseWheel += RequestedChangesView_MouseWheel;
-        _requestedChangesView.AfterSelect += SectorsView_AfterSelect;
         _requestedChangesView.AfterSelect += (_, _) => UpdateRequestActionButtons();
+        _requestedChangesView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
+        _requestedChangesView.BeforeExpand += TreeView_BeforeMouseExpandCollapse;
         _requestedChangesView.AfterCollapse += RequestedChangesView_AfterExpandCollapse;
         _requestedChangesView.AfterExpand += RequestedChangesView_AfterExpandCollapse;
 
@@ -593,8 +617,16 @@ public class OzServerSectorsWindow : BaseForm
     // maintains its own copy of ownership state.
     void SyncOwnedFromTracker()
     {
-        _sectorsSelected = _tracker.Owned.ToList();
-        PopulateLists();
+        var owned = _tracker.Owned.ToList();
+        var changed = !_hasOwnedSnapshot
+                      || owned.Count != _sectorsSelected.Count
+                      || owned.Any(sector => !_sectorsSelected.Any(existing => existing.Equals(sector)));
+
+        _hasOwnedSnapshot = true;
+        _sectorsSelected = owned;
+        if (changed)
+            PopulateLists();
+
         UpdateApplyCancelButtons();
     }
 
@@ -609,6 +641,10 @@ public class OzServerSectorsWindow : BaseForm
     void CurrSectorsView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
     {
         RefreshDropdownNodeText(e.Node);
+
+        if (_rebuildingTree)
+            return;
+
         ConfigureCurrScrollbar();
         _currScrollBar.Value = _currSectorsView.GetScrollPos().Y * _currSectorsView.ItemHeight - _currSectorsView.ItemHeight + 1;
     }
@@ -616,6 +652,10 @@ public class OzServerSectorsWindow : BaseForm
     void AvailSectorsView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
     {
         RefreshDropdownNodeText(e.Node);
+
+        if (_rebuildingTree)
+            return;
+
         ConfigureAvailScrollbar();
         _availScrollBar.Value = _availSectorsView.GetScrollPos().Y * _availSectorsView.ItemHeight - _availSectorsView.ItemHeight + 1;
     }
@@ -639,65 +679,88 @@ public class OzServerSectorsWindow : BaseForm
     void RequestedChangesView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
     {
         RefreshDropdownNodeText(e.Node);
+
+        if (_rebuildingTree)
+            return;
+
         ConfigureRequestedScrollbar();
         _requestedScrollBar.Value = _requestedChangesView.GetScrollPos().Y * _requestedChangesView.ItemHeight - _requestedChangesView.ItemHeight + 1;
     }
 
-    // Any node with children is a "dropdown" - a category header (Approach/Centre/...), or a
-    // sector that's itself a primary position bundling further sub-sectors (e.g. AAE inside
-    // Approach, or a sector like TBD that bundles AAE which itself bundles AAW/AAR). Dropdown
-    // nodes are click-toggled (see TreeView_NodeMouseClick) rather than selection-driven, so
-    // selecting a plain leaf just makes sure its ancestor chain stays visible.
-    static void SectorsView_AfterSelect(object? sender, TreeViewEventArgs e)
+    // A left click only selects a row. A right click is the separate expand/collapse gesture for
+    // category headers and primary sectors with children, and never collapses unrelated branches.
+    // This keeps a claimable primary sector still while it is being selected instead of reflowing
+    // the list underneath the pointer.
+    void TreeView_BeforeMouseExpandCollapse(object? sender, TreeViewCancelEventArgs e)
     {
-        if (e.Node.Nodes.Count > 0)
-            return;
-
-        var treeView = (TreeViewEx)sender!;
-        treeView.BeginUpdate();
-
-        var topLevelAncestor = e.Node;
-        while (topLevelAncestor.Parent != null)
-            topLevelAncestor = topLevelAncestor.Parent;
-
-        foreach (TreeNode node in treeView.Nodes)
-        {
-            if (node != topLevelAncestor)
-                node.Collapse();
-        }
-        treeView.EndUpdate();
+        // TreeView's native left-button double-click toggles a node even with ShowPlusMinus=false.
+        // TreeViewCancelEventArgs does not distinguish that native toggle from a direct
+        // TreeNode.Expand/Collapse call, so explicitly allow only our right-click handler and the
+        // programmatic expansion-state restore performed during a rebuild.
+        if (!_allowTreeToggle && !_rebuildingTree)
+            e.Cancel = true;
     }
 
-    // Dropdown nodes don't select-to-expand (see SectorsView_AfterSelect above) - clicking one
-    // toggles it directly, closing it if it's already open instead of always forcing it open.
-    // Only collapses sibling nodes when toggling a top-level dropdown open, so expanding a
-    // primary position nested inside a category doesn't disturb unrelated branches of the tree.
-    static void TreeView_NodeMouseClick(object? sender, TreeNodeMouseClickEventArgs e)
+    void TreeView_NodeMouseClick(object? sender, TreeNodeMouseClickEventArgs e)
     {
-        if (e.Node.Nodes.Count == 0)
+        var treeView = (TreeViewEx)sender!;
+
+        if (e.Button == MouseButtons.Left)
+        {
+            treeView.SelectedNode = e.Node;
+            return;
+        }
+
+        if (e.Button != MouseButtons.Right || e.Node.Nodes.Count == 0)
             return;
 
-        var treeView = (TreeViewEx)sender!;
+        // TreeView otherwise promotes a selected descendant to its parent when that parent is
+        // collapsed. Besides violating the left-click-only selection model, that is dangerous in
+        // Requested Changes: one selected request could silently become the category-wide
+        // "accept all" selection. Clear a selection that is about to be hidden instead.
+        var selectionCleared = treeView.SelectedNode != null
+                               && !ReferenceEquals(treeView.SelectedNode, e.Node)
+                               && IsDescendantOf(treeView.SelectedNode, e.Node);
+        if (selectionCleared)
+            treeView.SelectedNode = null;
+
         treeView.BeginUpdate();
-
-        if (e.Node.IsExpanded)
+        try
         {
-            e.Node.Collapse();
-        }
-        else
-        {
-            if (e.Node.Parent == null)
+            _allowTreeToggle = true;
+            try
             {
-                foreach (TreeNode node in treeView.Nodes)
-                {
-                    if (node != e.Node)
-                        node.Collapse();
-                }
+                if (e.Node.IsExpanded)
+                    e.Node.Collapse();
+                else
+                    e.Node.Expand();
             }
-            e.Node.Expand();
+            finally
+            {
+                _allowTreeToggle = false;
+            }
+        }
+        finally
+        {
+            treeView.EndUpdate();
         }
 
-        treeView.EndUpdate();
+        if (selectionCleared)
+        {
+            UpdateArrowButton();
+            UpdateRequestActionButtons();
+        }
+    }
+
+    static bool IsDescendantOf(TreeNode node, TreeNode ancestor)
+    {
+        for (var current = node.Parent; current != null; current = current.Parent)
+        {
+            if (ReferenceEquals(current, ancestor))
+                return true;
+        }
+
+        return false;
     }
 
     // Every node - group header or leaf - reads dark blue at rest and light blue when selected,
@@ -753,18 +816,26 @@ public class OzServerSectorsWindow : BaseForm
             RefreshDropdownNodeTextRecursive(child);
     }
 
-    // A logical identity for a node that survives a full Nodes.Clear()+rebuild - used to carry
-    // expand/collapse state and selection across a data refresh instead of losing them every time
-    // (a poll tick, MMI.SectorsControlledChanged, OnlineATCChanged, or any other action that calls
-    // PopulateOwnedList/PopulateAvailableList/PopulateRequestedChanges would otherwise silently
-    // collapse whatever the controller had open and drop their current selection).
-    static string? NodeKey(TreeNode node) => node.Tag switch
+    // A logical identity for one path that survives a full Nodes.Clear()+rebuild. The whole path is
+    // required because some grouping data contains a same-named sector both as a claimable parent
+    // and as its own child; a global "sector:TBD" key could restore a parent selection onto that
+    // child instead. Text is only the fallback for informational request descendants/placeholders.
+    static string NodeKey(TreeNode node)
     {
-        SectorsVolumes.Sector sector => "sector:" + sector.Name,
-        SectorChangeRequest request => "req:" + request.Id,
-        _ when ReferenceEquals(node.Tag, CategoryTag) => "cat:" + node.Name,
-        _ => null
-    };
+        var segments = new Stack<string>();
+        for (var current = node; current != null; current = current.Parent)
+        {
+            segments.Push(current.Tag switch
+            {
+                SectorsVolumes.Sector sector => "sector:" + sector.Name,
+                SectorChangeRequest request => "request:" + request.Id,
+                _ when ReferenceEquals(current.Tag, CategoryTag) => "category:" + current.Name,
+                _ => "text:" + current.Text
+            });
+        }
+
+        return string.Join("\u001f", segments);
+    }
 
     sealed class TreeViewState
     {
@@ -786,7 +857,7 @@ public class OzServerSectorsWindow : BaseForm
         foreach (TreeNode node in nodes)
         {
             var key = NodeKey(node);
-            if (key != null && node.IsExpanded)
+            if (node.IsExpanded)
                 expandedInto.Add(key);
 
             CaptureExpanded(node.Nodes, expandedInto);
@@ -806,16 +877,13 @@ public class OzServerSectorsWindow : BaseForm
             foreach (TreeNode node in nodes)
             {
                 var key = NodeKey(node);
-                if (key != null)
+                if (state.ExpandedKeys.Contains(key))
                 {
-                    if (state.ExpandedKeys.Contains(key))
-                    {
-                        node.Expand();
-                        RefreshDropdownNodeText(node);
-                    }
-                    if (key == state.SelectedKey)
-                        selected = node;
+                    node.Expand();
+                    RefreshDropdownNodeText(node);
                 }
+                if (key == state.SelectedKey)
+                    selected = node;
                 Walk(node.Nodes);
             }
         }
@@ -878,7 +946,7 @@ public class OzServerSectorsWindow : BaseForm
         var availSelected = _availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
 
         _arrowButton.Text = ownedSelected ? ArrowRight : ArrowLeft;
-        _arrowButton.Enabled = ownedSelected || availSelected;
+        _arrowButton.Enabled = !_sectorActionRunning && (ownedSelected || availSelected);
     }
 
     // Compares on exactly the footing ApplyButton_Click actually applies: non-dummy sectors, as a
@@ -925,7 +993,7 @@ public class OzServerSectorsWindow : BaseForm
         // IsDisposed before InvokeRequired: reading InvokeRequired on a disposed control can throw
         // ObjectDisposedException, and this is reached from Network.OnlineATCChanged, which keeps
         // firing regardless of what has happened to this window.
-        if (IsDisposed)
+        if (IsDisposed || !IsHandleCreated)
             return;
 
         if (InvokeRequired)
@@ -933,6 +1001,12 @@ public class OzServerSectorsWindow : BaseForm
             RunOnUiThread(RefreshAvailableList);
             return;
         }
+
+        // OnlineATCChanged affects the locally-derived Available list only. Controlled comes from
+        // OzServer and already has its own poll; refreshing it for every VATSIM connect/disconnect
+        // just creates duplicate requests and increases the chance of out-of-order responses.
+        if (_sectorListMode != SectorListMode.Available)
+            return;
 
         PopulateAvailableList();
     }
@@ -971,11 +1045,6 @@ public class OzServerSectorsWindow : BaseForm
     // dropdown or scroll the list back to the top out from under them.
     void PopulateOwnedList()
     {
-        var state = CaptureTreeState(_currSectorsView, _currScrollBar);
-
-        _currSectorsView.BeginUpdate();
-        _currSectorsView.Nodes.Clear();
-
         var sectorNodes = new List<TreeNode>();
         foreach (var key in _sectorsSelected)
         {
@@ -995,24 +1064,49 @@ public class OzServerSectorsWindow : BaseForm
             sectorNodes.Add(BuildOwnedSectorNode(key));
         }
 
-        AddNodesGroupedByCategory(_currSectorsView, sectorNodes);
+        sectorNodes = OrderSectorNodes(sectorNodes);
+        var signature = "owned|" + TreeSignature(sectorNodes);
+        if (signature == _ownedTreeSignature)
+            return;
 
-        // Only the very first populate forces everything open (Owned is usually short enough that
-        // seeing it all at a glance is worth it) - every refresh after that just restores whatever
-        // the controller had open themselves, via the state captured above.
-        if (_ownedFirstPopulate)
+        var state = CaptureTreeState(_currSectorsView, _currScrollBar);
+        var firstPopulate = _ownedFirstPopulate;
+
+        _rebuildingTree = true;
+        try
         {
-            _currSectorsView.ExpandAll();
-            foreach (TreeNode node in _currSectorsView.Nodes)
-                RefreshDropdownNodeTextRecursive(node);
+            _currSectorsView.BeginUpdate();
+            try
+            {
+                _currSectorsView.Nodes.Clear();
+                AddNodesGroupedByCategory(_currSectorsView, sectorNodes);
+
+                // Only the very first populate forces everything open (Owned is usually short
+                // enough to show at a glance). Later rebuilds restore the controller's state.
+                if (firstPopulate)
+                {
+                    _currSectorsView.ExpandAll();
+                    foreach (TreeNode node in _currSectorsView.Nodes)
+                        RefreshDropdownNodeTextRecursive(node);
+                }
+
+                RestoreExpandedAndSelection(_currSectorsView, state);
+            }
+            finally
+            {
+                _currSectorsView.EndUpdate();
+            }
+
+            ConfigureCurrScrollbar();
+            RestoreScroll(_currSectorsView, _currScrollBar, state);
             _ownedFirstPopulate = false;
+            _ownedTreeSignature = signature;
+            UpdateArrowButton();
         }
-
-        RestoreExpandedAndSelection(_currSectorsView, state);
-        _currSectorsView.EndUpdate();
-
-        ConfigureCurrScrollbar();
-        RestoreScroll(_currSectorsView, _currScrollBar, state);
+        finally
+        {
+            _rebuildingTree = false;
+        }
     }
 
     // Recurses through a grouping sector's own sub-sectors (e.g. TBD > AAE > AAW/AAR) - always
@@ -1058,14 +1152,12 @@ public class OzServerSectorsWindow : BaseForm
     {
         if (_sectorListMode == SectorListMode.Controlled)
         {
-            _ = PopulateControlledListAsync();
+            QueueControlledListRefresh();
             return;
         }
 
-        var state = CaptureTreeState(_availSectorsView, _availScrollBar);
-
-        _availSectorsView.BeginUpdate();
-        _availSectorsView.Nodes.Clear();
+        // Invalidates a Controlled response still in flight if the mode changed while it awaited.
+        ++_controlledRefreshVersion;
 
         var sectorNodes = new List<TreeNode>();
         foreach (var key in SectorsVolumes.Sectors.Where(s =>
@@ -1076,20 +1168,51 @@ public class OzServerSectorsWindow : BaseForm
                 sectorNodes.Add(node);
         }
 
-        AddNodesGroupedByCategory(_availSectorsView, sectorNodes);
+        ApplyAvailableSectorNodes(sectorNodes, "available|");
+    }
 
-        RestoreExpandedAndSelection(_availSectorsView, state);
-        _availSectorsView.EndUpdate();
+    void QueueControlledListRefresh()
+    {
+        if (_controlledRefreshRunning)
+        {
+            _controlledRefreshQueued = true;
+            return;
+        }
 
-        ConfigureAvailScrollbar();
-        RestoreScroll(_availSectorsView, _availScrollBar, state);
+        _controlledRefreshRunning = true;
+        _ = RunControlledListRefreshLoopAsync();
+    }
+
+    async Task RunControlledListRefreshLoopAsync()
+    {
+        try
+        {
+            do
+            {
+                _controlledRefreshQueued = false;
+                var refreshVersion = _controlledRefreshVersion;
+                await PopulateControlledListAsync(refreshVersion);
+            }
+            while (_controlledRefreshQueued && _sectorListMode == SectorListMode.Controlled);
+        }
+        catch (Exception ex)
+        {
+            // This loop is deliberately fire-and-forget. Do not let a rendering/lifecycle failure
+            // escape as an unobserved task exception or leave future Controlled refreshes wedged.
+            Errors.Add(new Exception($"Couldn't refresh the Controlled sector list: {ex.Message}", ex), "OzServer");
+        }
+        finally
+        {
+            _controlledRefreshRunning = false;
+            _controlledRefreshQueued = false;
+        }
     }
 
     // GET /sectors/controlled is already flattened server-side - claiming a grouping sector (e.g.
     // TBD) creates one sector_ownerships row per covered sector, so the response already has a
     // separate TBD/AUG/AAE/... entry, no client-side recursion needed the way Owned/Available's
     // own tree-building does.
-    async Task PopulateControlledListAsync()
+    async Task PopulateControlledListAsync(int refreshVersion)
     {
         if (!Network.IsConnected)
             return;
@@ -1101,18 +1224,18 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
-            controlled = new List<OzServerControlledSectorDto>();
+            if (!IsDisposed && IsHandleCreated)
+                Errors.Add(new Exception(ex.Message, ex), "OzServer");
+
+            // Keep the last successful list on screen. Rendering a transient failure as an empty
+            // response makes every row vanish and then jump back on the next successful poll.
+            return;
         }
 
         // The toggle may have flipped back to Available while this request was in flight.
-        if (_sectorListMode != SectorListMode.Controlled)
+        if (IsDisposed || !IsHandleCreated || !Network.IsConnected
+            || _sectorListMode != SectorListMode.Controlled || refreshVersion != _controlledRefreshVersion)
             return;
-
-        var state = CaptureTreeState(_availSectorsView, _availScrollBar);
-
-        _availSectorsView.BeginUpdate();
-        _availSectorsView.Nodes.Clear();
 
         var sectorNodes = new List<TreeNode>();
         foreach (var dto in controlled)
@@ -1129,13 +1252,42 @@ public class OzServerSectorsWindow : BaseForm
             sectorNodes.Add(new TreeNode(text) { Tag = sector, NodeFont = _availSectorsView.Font, ToolTipText = text });
         }
 
-        AddNodesGroupedByCategory(_availSectorsView, sectorNodes);
+        ApplyAvailableSectorNodes(sectorNodes, "controlled|");
+    }
 
-        RestoreExpandedAndSelection(_availSectorsView, state);
-        _availSectorsView.EndUpdate();
+    void ApplyAvailableSectorNodes(List<TreeNode> sectorNodes, string modePrefix)
+    {
+        sectorNodes = OrderSectorNodes(sectorNodes);
+        var signature = modePrefix + TreeSignature(sectorNodes);
+        if (signature == _availableTreeSignature)
+            return;
 
-        ConfigureAvailScrollbar();
-        RestoreScroll(_availSectorsView, _availScrollBar, state);
+        var state = CaptureTreeState(_availSectorsView, _availScrollBar);
+
+        _rebuildingTree = true;
+        try
+        {
+            _availSectorsView.BeginUpdate();
+            try
+            {
+                _availSectorsView.Nodes.Clear();
+                AddNodesGroupedByCategory(_availSectorsView, sectorNodes);
+                RestoreExpandedAndSelection(_availSectorsView, state);
+            }
+            finally
+            {
+                _availSectorsView.EndUpdate();
+            }
+
+            ConfigureAvailScrollbar();
+            RestoreScroll(_availSectorsView, _availScrollBar, state);
+            _availableTreeSignature = signature;
+            UpdateArrowButton();
+        }
+        finally
+        {
+            _rebuildingTree = false;
+        }
     }
 
     // Recurses through a sector's own sub-sectors so a primary position nested at any depth (e.g.
@@ -1200,16 +1352,45 @@ public class OzServerSectorsWindow : BaseForm
         return $"{sector.Name} - {sector.FullName} ({name})";
     }
 
-    static void AddNodesGroupedByCategory(TreeViewEx view, IEnumerable<TreeNode> sectorNodes)
+    static List<TreeNode> OrderSectorNodes(IEnumerable<TreeNode> sectorNodes) => sectorNodes
+        .OrderBy(node => GetSectorCategory((SectorsVolumes.Sector)node.Tag))
+        .ThenBy(node => ((SectorsVolumes.Sector)node.Tag).Name, StringComparer.OrdinalIgnoreCase)
+        .ThenBy(node => node.Text, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    static void AddNodesGroupedByCategory(TreeViewEx view, IEnumerable<TreeNode> orderedSectorNodes)
     {
-        foreach (var group in sectorNodes
-                     .GroupBy(node => GetSectorCategory((SectorsVolumes.Sector)node.Tag))
-                     .OrderBy(g => g.Key))
+        foreach (var group in orderedSectorNodes.GroupBy(node => GetSectorCategory((SectorsVolumes.Sector)node.Tag)))
         {
             var categoryNode = AddCategoryNode(view, CategoryName(group.Key));
             foreach (var node in group)
                 categoryNode.Nodes.Add(node);
         }
+    }
+
+    // Stable structural fingerprint for a would-be tree. Tag identity is included as well as text:
+    // two otherwise identical request rows with different server IDs must still trigger a rebuild,
+    // while child boundaries make differently nested sectors distinct.
+    static string TreeSignature(IEnumerable<TreeNode> nodes)
+    {
+        var builder = new StringBuilder();
+
+        static void AppendValue(StringBuilder into, string value) =>
+            into.Append(value.Length).Append(':').Append(value);
+
+        static void AppendNode(StringBuilder into, TreeNode node)
+        {
+            AppendValue(into, NodeKey(node));
+            AppendValue(into, node.Text);
+            into.Append('[').Append(node.Nodes.Count).Append(']');
+            foreach (TreeNode child in node.Nodes)
+                AppendNode(into, child);
+        }
+
+        foreach (var node in nodes)
+            AppendNode(builder, node);
+
+        return builder.ToString();
     }
 
     // Bold category-header fonts, cached against the view font they were derived from. A Font is an
@@ -1232,7 +1413,7 @@ public class OzServerSectorsWindow : BaseForm
         return bold;
     }
 
-    static TreeNode AddCategoryNode(TreeViewEx view, string name)
+    static TreeNode CreateCategoryNode(TreeViewEx view, string name)
     {
         var node = new TreeNode(CollapsedPrefix + name)
         {
@@ -1241,6 +1422,12 @@ public class OzServerSectorsWindow : BaseForm
             NodeFont = GetCategoryFont(view.Font)
         };
         node.ToolTipText = node.Text;
+        return node;
+    }
+
+    static TreeNode AddCategoryNode(TreeViewEx view, string name)
+    {
+        var node = CreateCategoryNode(view, name);
         view.Nodes.Add(node);
         return node;
     }
@@ -1303,6 +1490,11 @@ public class OzServerSectorsWindow : BaseForm
     // the sibling catch could not see it (see OzServerOwnershipTracker.ClaimAsync).
     async void ArrowButton_Click(object? sender, EventArgs e)
     {
+        if (_sectorActionRunning)
+            return;
+
+        _sectorActionRunning = true;
+        UpdateArrowButton();
         try
         {
             if (_currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector ownedSector)
@@ -1320,6 +1512,10 @@ public class OzServerSectorsWindow : BaseForm
         catch (Exception ex)
         {
             Errors.Add(new Exception($"Couldn't complete that sector change: {ex.Message}", ex), "OzServer");
+        }
+        finally
+        {
+            _sectorActionRunning = false;
             UpdateArrowButton();
         }
     }
@@ -1372,25 +1568,77 @@ public class OzServerSectorsWindow : BaseForm
     // every 10s while visible (see the poll timer in the constructor), and after every action below
     // succeeds, rather than trying to patch _requestsByMe/_requestsFromMe by hand from each
     // response's own shape.
-    async Task RefreshRequestedChangesAsync()
+    Task RefreshRequestedChangesAsync()
     {
         if (!Network.IsConnected)
-            return;
+            return Task.CompletedTask;
 
+        _requestedRefreshQueued = true;
+        return _requestedRefreshTask ??= RunRequestedChangesRefreshLoopAsync();
+    }
+
+    async Task RunRequestedChangesRefreshLoopAsync()
+    {
+        // Ensure RefreshRequestedChangesAsync assigns _requestedRefreshTask before this runner can
+        // reach its finally block, even if the API fails/completes synchronously.
+        await Task.Yield();
+
+        try
+        {
+            do
+            {
+                _requestedRefreshQueued = false;
+                await RefreshRequestedChangesOnceAsync();
+            }
+            while (_requestedRefreshQueued && Network.IsConnected);
+        }
+        catch (Exception ex)
+        {
+            // The timer/open paths deliberately do not await this task, so contain any unexpected
+            // rendering/lifecycle failure here rather than leaking an unobserved exception.
+            Errors.Add(new Exception($"Couldn't refresh sector requests: {ex.Message}", ex), "OzServer");
+        }
+        finally
+        {
+            _requestedRefreshTask = null;
+            _requestedRefreshQueued = false;
+        }
+    }
+
+    async Task RefreshRequestedChangesOnceAsync()
+    {
         try
         {
             var response = await _api.GetMyRequestsAsync();
 
+            if (IsDisposed || !IsHandleCreated)
+                return;
+
+            // Map both halves before changing either field so a malformed response cannot leave a
+            // half-new/half-old Requested Changes snapshot on screen.
+            var byMe = response.ByMe
+                .Select(dto => MapRequest(dto, dto.TargetCallsign))
+                .OfType<SectorChangeRequest>()
+                .ToList();
+            var fromMe = response.FromMe
+                .Select(dto => MapRequest(dto, dto.RequestingCallsign))
+                .OfType<SectorChangeRequest>()
+                .ToList();
+
             _requestsByMe.Clear();
-            _requestsByMe.AddRange(response.ByMe.Select(dto => MapRequest(dto, dto.TargetCallsign)).OfType<SectorChangeRequest>());
+            _requestsByMe.AddRange(byMe);
 
             _requestsFromMe.Clear();
-            _requestsFromMe.AddRange(response.FromMe.Select(dto => MapRequest(dto, dto.RequestingCallsign)).OfType<SectorChangeRequest>());
+            _requestsFromMe.AddRange(fromMe);
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+            if (!IsDisposed && IsHandleCreated)
+                Errors.Add(new Exception(ex.Message, ex), "OzServer");
         }
+
+        if (IsDisposed || !IsHandleCreated)
+            return;
 
         PopulateRequestedChanges();
     }
@@ -1408,22 +1656,46 @@ public class OzServerSectorsWindow : BaseForm
 
     void PopulateRequestedChanges()
     {
-        var state = CaptureTreeState(_requestedChangesView, _requestedScrollBar);
-
-        _requestedChangesView.BeginUpdate();
-        _requestedChangesView.Nodes.Clear();
-
-        var byMeNode = AddCategoryNode(_requestedChangesView, RequestedByMeName);
+        var byMeNode = CreateCategoryNode(_requestedChangesView, RequestedByMeName);
         AddRequestNodes(byMeNode, _requestsByMe, NoRequestsByMe);
 
-        var fromMeNode = AddCategoryNode(_requestedChangesView, RequestedFromMeName);
+        var fromMeNode = CreateCategoryNode(_requestedChangesView, RequestedFromMeName);
         AddRequestNodes(fromMeNode, _requestsFromMe, NoRequestsFromMe);
 
-        RestoreExpandedAndSelection(_requestedChangesView, state);
-        _requestedChangesView.EndUpdate();
+        var rootNodes = new[] { byMeNode, fromMeNode };
+        var signature = "requested|" + TreeSignature(rootNodes);
+        if (signature == _requestedTreeSignature)
+        {
+            UpdateRequestActionButtons();
+            return;
+        }
 
-        ConfigureRequestedScrollbar();
-        RestoreScroll(_requestedChangesView, _requestedScrollBar, state);
+        var state = CaptureTreeState(_requestedChangesView, _requestedScrollBar);
+
+        _rebuildingTree = true;
+        try
+        {
+            _requestedChangesView.BeginUpdate();
+            try
+            {
+                _requestedChangesView.Nodes.Clear();
+                _requestedChangesView.Nodes.AddRange(rootNodes);
+                RestoreExpandedAndSelection(_requestedChangesView, state);
+            }
+            finally
+            {
+                _requestedChangesView.EndUpdate();
+            }
+
+            ConfigureRequestedScrollbar();
+            RestoreScroll(_requestedChangesView, _requestedScrollBar, state);
+            _requestedTreeSignature = signature;
+        }
+        finally
+        {
+            _rebuildingTree = false;
+        }
+
         UpdateRequestActionButtons();
     }
 
@@ -1435,7 +1707,10 @@ public class OzServerSectorsWindow : BaseForm
             return;
         }
 
-        foreach (var request in requests)
+        foreach (var request in requests
+                     .OrderBy(r => r.Sector.Name, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(r => r.Controller, StringComparer.OrdinalIgnoreCase)
+                     .ThenBy(r => r.Id))
             parent.Nodes.Add(BuildRequestNode(request));
     }
 
@@ -1488,6 +1763,12 @@ public class OzServerSectorsWindow : BaseForm
 
     void UpdateRequestActionButtons()
     {
+        if (_requestActionRunning || !Network.IsConnected)
+        {
+            SetRequestButtonsEnabled(false);
+            return;
+        }
+
         var selected = _requestedChangesView.SelectedNode;
         var category = CategoryNameOf(selected);
         var request = FindOwningRequest(selected);
@@ -1566,10 +1847,11 @@ public class OzServerSectorsWindow : BaseForm
         // so no failure is reported, and RefreshRequestedChangesAsync bails out before reaching
         // PopulateRequestedChanges - which is what would have called UpdateRequestActionButtons.
         // The buttons stayed greyed out until the next successful poll after reconnecting.
-        if (!Network.IsConnected)
+        if (!Network.IsConnected || _requestActionRunning)
             return;
 
-        SetRequestButtonsEnabled(false);
+        _requestActionRunning = true;
+        UpdateRequestActionButtons();
         try
         {
             // Accepting means ownership just transferred away from me - the tracker re-derives
@@ -1589,16 +1871,21 @@ public class OzServerSectorsWindow : BaseForm
         catch (Exception ex)
         {
             Errors.Add(new Exception(ex.Message, ex), "OzServer");
+        }
+        finally
+        {
+            _requestActionRunning = false;
             UpdateRequestActionButtons();
         }
     }
 
     async Task RejectRequestAsync(SectorChangeRequest request)
     {
-        if (!Network.IsConnected)
+        if (!Network.IsConnected || _requestActionRunning)
             return;
 
-        SetRequestButtonsEnabled(false);
+        _requestActionRunning = true;
+        UpdateRequestActionButtons();
         try
         {
             await _api.RejectRequestAsync(request.Id);
@@ -1607,16 +1894,21 @@ public class OzServerSectorsWindow : BaseForm
         catch (Exception ex)
         {
             Errors.Add(new Exception(ex.Message, ex), "OzServer");
+        }
+        finally
+        {
+            _requestActionRunning = false;
             UpdateRequestActionButtons();
         }
     }
 
     async Task CancelRequestAsync(SectorChangeRequest request)
     {
-        if (!Network.IsConnected)
+        if (!Network.IsConnected || _requestActionRunning)
             return;
 
-        SetRequestButtonsEnabled(false);
+        _requestActionRunning = true;
+        UpdateRequestActionButtons();
         try
         {
             await _api.CancelRequestAsync(request.Id);
@@ -1625,6 +1917,10 @@ public class OzServerSectorsWindow : BaseForm
         catch (Exception ex)
         {
             Errors.Add(new Exception(ex.Message, ex), "OzServer");
+        }
+        finally
+        {
+            _requestActionRunning = false;
             UpdateRequestActionButtons();
         }
     }
