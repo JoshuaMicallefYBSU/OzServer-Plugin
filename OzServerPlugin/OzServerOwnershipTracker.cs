@@ -8,6 +8,17 @@ using vatsys;
 
 namespace OzServerPlugin;
 
+// What one Apply actually did, so the window can report it rather than leaving the controller to
+// infer it from which rows moved. Sectors are named rather than typed: some entries (a contested
+// sub-sector reported by the server) are names the client never resolved to a Sector at all.
+public class SectorCommitResult
+{
+    public List<string> Claimed { get; } = new();
+    public List<string> Released { get; } = new();
+    public List<string> Requested { get; } = new();
+    public List<string> Failed { get; } = new();
+}
+
 // Keeps OzServer's sector-ownership record in sync with MMI.SectorsControlled, independent of
 // whether OzServerSectorsWindow happens to be open. Constructed unconditionally by Plugin (like
 // AfvSectorClaimer) rather than lazily: a VSCS/AFV transmit press only ever touches
@@ -388,6 +399,95 @@ public class OzServerOwnershipTracker
         }
 
         await RefreshFromServerAsync();
+    }
+
+    // Commits one Apply: releases everything the controller unpicked, then claims everything they
+    // picked, turning any sector another controller already owns into a request instead of a
+    // prompt. Apply *is* the confirmation - the controller has already said what they want by the
+    // time this runs - so unlike ClaimAsync's interactive path (HandleConflictAsync) nothing here
+    // stops to ask.
+    //
+    // One RefreshFromServerAsync for the whole batch, not one per sector as Claim/ReleaseAsync each
+    // do individually: that per-sector GET is what made moving several sectors take seconds, and
+    // the intermediate states it published were never worth rendering anyway.
+    public async Task<SectorCommitResult> CommitSectorChangesAsync(
+        IReadOnlyList<SectorsVolumes.Sector> toClaim,
+        IReadOnlyList<SectorsVolumes.Sector> toRelease)
+    {
+        var result = new SectorCommitResult();
+        if (!Network.IsConnected)
+            return result;
+
+        // Releases first: a sector being handed back may be part of a group being claimed in the
+        // same Apply, and releasing after the claim would undo it.
+        foreach (var sector in toRelease)
+        {
+            try
+            {
+                await _api.ReleaseSectorAsync(sector.Name);
+                result.Released.Add(sector.Name);
+            }
+            catch (Exception ex)
+            {
+                result.Failed.Add(sector.Name);
+                Errors.Add(new Exception($"Couldn't release {sector.Name}: {ex.Message}", ex), "OzServer");
+            }
+        }
+
+        foreach (var sector in toClaim)
+        {
+            IReadOnlyList<OzServerSectorConflictDto>? conflicts = null;
+
+            try
+            {
+                await _api.ClaimSectorAsync(sector.Name);
+                result.Claimed.Add(sector.Name);
+            }
+            catch (OzServerApiException ex) when (ex.StatusCode == 409 && ex.Conflicts.Count > 0)
+            {
+                // Same catch-clause escape rule as ClaimAsync - handled after the try, not inside it.
+                conflicts = ex.Conflicts;
+            }
+            catch (Exception ex)
+            {
+                result.Failed.Add(sector.Name);
+                Errors.Add(new Exception($"Couldn't claim {sector.Name}: {ex.Message}", ex), "OzServer");
+            }
+
+            if (conflicts == null)
+                continue;
+
+            foreach (var conflict in conflicts)
+            {
+                try
+                {
+                    await _api.RequestSectorAsync(conflict.Sector);
+                    result.Requested.Add(conflict.Sector);
+                }
+                catch (Exception ex)
+                {
+                    result.Failed.Add(conflict.Sector);
+                    Errors.Add(new Exception($"Couldn't request {conflict.Sector}: {ex.Message}", ex), "OzServer");
+                }
+            }
+
+            // Then take the rest of the group. Without this second call a claim that collided on one
+            // sub-sector would hand over none of the others, even though they were free.
+            try
+            {
+                await _api.ClaimSectorAsync(sector.Name, conflicts.Select(c => c.Sector));
+                result.Claimed.Add(sector.Name);
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't claim the rest of {sector.Name}: {ex.Message}", ex), "OzServer");
+            }
+        }
+
+        // Owned is re-derived once, at the end - which is also what pushes the whole result into
+        // MMI.SectorsControlled and the VSCS panel in one go, through ReconcileMmiWithOwned.
+        await RefreshFromServerAsync();
+        return result;
     }
 
     public async Task ReleaseAsync(SectorsVolumes.Sector sector)

@@ -159,9 +159,17 @@ public class PrimaryPositionWatcher
         // actually collides with, and it is the thing that has to stop saying "mine". Releasing it
         // pulls the sector out of MMI and drops its VSCS line back to Idle on its own, through
         // OzServerOwnershipTracker.ReconcileMmiWithOwned.
+        // This session's own position is never given away, whatever the arriving controller's
+        // grouping says. DefaultSectorsFor already skips a sub-sector somebody is logged in on, but
+        // that test reads Network.GetOnlineATCs, and this controller's own callsign is not reliably
+        // in that list at the moment it matters - so a primary whose group happens to contain this
+        // position could otherwise take it straight off the person actually logged in on it.
+        var mine = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
+
         var owned = _tracker.Owned;
         var relinquishing = PrimaryPosition.DefaultSectorsFor(atc.Callsign)
             .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name))
+            .Where(s => !mine.Any(m => m.Name == s.Name))
             .ToList();
 
         if (relinquishing.Count == 0)

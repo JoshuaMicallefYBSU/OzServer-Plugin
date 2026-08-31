@@ -87,7 +87,11 @@ public class OzServerSectorsWindow : BaseForm
     Task? _requestedRefreshTask;
     bool _requestedRefreshQueued;
     bool _requestActionRunning;
-    bool _sectorActionRunning;
+    // True from the first staged move until Apply or Cancel resolves it. While set, the Owned list
+    // is the controller's working selection rather than a view of _tracker.Owned, so background
+    // refreshes must not overwrite it - see SyncOwnedFromTracker.
+    bool _hasStagedEdits;
+    bool _applyRunning;
 
     // One menu for the window's lifetime, its items rebuilt per click, rather than a fresh
     // ContextMenuStrip each time. The renderer it is given is vatSys's own shared instance (see
@@ -605,6 +609,17 @@ public class OzServerSectorsWindow : BaseForm
     // maintains its own copy of ownership state.
     void SyncOwnedFromTracker()
     {
+        // The whole point of staging: while the controller has an uncommitted selection, the Owned
+        // list is theirs, not a view of the server. A poll tick, an OwnedChanged from someone
+        // accepting a request, or the tracker's own reconcile would otherwise land mid-edit and
+        // silently throw away everything they had picked - which is what made this list look like it
+        // was refreshing at random. Available still tracks the staged list, so it stays consistent.
+        if (_hasStagedEdits)
+        {
+            UpdateApplyCancelButtons();
+            return;
+        }
+
         // Before the tracker's first response, Owned is empty because nothing has been *asked* yet,
         // not because nothing is owned (see OzServerOwnershipTracker.HasBaseline). Rendering that
         // empty list put every sector the controller was actually holding into Available for the
@@ -797,19 +812,23 @@ public class OzServerSectorsWindow : BaseForm
         menu.Items.Add(reject);
         menu.Items.Add(new ToolStripSeparator());
 
-        // Add/Remove are this menu's wording for the claim/release the arrow button performs, and
+        // Add/Remove are this menu's wording for the same staged move the arrow button makes, and
         // work from any of the three trees: a request row resolves to the sector it is about, so an
-        // incoming request can be acted on without first hunting that sector down in Available.
+        // incoming request can be staged without first hunting that sector down in Available.
+        //
+        // Not gated on being connected: staging is local, and Apply is the only thing that needs the
+        // network. Only an Apply already in flight blocks it, so the selection being committed can't
+        // move underneath it.
         var sector = SectorForNode(node);
         var owned = sector != null && IsOwned(sector);
-        var sectorActionable = sector != null && !_sectorActionRunning && Network.IsConnected;
+        var sectorActionable = sector != null && !_applyRunning;
 
         var add = new ToolStripMenuItem("Add") { Enabled = sectorActionable && !owned };
-        add.Click += (_, _) => _ = RunSectorActionAsync(sector!, add: true);
+        add.Click += (_, _) => RunSectorAction(sector!, add: true);
         menu.Items.Add(add);
 
         var remove = new ToolStripMenuItem("Remove") { Enabled = sectorActionable && owned };
-        remove.Click += (_, _) => _ = RunSectorActionAsync(sector!, add: false);
+        remove.Click += (_, _) => RunSectorAction(sector!, add: false);
         menu.Items.Add(remove);
 
         menu.Show(treeView, location);
@@ -1072,7 +1091,7 @@ public class OzServerSectorsWindow : BaseForm
         var availSelected = _availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
 
         _arrowButton.Text = ownedSelected ? ArrowRight : ArrowLeft;
-        _arrowButton.Enabled = !_sectorActionRunning && (ownedSelected || availSelected);
+        _arrowButton.Enabled = !_applyRunning && (ownedSelected || availSelected);
     }
 
     // Compares on exactly the footing ApplyButton_Click actually applies: non-dummy sectors, as a
@@ -1083,16 +1102,20 @@ public class OzServerSectorsWindow : BaseForm
     // leaving Apply and Cancel permanently lit whether or not anything actually differed.
     void UpdateApplyCancelButtons()
     {
-        var applied = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
-        var selected = _sectorsSelected.Where(s => !s.IsDummy).ToList();
+        // Compared against OzServer's record, not MMI.SectorsControlled. Ownership is what Apply
+        // actually commits, and MMI is downstream of it (ReconcileMmiWithOwned writes MMI once the
+        // commit's refresh lands) - so diffing against MMI reported "unsaved changes" for any
+        // difference the two happened to have for unrelated reasons, such as a dummy backfill or a
+        // sector held on the network but not yet recorded on OzServer.
+        var owned = _tracker.Owned.Where(s => !s.IsDummy).ToList();
+        var staged = _sectorsSelected.Where(s => !s.IsDummy).ToList();
 
-        // Sector.Equals is callsign-based; == is not overloaded, so it must not be used here (the
-        // same trap AfvSectorClaimer.CheckActive documents).
-        var upToDate = selected.Count == applied.Count
-                       && selected.All(s => applied.Any(a => a.Equals(s)));
+        var upToDate = staged.Count == owned.Count
+                       && staged.All(s => owned.Any(o => o.Name == s.Name));
 
-        _applyButton.Enabled = !upToDate;
-        _cancelButton.Enabled = !upToDate;
+        // Nothing to commit and nothing to discard while an Apply is still in flight.
+        _applyButton.Enabled = !upToDate && !_applyRunning;
+        _cancelButton.Enabled = !upToDate && !_applyRunning;
     }
 
     void SetSectorListMode(SectorListMode mode)
@@ -1616,15 +1639,90 @@ public class OzServerSectorsWindow : BaseForm
         _ => "Other"
     };
 
-    void ApplyButton_Click(object? sender, EventArgs e)
+    // Commits the staged selection. Everything unpicked is released, everything newly picked is
+    // claimed, and anything another controller already owns becomes a request - see
+    // OzServerOwnershipTracker.CommitSectorChangesAsync. vatSys itself is only activated as a
+    // consequence of that: the single refresh at the end of the commit is what pushes the result
+    // into MMI.SectorsControlled and the VSCS panel, through ReconcileMmiWithOwned.
+    //
+    // async void, so nothing may escape: an exception leaving here is unhandled on the UI thread
+    // and takes vatSys down with it rather than surfacing in the error log.
+    async void ApplyButton_Click(object? sender, EventArgs e)
     {
-        MMI.SetControlledSectors(_sectorsSelected.Where(s => !s.IsDummy).ToList());
+        if (_applyRunning || !_hasStagedEdits)
+            return;
+
+        var owned = _tracker.Owned.Where(s => !s.IsDummy).ToList();
+        var staged = _sectorsSelected.Where(s => !s.IsDummy).ToList();
+        var toClaim = staged.Where(s => !owned.Any(o => o.Name == s.Name)).ToList();
+        var toRelease = owned.Where(o => !staged.Any(s => s.Name == o.Name)).ToList();
+
+        _applyRunning = true;
         UpdateArrowButton();
+        UpdateApplyCancelButtons();
+        try
+        {
+            var result = await _tracker.CommitSectorChangesAsync(toClaim, toRelease);
+
+            if (IsDisposed || !IsHandleCreated)
+                return;
+
+            // Cleared only after the commit, so a poll landing mid-Apply still can't overwrite what
+            // is being committed. The refresh inside the commit has already re-derived Owned, so the
+            // resync below adopts the real result - including a claim that turned into a request and
+            // therefore did not move.
+            _hasStagedEdits = false;
+            SyncOwnedFromTracker();
+            ReportCommitResult(result);
+        }
+        catch (Exception ex)
+        {
+            Errors.Add(new Exception($"Couldn't apply those sector changes: {ex.Message}", ex), "OzServer");
+        }
+        finally
+        {
+            _applyRunning = false;
+            UpdateArrowButton();
+            UpdateApplyCancelButtons();
+        }
     }
 
+    // Requests are the one outcome worth saying out loud: nothing moves on screen for them, so
+    // without this an Apply that turned into a request looks like an Apply that did nothing.
+    void ReportCommitResult(SectorCommitResult result)
+    {
+        if (result.Requested.Count == 0)
+            return;
+
+        var names = string.Join(", ", result.Requested.Distinct());
+        var message = result.Requested.Count == 1
+            ? $"{names} is owned by another controller, so a request has been sent to them."
+            : $"These are owned by other controllers, so requests have been sent: {names}";
+
+        _ = RefreshRequestedChangesAsync();
+        ShowNotice(message, "Sector requested");
+    }
+
+    static void ShowNotice(string message, string caption)
+    {
+        var notice = new SectorRelinquishNoticeWindow(message, caption);
+        if (Application.OpenForms["MainForm"] is Form mainForm)
+            notice.Show(mainForm);
+        else
+            notice.Show();
+
+        notice.BringToFront();
+    }
+
+    // Throws the staged selection away and goes back to what OzServer says is actually owned.
     void CancelButton_Click(object? sender, EventArgs e)
     {
-        LoadSectors();
+        if (_applyRunning)
+            return;
+
+        _hasStagedEdits = false;
+        SyncOwnedFromTracker();
+        PopulateLists();
         UpdateArrowButton();
     }
 
@@ -1642,52 +1740,28 @@ public class OzServerSectorsWindow : BaseForm
         UpdateArrowButton();
     }
 
-    // async void, so nothing may escape: an exception leaving this method is unhandled on the UI
-    // thread and takes vatSys down with it, rather than surfacing in the error log. The tracker
-    // handles the API calls themselves, but not everything downstream of them - conflict handling
-    // in particular marshals a modal dialog, and used to be raised from inside a catch clause where
-    // the sibling catch could not see it (see OzServerOwnershipTracker.ClaimAsync).
-    async void ArrowButton_Click(object? sender, EventArgs e)
+    void ArrowButton_Click(object? sender, EventArgs e)
     {
         if (_currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector ownedSector)
-            await RunSectorActionAsync(ownedSector, add: false);
+            RunSectorAction(ownedSector, add: false);
         else if (_availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector availSector)
-            await RunSectorActionAsync(availSector, add: true);
+            RunSectorAction(availSector, add: true);
     }
 
-    // The one path both the arrow button and the menu's Add/Remove take, so a single
-    // _sectorActionRunning latch covers both - the two entry points can't leave overlapping claims
-    // in flight on the same sector, which is exactly the re-entrancy
-    // OzServerOwnershipTracker's own class comment describes as a real bug rather than a
-    // theoretical one. Catches everything: ArrowButton_Click is async void, where an escaping
-    // exception is unhandled on the UI thread and takes vatSys down with it.
-    async Task RunSectorActionAsync(SectorsVolumes.Sector sector, bool add)
+    // The one path both the arrow button and the menu's Add/Remove take. Purely local now - no
+    // network call, nothing awaited, nothing to latch against - because the only thing either
+    // gesture does is move a row between the two lists. Apply is what talks to OzServer.
+    //
+    // Controlled mode needs no special case any more either: staging a sector someone else owns and
+    // pressing Apply produces a request, because that is what CommitSectorChangesAsync does with a
+    // claim the server rejects as already-owned.
+    void RunSectorAction(SectorsVolumes.Sector sector, bool add)
     {
-        if (_sectorActionRunning)
+        if (_applyRunning)
             return;
 
-        _sectorActionRunning = true;
+        StageSectorChange(sector, add);
         UpdateArrowButton();
-        try
-        {
-            if (!add)
-                await ReleaseSectorAsync(sector);
-            else if (_sectorListMode == SectorListMode.Available)
-                await ClaimSectorAsync(sector);
-            else
-                // Controlled lists what someone else already holds, so Add can only mean "ask for
-                // it" there - the same split the arrow button's <</>> has always made.
-                await RequestSectorAsync(sector);
-        }
-        catch (Exception ex)
-        {
-            Errors.Add(new Exception($"Couldn't complete that sector change: {ex.Message}", ex), "OzServer");
-        }
-        finally
-        {
-            _sectorActionRunning = false;
-            UpdateArrowButton();
-        }
     }
 
     // Shared by the Accept button and the menu's Accept, so both act on the identical selection
@@ -1728,38 +1802,16 @@ public class OzServerSectorsWindow : BaseForm
     // server-side - see SectorOwnershipController::claim), which re-derives Owned from the server
     // and raises OwnedChanged - see the class comment for why this window never touches
     // _sectorsSelected directly.
-    async Task ClaimSectorAsync(SectorsVolumes.Sector sector)
-    {
-        _arrowButton.Enabled = false;
-        ShowOwnedOptimistically(sector, owned: true);
-        await _tracker.ClaimAsync(sector);
-        UpdateArrowButton();
-    }
-
-    async Task ReleaseSectorAsync(SectorsVolumes.Sector sector)
-    {
-        _arrowButton.Enabled = false;
-        ShowOwnedOptimistically(sector, owned: false);
-        await _tracker.ReleaseAsync(sector);
-        UpdateArrowButton();
-    }
-
-    // Moves the row between Owned and Available immediately, before the server has been asked.
-    // A claim is two sequential round trips before anything moves on screen - POST /claim, then the
-    // GET that re-derives Owned (see OzServerOwnershipTracker.ClaimAsync) - which read as the window
-    // having ignored the click. This is presentation only: _sectorsSelected is overwritten wholesale
-    // by the next SyncOwnedFromTracker, so the server still decides what is actually owned, and a
-    // claim that fails or that the server answers differently (a claim covers the whole
-    // responsible_sectors chain, so the real result is usually *more* than guessed here) corrects
-    // itself on that refresh rather than being left as a lie on screen.
+    // Moves the row between Owned and Available locally and stops there. Nothing is claimed,
+    // released or requested, and nothing is activated in vatSys, until Apply - which is what makes
+    // the two lists a selection the controller builds up and then commits, rather than a pair of
+    // buttons that each fire a live ownership change at OzServer the moment they are clicked.
     //
-    // Skipped while disconnected: ClaimAsync/ReleaseAsync both return without calling the server at
-    // all in that state, so there would be no refresh afterwards to correct the guess.
-    void ShowOwnedOptimistically(SectorsVolumes.Sector sector, bool owned)
+    // The staged list deliberately diverges from _tracker.Owned while this is set, and
+    // SyncOwnedFromTracker leaves it alone until Apply or Cancel resolves it - a poll landing
+    // mid-edit used to overwrite whatever the controller had picked.
+    void StageSectorChange(SectorsVolumes.Sector sector, bool owned)
     {
-        if (!Network.IsConnected)
-            return;
-
         // Name comparison, not Contains: it is the footing every other Owned/Available decision in
         // this window uses, and the one vatSys's own SectorsWindow uses too (see PopulateLists).
         var alreadyOwned = _sectorsSelected.Any(s => !s.IsDummy && s.Name == sector.Name);
@@ -1771,25 +1823,9 @@ public class OzServerSectorsWindow : BaseForm
             updated.Add(sector);
 
         _sectorsSelected = updated;
+        _hasStagedEdits = true;
         PopulateLists();
-    }
-
-    async Task RequestSectorAsync(SectorsVolumes.Sector sector)
-    {
-        _arrowButton.Enabled = false;
-        try
-        {
-            await _tracker.RequestAsync(sector);
-            await RefreshRequestedChangesAsync();
-        }
-        catch (Exception ex)
-        {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
-        }
-        finally
-        {
-            UpdateArrowButton();
-        }
+        UpdateApplyCancelButtons();
     }
 
     static GenericButton CreateRequestActionButton(string text) => new()
