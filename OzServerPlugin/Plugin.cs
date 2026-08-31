@@ -33,6 +33,7 @@ public class Plugin : IPlugin
     readonly AfvSectorClaimer _afvSectorClaimer;
     readonly OzServerOwnershipTracker _ownershipTracker;
     readonly FdrSync _fdrSync;
+    readonly TagOwnershipSync _tagOwnershipSync;
     readonly AtisSync _atisSync;
     readonly BadVectorsAtisSync _badVectorsAtisSync;
     // Held for the same reason as the two above: it lives entirely off Network's own events, and a
@@ -44,6 +45,8 @@ public class Plugin : IPlugin
         _ownershipTracker = new OzServerOwnershipTracker();
         _afvSectorClaimer = new AfvSectorClaimer();
         _fdrSync = new FdrSync();
+        // After the tracker, which it reads live subsector ownership through.
+        _tagOwnershipSync = new TagOwnershipSync(_ownershipTracker);
         _atisSync = new AtisSync();
         _badVectorsAtisSync = new BadVectorsAtisSync();
         // After the tracker, which it releases through.
@@ -226,10 +229,12 @@ public class Plugin : IPlugin
     public void OnFDRUpdate(FDP2.FDR updated)
     {
         _fdrSync.OnFdrUpdate(updated);
+        _tagOwnershipSync.OnFdrUpdate(updated);
     }
 
     public void OnRadarTrackUpdate(RDP.RadarTrack updated)
     {
         _fdrSync.OnRadarTrackUpdate(updated);
+        _tagOwnershipSync.OnRadarTrackUpdate(updated);
     }
 }

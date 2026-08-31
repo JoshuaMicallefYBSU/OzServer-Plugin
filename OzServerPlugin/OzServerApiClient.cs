@@ -98,13 +98,14 @@ class OzServerErrorDto
 }
 
 // Mirrors UpdateFlightDataRecordRequest's validation rules (app/Http/Requests on the backend) field
-// for field. controlling_cid/controlling_callsign are the flight's datalink authority - who
-// FDP2.FDR.ControllerTracking says currently owns it - and are deliberately separate from this
-// session's own identity (attached automatically by PostRawAsync, same as every other endpoint):
-// a controller merely observing a flight still pushes its data, attributing authority to whoever
-// actually has it (self, another controller's callsign, or neither when null/free). Every field
-// besides Callsign is nullable so a partial or position-only push doesn't have to fabricate values
-// for whatever FdrSync couldn't read off the FDR.
+// for field. controlling_cid/controlling_callsign are the flight's datalink authority, deliberately
+// separate from this session's own identity (attached automatically by PostRawAsync, same as every
+// other endpoint) even though, now, they're always this session's own cid/callsign: FdrSync only
+// ever pushes while fdr.IsTrackedByMe is true (see FdrSync.ShouldPush) - a flight merely observed,
+// handed off elsewhere, or not yet activated is never pushed for at all, so there's no "someone
+// else's callsign" or "free/null" authority left to report. Every field besides Callsign is
+// nullable so a partial or position-only push doesn't have to fabricate values for whatever FdrSync
+// couldn't read off the FDR.
 public class OzServerFdrUpdateDto
 {
     [JsonProperty("callsign")] public string Callsign { get; set; } = "";
@@ -152,6 +153,13 @@ public class OzServerFdrUpdateDto
     [JsonProperty("heading")] public int? Heading { get; set; }
     [JsonProperty("vertical_rate")] public int? VerticalRate { get; set; }
     [JsonProperty("on_ground")] public bool? OnGround { get; set; }
+
+    // The geographic subsector this aircraft is physically inside of right now (SectorLocator,
+    // resolved against the full SectorsVolumes.Sectors list - not tracker.ClaimedSectors), which is
+    // deliberately a different question from who owns the tag (controlling_cid/controlling_callsign,
+    // above). Null when the aircraft isn't inside any known sector volume at its current
+    // position/level, or when neither a live nor a predicted position is available yet.
+    [JsonProperty("current_sector")] public string? CurrentSector { get; set; }
 }
 
 // AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
