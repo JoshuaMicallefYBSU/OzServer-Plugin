@@ -56,7 +56,18 @@ public class BadVectorsAtisSync
 
             foreach (var propName in SlotPropertyNames)
             {
-                var control = pluginType.GetProperty(propName, BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                // ATIS1..4 are plain public static fields on ATISPlugin.Plugin (confirmed against its
+                // source), not properties - GetProperty silently returns null for these, which is why
+                // this used to never find anything. GetField first, with a GetProperty fallback in
+                // case a future ATISPlugin release turns them into auto-properties instead.
+                var member = pluginType.GetField(propName, BindingFlags.Public | BindingFlags.Static) as MemberInfo
+                             ?? pluginType.GetProperty(propName, BindingFlags.Public | BindingFlags.Static);
+                var control = member switch
+                {
+                    FieldInfo f => f.GetValue(null),
+                    PropertyInfo p => p.GetValue(null),
+                    _ => null,
+                };
                 if (control == null || _subscribed.Any(c => ReferenceEquals(c, control)))
                     continue;
 
@@ -81,16 +92,20 @@ public class BadVectorsAtisSync
 
         var type = control.GetType();
         var icao = type.GetProperty("ICAO")?.GetValue(control) as string;
-        var broadcasting = type.GetProperty("Broadcasting")?.GetValue(control) as bool? ?? false;
         var letter = type.GetProperty("ID")?.GetValue(control) as char?;
         var lines = type.GetProperty("Lines")?.GetValue(control) as IEnumerable;
         var frequencyDisplay = type.GetProperty("FrequencyDisplay")?.GetValue(control) as string;
 
-        // Broadcasting false / no letter yet covers ATISControl.Create() (station just opened,
-        // nothing broadcast) and Delete() (station torn down, fields nulled) - same "nothing worth
-        // telling OzServer yet" reasoning as AtisSync's own guard. The entry already on the server
-        // (if any) just ages out via PruneStaleAtisJob rather than being cleared explicitly here.
-        if (string.IsNullOrEmpty(icao) || !broadcasting || letter == null)
+        // Deliberately NOT gated on Broadcasting: ATISControl.Save() (source confirmed) sets
+        // Broadcasting = false via BroadcastStop() *before* updating ID/Lines and firing
+        // StatusChanged, and only BroadcastStart() - which never raises StatusChanged - sets it back
+        // to true afterwards. Gating on Broadcasting here meant this fired for every real update and
+        // discarded it every time. Empty icao/letter/content is what actually distinguishes
+        // ATISControl.Create() (station just opened, nothing broadcast yet - Lines exists but every
+        // line's Value is still blank) and Delete() (station torn down, ICAO/Lines cleared) from a
+        // real Save(), so that's the guard instead. The entry already on the server (if any) just
+        // ages out via PruneStaleAtisJob rather than being cleared explicitly here.
+        if (string.IsNullOrEmpty(icao) || letter == null)
             return;
 
         var content = ReadContent(lines);
