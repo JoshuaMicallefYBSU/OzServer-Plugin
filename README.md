@@ -19,7 +19,8 @@ OzServer flows back into vatSys and onto your VSCS panel automatically.
 | **Conflict handling** | Claiming a primary that bundles sub-sectors someone else already holds asks once, then claims everything that *isn't* contested rather than failing the whole thing. |
 | **Request indicator** | A `[n SECTOR REQUEST]` button, in the profile's own warning colour, appears in the main menu bar when someone wants a sector from you — whether or not the Sectors window has ever been opened. |
 | **Extending line** | Keeps an `Extending ...` line in your Controller Info in step with the extra VSCS lines you're transmitting on. APP/DEP and CTR positions only. |
-| **Flight data** | Pushes FDR and radar-track updates to OzServer in 5-second batches, attributing datalink authority from each FDR's own tracking state rather than from your session. |
+| **Tag ownership** | An aircraft's tag follows the live geographic subsector it's physically in: sitting in one you own, on OzServer, gets it activated (if its flight plan hasn't been) and assumed (if nobody holds it) automatically; losing that subsector on OzServer hands off whatever you were tracking there. |
+| **Flight data** | Pushes FDR and radar-track updates to OzServer in 5-second batches, only for flights you currently hold (`IsTrackedByMe`) and have activated, attributing datalink authority as your own session's identity. Each push also reports the real geographic subsector the aircraft is physically inside of right now, independent of who (if anyone) owns it. |
 
 Ownership has exactly one source of truth: **OzServer's own record**. Every action calls the
 relevant endpoint and then re-reads `/sectors/mine` rather than guessing locally what the result must
@@ -102,6 +103,17 @@ Only `https://` is accepted, with `http://` allowed for loopback addresses so a 
 still works. Every request carries the plugin token, so this is a security boundary rather than a
 convenience — see [Security](#security). A URL hand-edited into `settings.json` is held to the same
 rule and ignored (with an entry in the vatSys error log) if it fails.
+
+**Note for backend maintainers:** since a flight is now only ever pushed to while a controller
+actually holds it (see Tag ownership / Flight data above), a row nothing has pushed to in 10 minutes
+is stale and safe to drop server-side — the same precedent as the existing 90-minute ATIS TTL. Not
+implemented in this repo; there is no backend code here to implement it in.
+
+Every `/fdr`, `/fdr/batch` push now also sends `current_sector` (nullable string) — the *name* of the
+geographic subsector the aircraft is physically inside of, independent of `controlling_cid`/
+`controlling_callsign`, which say who owns the tag. `UpdateFlightDataRecordRequest` and the flight
+data table need a matching field before this is actually persisted or queryable; until then the
+plugin sends it but the backend has nowhere to put it.
 
 ---
 
@@ -209,7 +221,9 @@ Four rules if you touch the styling:
 | `SectorConflictPromptWindow.cs` | vatSys-styled Yes/No prompt, in place of `MessageBox` |
 | `AfvSectorClaimer.cs` | Turns VSCS transmit state into `MMI.SectorsControlled` changes |
 | `ControllerInfoUpdater.cs` | Maintains the `Extending ...` Controller Info line |
-| `FdrSync.cs` | Batches FDR and radar-track pushes |
+| `FdrSync.cs` | Batches FDR and radar-track pushes, gated on currently holding and having activated the flight |
+| `TagOwnershipSync.cs` | Activates/assumes a tag when it's sitting in a subsector you own; hands it off when OzServer says you no longer own that subsector |
+| `SectorLocator.cs` | Resolves which sector, out of a given candidate list, an FDR is physically inside of right now |
 | `AtisSync.cs` | Pushes vatSys's own built-in ATIS (`vatsys.ATIS`, slot 0) on change |
 | `BadVectorsAtisSync.cs` | Same, but for [badvectors/ATISPlugin](https://github.com/badvectors/ATISPlugin)'s up-to-4 broadcasts, via reflection |
 | `OzServerSettings.cs` | Base-URL persistence and validation |
@@ -229,7 +243,7 @@ All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` at
 | `POST /sectors/{name}/release` | Release |
 | `POST /sectors/{name}/request` | Request from the current owner |
 | `GET /sectors/mine` | The authoritative "what do I own" check |
-| `GET /sectors/controlled` | Sectors owned by someone else, pre-flattened server-side |
+| `GET /sectors/controlled` | Sectors owned by someone else, pre-flattened server-side; polled continuously (not just while the Sectors window is open) so `TagOwnershipSync` always has the full picture |
 | `GET /sector-requests` | Both directions of pending requests |
 | `POST /sector-requests/accept-batch` | Accept several at once, processed sequentially |
 | `POST /sector-requests/{id}/accept`, `/reject`, `/cancel` | Single-request actions |

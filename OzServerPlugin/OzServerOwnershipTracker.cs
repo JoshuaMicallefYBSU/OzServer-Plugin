@@ -22,6 +22,16 @@ public class SectorCommitResult
     public List<string> Failed { get; } = new();
 }
 
+// What changed the moment Owned itself changed - raised by ReconcileMmiWithOwned alongside its own
+// MMI/VSCS writes. TagOwnershipSync is the consumer: Lost is what drives its hand-off-on-loss
+// trigger (see its own class comment for why that, and only that, plus a tag going uncontrolled, are
+// the two things allowed to move a tag between controllers).
+public class SectorOwnershipDiff
+{
+    public List<SectorsVolumes.Sector> Gained { get; } = new();
+    public List<SectorsVolumes.Sector> Lost { get; } = new();
+}
+
 // Keeps OzServer's sector-ownership record in sync with MMI.SectorsControlled, independent of
 // whether OzServerSectorsWindow happens to be open. Constructed unconditionally by Plugin (like
 // AfvSectorClaimer) rather than lazily: a VSCS/AFV transmit press only ever touches
@@ -47,6 +57,12 @@ public class SectorCommitResult
 // request still reaches this controller's VSCS panel even if they never open that window - the
 // other controller's Accept click only changes ownership on the server, with no direct signal to
 // this session at all otherwise.
+//
+// Also tracks everyone else's ownership (_controlled/ClaimedSectors/OwnerOf), not just this
+// session's own Owned, and raises OwnershipChanged whenever Owned itself changes - both unconditional
+// for the same reason Owned itself is: TagOwnershipSync needs the full live picture of who owns
+// which subsector, on every FDR/radar update, to decide who should hold each tag - see its own class
+// comment.
 public class OzServerOwnershipTracker
 {
     static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(10);
@@ -60,10 +76,19 @@ public class OzServerOwnershipTracker
     // popup naming the sector and who asked, which a bare count cannot do. Still only raised when
     // the set actually changes, so it fires once per new request rather than once per poll.
     public event EventHandler<IReadOnlyList<OzServerSectorOwnershipRequestDto>>? IncomingRequestsChanged;
+    // Fires whenever Owned actually gains or loses a sector - see SectorOwnershipDiff. Consumed by
+    // TagOwnershipSync to hand tags off the moment their subsector changes owner on OzServer.
+    public event EventHandler<SectorOwnershipDiff>? OwnershipChanged;
 
     readonly OzServerApiClient _api = new();
     readonly System.Threading.Timer _pollTimer;
     List<SectorsVolumes.Sector> _owned = new();
+    // Everyone else's active ownership record, keyed by sector name - the same data
+    // OzServerSectorsWindow's "Controlled" pane shows, but kept current unconditionally (like Owned)
+    // rather than only while that window happens to be open, since TagOwnershipSync needs the full
+    // picture - who owns what, not just what this session owns - on every FDR/radar update, not just
+    // when a controller happens to have the Sectors window up.
+    Dictionary<string, OzServerControlledSectorOwnerDto> _controlled = new(StringComparer.OrdinalIgnoreCase);
     // False until RefreshFromServerAsync has run once - the very first result is this session's
     // starting baseline (whatever was already owned from a previous session, claimed elsewhere,
     // etc.), not something *newly* gained just now, so it's recorded without also seizing
@@ -124,6 +149,35 @@ public class OzServerOwnershipTracker
     bool _primaryClaimRetryRunning;
 
     public IReadOnlyList<SectorsVolumes.Sector> Owned => _owned;
+
+    // Every sector OzServer currently has an active ownership record for, mine or otherwise -
+    // Owned's own Sector instances plus whatever _controlled's keys resolve to in
+    // SectorsVolumes.Sectors. TagOwnershipSync resolves a tag's live subsector against exactly this
+    // set, not the whole SectorsVolumes.Sectors list, since a sector nobody on OzServer has claimed
+    // has no bearing on who should hold a tag sitting in it.
+    public IEnumerable<SectorsVolumes.Sector> ClaimedSectors => _owned.Concat(
+        _controlled.Keys
+            .Select(name => SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == name))
+            .Where(s => s != null)
+            .Select(s => s!))
+        .Distinct();
+
+    public bool IsMine(SectorsVolumes.Sector sector) => _owned.Any(o => o.Equals(sector));
+
+    // Whoever OzServer currently says holds sector - a synthetic "me" when it's in Owned (Owned
+    // itself only ever carries the sector, not an owner record, since it's never needed anything
+    // else about itself), otherwise whatever _controlled has for it, otherwise null (nobody has an
+    // active ownership record for it at all).
+    public OzServerControlledSectorOwnerDto? OwnerOf(SectorsVolumes.Sector sector)
+    {
+        if (IsMine(sector))
+        {
+            int.TryParse(Network.ControllerId, out var myCid);
+            return new OzServerControlledSectorOwnerDto { Cid = myCid, Callsign = Network.Callsign };
+        }
+
+        return _controlled.TryGetValue(sector.Name, out var owner) ? owner : null;
+    }
 
     public OzServerOwnershipTracker()
     {
@@ -312,6 +366,22 @@ public class OzServerOwnershipTracker
             return;
         }
 
+        try
+        {
+            var controlled = await _api.GetControlledSectorsAsync();
+            _controlled = controlled
+                .Where(c => c.Owner != null)
+                .ToDictionary(c => c.Name, c => c.Owner!, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            // Owned is still refreshed below even if this leg fails - Controlled going briefly
+            // stale (rather than being wiped to empty here) is far less disruptive than an
+            // unrelated transient failure blocking Owned, which every other caller here already
+            // depends on being current by the time this returns.
+            Errors.Add(new Exception($"Couldn't refresh Controlled from OzServer: {ex.Message}", ex), "OzServer");
+        }
+
         var previous = _owned;
         var current = mine
             .Select(dto => SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == dto.Name))
@@ -344,6 +414,11 @@ public class OzServerOwnershipTracker
 
         if (gained.Count == 0 && lost.Count == 0)
             return;
+
+        var diff = new SectorOwnershipDiff();
+        diff.Gained.AddRange(gained);
+        diff.Lost.AddRange(lost);
+        OwnershipChanged?.Invoke(this, diff);
 
         var mmiSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
