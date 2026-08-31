@@ -16,6 +16,9 @@ public class SectorCommitResult
     public List<string> Claimed { get; } = new();
     public List<string> Released { get; } = new();
     public List<string> Requested { get; } = new();
+    // Covered sub-sectors another controller already owned, left with them rather than requested -
+    // see CommitSectorChangesAsync for why asking for these automatically was wrong.
+    public List<string> Skipped { get; } = new();
     public List<string> Failed { get; } = new();
 }
 
@@ -49,11 +52,14 @@ public class OzServerOwnershipTracker
     static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(10);
 
     public event EventHandler? OwnedChanged;
-    // Fires with the new count whenever the number of incoming ("Requested From Me") requests
-    // changes - polled here rather than left to OzServerSectorsWindow alone so a plugin-wide
-    // notification (see Plugin's own navbar indicator) works even if that window has never been
-    // opened this session.
-    public event EventHandler<int>? PendingRequestCountChanged;
+    // Fires whenever the set of incoming ("Requested From Me") requests changes - polled here
+    // rather than left to OzServerSectorsWindow alone so the notification works even if that window
+    // has never been opened this session.
+    //
+    // Carries the incoming requests themselves, not just how many there are: Plugin shows them in a
+    // popup naming the sector and who asked, which a bare count cannot do. Still only raised when
+    // the set actually changes, so it fires once per new request rather than once per poll.
+    public event EventHandler<IReadOnlyList<OzServerSectorOwnershipRequestDto>>? IncomingRequestsChanged;
 
     readonly OzServerApiClient _api = new();
     readonly System.Threading.Timer _pollTimer;
@@ -68,7 +74,7 @@ public class OzServerOwnershipTracker
     // reading puts every sector the controller actually owns into Available. See its
     // SyncOwnedFromTracker.
     public bool HasBaseline => _hasBaseline;
-    int _pendingRequestCount = -1;
+    string? _pendingRequestSignature;
     // Coalesces MMI.SectorsControlledChanged - see OnMmiSectorsControlledChanged's own comment for
     // why running ClaimMmiControlledSectorsAsync re-entrantly (a second, overlapping call starting
     // before the first has finished) was a real bug, not just a theoretical one: it raced reads and
@@ -232,12 +238,15 @@ public class OzServerOwnershipTracker
             return;
         }
 
-        var count = requests.FromMe.Count;
-        if (count == _pendingRequestCount)
+        // Compared on request ids, not on the count: one request being accepted while another
+        // arrives between polls leaves the count identical while the actual requests differ, and
+        // that used to pass silently.
+        var signature = string.Join(",", requests.FromMe.Select(r => r.Id).OrderBy(id => id));
+        if (signature == _pendingRequestSignature)
             return;
 
-        _pendingRequestCount = count;
-        PendingRequestCountChanged?.Invoke(this, count);
+        _pendingRequestSignature = signature;
+        IncomingRequestsChanged?.Invoke(this, requests.FromMe);
     }
 
     // Deliberately no ConfigureAwait(false) anywhere on this path: callers reached from the UI
@@ -457,19 +466,20 @@ public class OzServerOwnershipTracker
             if (conflicts == null)
                 continue;
 
+            // Deliberately does NOT request the contested sub-sectors.
+            //
+            // A claim covers the sector plus everything its dataset entry is responsible for
+            // (Sector::coveredSectors), so one staged sector can collide on several sub-sectors it
+            // merely covers. Firing a request at each of those turned "I want ASP" into pending
+            // requests against half a dozen sectors the controller never asked for - and accepting
+            // any one of them handed over that sector's own covered group in turn. That is exactly
+            // the "requested one sector, received an unrelated one" case.
+            //
+            // Asking for a sector is now only ever something the controller does explicitly, by
+            // staging a sector another controller owns (OzServerSectorsWindow.StageSectorChange).
+            // Here the contested pieces are simply left with their current owner and reported.
             foreach (var conflict in conflicts)
-            {
-                try
-                {
-                    await _api.RequestSectorAsync(conflict.Sector);
-                    result.Requested.Add(conflict.Sector);
-                }
-                catch (Exception ex)
-                {
-                    result.Failed.Add(conflict.Sector);
-                    Errors.Add(new Exception($"Couldn't request {conflict.Sector}: {ex.Message}", ex), "OzServer");
-                }
-            }
+                result.Skipped.Add(conflict.Sector);
 
             // Then take the rest of the group. Without this second call a claim that collided on one
             // sub-sector would hand over none of the others, even though they were free.

@@ -14,7 +14,7 @@ namespace OzServerPlugin;
 //
 // Subclasses supply only the buttons along the bottom, which is the only thing that actually
 // differs between them: SectorConflictPromptWindow asks a Yes/No question,
-// SectorRelinquishNoticeWindow just reports something that has already happened.
+// SectorNoticeWindow just reports something that has already happened.
 public abstract class SectorMessageWindow : BaseForm
 {
     const int DialogWidth = 360;

@@ -201,7 +201,7 @@ public class PrimaryPositionWatcher
 
         // Non-modal: this is a notification about something already decided, and ShowDialog would
         // freeze the whole vatSys UI thread until the controller happened to notice and dismiss it.
-        var notice = new SectorRelinquishNoticeWindow(message, "Position relinquished");
+        var notice = new SectorNoticeWindow(message, "Position relinquished");
         if (Application.OpenForms["MainForm"] is Form mainForm)
             notice.Show(mainForm);
         else

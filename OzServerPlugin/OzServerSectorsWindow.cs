@@ -79,6 +79,8 @@ public class OzServerSectorsWindow : BaseForm
     // Set while an expand/collapse is being applied inside a BeginUpdate block - see the
     // AfterExpandCollapse handlers for why the scrollbar must not be touched until it ends.
     bool _suspendScrollSync;
+    // See SetScrollBarValue - stops a code-assigned scrollbar value bouncing back into the tree.
+    bool _syncingScrollBar;
     bool _allowTreeToggle;
     // Avoid clearing and recreating an unchanged tree. Owned is refreshed every ten seconds even
     // when it has not changed, Available also reacts to every network-controller change, and
@@ -89,6 +91,11 @@ public class OzServerSectorsWindow : BaseForm
     // Last GET /sectors/controlled result - "OzServer says someone other than me owns this". Held
     // as a snapshot so both lists render from it with no await, and refreshed on the same poll as
     // everything else rather than only when Controlled happens to be showing.
+    // Online controllers by callsign, rebuilt once per populate - see RefreshOnlineControllerIndex.
+    readonly Dictionary<string, NetworkATC> _onlineByCallsign = new(StringComparer.OrdinalIgnoreCase);
+    // Names from _controlledSnapshot as a set, so the Available filter is a hash lookup per sector
+    // rather than a linear scan of the whole response per sector.
+    readonly HashSet<string> _controlledNames = new(StringComparer.OrdinalIgnoreCase);
     List<OzServerControlledSectorDto> _controlledSnapshot = new();
     string? _controlledSignature;
     bool _hasControlledSnapshot;
@@ -108,6 +115,10 @@ public class OzServerSectorsWindow : BaseForm
     // every one of those rows yellow the instant anything was staged, instead of only the row that
     // was actually moved.
     readonly HashSet<string> _stagedNames = new(StringComparer.OrdinalIgnoreCase);
+    // Sectors staged to be *requested* rather than claimed - ones another controller currently owns.
+    // They are not added to _sectorsSelected, because staging one does not make it this controller's
+    // even provisionally: it shows under Requested By Me until Apply actually sends the request.
+    readonly List<SectorsVolumes.Sector> _stagedRequests = new();
     bool _applyRunning;
 
     // One menu for the window's lifetime, its items rebuilt per click, rather than a fresh
@@ -124,14 +135,14 @@ public class OzServerSectorsWindow : BaseForm
     readonly GenericButton _arrowButton;
     readonly ToggleGenericButton _availableModeButton;
     readonly ToggleGenericButton _controlledModeButton;
-    readonly GenericButton _acceptButton;
-    readonly GenericButton _rejectButton;
-    readonly GenericButton _cancelRequestButton;
+    // Accept/Reject/Cancel are no longer buttons. Every one of them was only ever a second way to
+    // invoke what the middle-click menu already offers on the row itself, and each needed its own
+    // enable/disable rules kept in step with that menu's. Removing them gives the list the height
+    // back and leaves exactly one place those actions live.
     readonly FlowLayoutPanel _sectorListModePanel;
     readonly FlowLayoutPanel _currSectorsFlowPanel;
     readonly FlowLayoutPanel _addRemoveLayoutPanel;
     readonly FlowLayoutPanel _requestedListRow;
-    readonly FlowLayoutPanel _requestActionsPanel;
     readonly InsetPanel _currInsetPanel;
     readonly InsetPanel _availInsetPanel;
     readonly InsetPanel _requestedInsetPanel;
@@ -227,7 +238,7 @@ public class OzServerSectorsWindow : BaseForm
             ShowNodeToolTips = true,
             ShowPlusMinus = false,
             ShowRootLines = false,
-            Size = new Size(265, 217),
+            Size = new Size(265, 255),
             TabIndex = 21,
             BackColor = Colours.GetColour(Colours.Identities.WindowBackground),
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText)
@@ -267,7 +278,7 @@ public class OzServerSectorsWindow : BaseForm
             Location = new Point(3, 3),
             Margin = new Padding(3, 3, 1, 3),
             Name = "requestedInsetPanel",
-            Size = new Size(270, 224),
+            Size = new Size(270, 262),
             TabIndex = 0
         };
         _requestedInsetPanel.Controls.Add(_requestedChangesView);
@@ -324,7 +335,7 @@ public class OzServerSectorsWindow : BaseForm
             Name = "requestedScrollBar",
             Orientation = ScrollOrientation.VerticalScroll,
             PreferredHeight = 10,
-            Size = new Size(20, 224),
+            Size = new Size(20, 262),
             TabIndex = 1,
             Text = "requestedScrollBar",
             Value = 0,
@@ -359,47 +370,11 @@ public class OzServerSectorsWindow : BaseForm
         {
             Margin = new Padding(0),
             Name = "requestedListRow",
-            Size = new Size(298, 230),
+            Size = new Size(298, 268),
             TabIndex = 20
         };
         _requestedListRow.Controls.Add(_requestedInsetPanel);
         _requestedListRow.Controls.Add(_requestedScrollBar);
-
-        _acceptButton = CreateRequestActionButton("Accept");
-        // Guarded for the same reason as ArrowButton_Click - these lambdas are async void.
-        _acceptButton.Click += async (_, _) => await AcceptSelectedRequestsAsync();
-
-        _rejectButton = CreateRequestActionButton("Reject");
-        _rejectButton.Click += async (_, _) => await RejectSelectedRequestAsync();
-
-        _cancelRequestButton = CreateRequestActionButton("Cancel");
-        _cancelRequestButton.Click += async (_, _) =>
-        {
-            try
-            {
-                var request = FindOwningRequest(_requestedChangesView.SelectedNode);
-                if (request != null && CategoryNameOf(_requestedChangesView.SelectedNode) == RequestedByMeName)
-                    await CancelRequestAsync(request);
-            }
-            catch (Exception ex)
-            {
-                Errors.Add(new Exception($"Couldn't cancel that sector request: {ex.Message}", ex), "OzServer");
-                UpdateRequestActionButtons();
-            }
-        };
-
-        _requestActionsPanel = new FlowLayoutPanel
-        {
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            Margin = new Padding(0, 4, 0, 0),
-            Name = "requestActionsPanel"
-        };
-        _requestActionsPanel.Controls.Add(_acceptButton);
-        _requestActionsPanel.Controls.Add(_rejectButton);
-        _requestActionsPanel.Controls.Add(_cancelRequestButton);
 
         _arrowButton = new GenericButton
         {
@@ -425,7 +400,6 @@ public class OzServerSectorsWindow : BaseForm
             TabIndex = 22
         };
         _requestedChangesPanel.Controls.Add(_requestedListRow);
-        _requestedChangesPanel.Controls.Add(_requestActionsPanel);
         _requestedChangesPanel.Controls.Add(_arrowButton);
 
         _currentSectorsLabel = new TextLabel
@@ -556,7 +530,14 @@ public class OzServerSectorsWindow : BaseForm
         // Owned itself doesn't need polling any more - the tracker keeps it current on its own,
         // independent of this window - but a nudge here still catches up faster than waiting on
         // whatever last triggered the tracker's own refresh.
-        _pollTimer = new System.Windows.Forms.Timer { Interval = 10000 };
+        // 2s, not 10s. This timer only runs while the window is actually visible (see
+        // OnVisibleChanged), and it is the only thing that surfaces another controller's actions -
+        // a sector being claimed, released, requested or handed over. At ten seconds those took
+        // long enough to appear that the lists looked wrong rather than merely behind. Each tick is
+        // three GETs that all no-op cheaply when nothing changed: the tracker's refresh drops out if
+        // one is already running, and both the requests and controlled snapshots are compared before
+        // anything is rebuilt.
+        _pollTimer = new System.Windows.Forms.Timer { Interval = 2000 };
         _pollTimer.Tick += (_, _) =>
         {
             _ = _tracker.RefreshFromServerIfIdleAsync();
@@ -916,32 +897,29 @@ public class OzServerSectorsWindow : BaseForm
         if (selectionCleared)
             treeView.SelectedNode = null;
 
-        treeView.BeginUpdate();
+        // Deliberately NOT wrapped in BeginUpdate/EndUpdate. Suspending redraw only pays off when
+        // several mutations are being batched - this is a single Expand/Collapse, and EndUpdate
+        // re-enables WM_SETREDRAW by invalidating the whole control, so wrapping it threw away the
+        // native incremental expand (which repaints just the rows that moved) and repainted the
+        // entire list instead. That full repaint is what read as the list redrawing rather than
+        // opening.
+        _allowTreeToggle = true;
+        _suspendScrollSync = true;
         try
         {
-            _allowTreeToggle = true;
-            _suspendScrollSync = true;
-            try
-            {
-                if (node.IsExpanded)
-                    node.Collapse();
-                else
-                    node.Expand();
-            }
-            finally
-            {
-                _allowTreeToggle = false;
-            }
+            if (node.IsExpanded)
+                node.Collapse();
+            else
+                node.Expand();
         }
         finally
         {
-            treeView.EndUpdate();
+            _allowTreeToggle = false;
             _suspendScrollSync = false;
         }
 
-        // After EndUpdate, not from AfterExpand: the tree has actually relaid out by now, so the
-        // preferred height and scroll position this reads are the ones that describe what is on
-        // screen. One sync for the whole toggle rather than one per node event.
+        // One sync for the whole toggle rather than one per node event, and after the expand rather
+        // than from inside AfterExpand, where the control has not finished relaying out.
         SyncScrollbarFor(treeView);
 
         if (selectionCleared)
@@ -967,32 +945,42 @@ public class OzServerSectorsWindow : BaseForm
     void SectorsView_DrawNode(object? sender, DrawTreeNodeEventArgs e)
     {
         var treeView = (TreeViewEx)sender!;
+        var selected = (e.State & TreeNodeStates.Selected) != 0;
 
         // A staged row - moved across but not yet committed by Apply - is drawn in the profile's
         // own WindowWarning identity rather than a hardcoded yellow. That is exactly the role
         // ("warning indications in windows"), it is BrightYellow in the Australia profile, and it
         // follows the loaded profile the way every other colour in this window does. Selection still
         // wins over it, so a staged row the controller is pointing at still reads as selected.
-        var color = (e.State & TreeNodeStates.Selected) != 0
+        var color = selected
             ? Colours.GetColour(Colours.Identities.HighlightedText)
             : IsStagedNode(e.Node)
                 ? Colours.GetColour(Colours.Identities.WindowWarning)
                 : Colours.GetColour(Colours.Identities.InteractiveText);
 
-        // Both of these are unmanaged GDI+ region handles, and this runs once per node per repaint
-        // across three trees - neither can be left to the finalizer. Graphics.Clip's *getter*
-        // allocates a fresh Region every call (it is not a borrowed reference), so the saved
-        // original needs disposing just as much as the replacement does. The setter copies the
-        // region it's given, which is what makes it safe to dispose the replacement immediately.
-        using var previousClip = e.Graphics.Clip;
+        // DrawMode is OwnerDrawText, so the system has already filled the row with the control's
+        // BackColor before this runs - an ordinary row has nothing to erase and only needs its text.
+        //
+        // Only a selected row does: the system paints its highlight block there, and this window
+        // shows selection as coloured text on the normal background instead. Clearing every row
+        // regardless meant allocating and disposing two GDI+ Regions per row per repaint (Clip's
+        // getter allocates a fresh Region, it is not a borrowed reference) for no visible
+        // difference on the vast majority of them.
+        if (selected)
+        {
+            using var previousClip = e.Graphics.Clip;
 
-        using (var clip = new Region(e.Bounds))
-            e.Graphics.Clip = clip;
+            using (var clip = new Region(e.Bounds))
+                e.Graphics.Clip = clip;
 
-        e.Graphics.Clear(treeView.BackColor);
+            e.Graphics.Clear(treeView.BackColor);
+            TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, color);
+
+            e.Graphics.Clip = previousClip;
+            return;
+        }
+
         TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, color);
-
-        e.Graphics.Clip = previousClip;
     }
 
     // Group headers (Approach/Centre/.../Requested By Me/...) get the >/v expand-collapse prefix
@@ -1026,22 +1014,26 @@ public class OzServerSectorsWindow : BaseForm
     // required because some grouping data contains a same-named sector both as a claimable parent
     // and as its own child; a global "sector:TBD" key could restore a parent selection onto that
     // child instead. Text is only the fallback for informational request descendants/placeholders.
-    static string NodeKey(TreeNode node)
+    // One node's own identity, without its ancestors. The full path key is assembled top-down as
+    // the tree is walked (see CaptureExpanded/RestoreExpandedAndSelection), because building it
+    // per-node from the node upwards was the single most expensive thing this window did: it
+    // allocated a Stack and a string per segment and then joined them, for every node, on three
+    // separate full walks of every rebuild (capture, signature, restore). With a few hundred
+    // sectors that is thousands of allocations per refresh - and refreshes happen on every poll.
+    //
+    // The path still matters for correctness: some grouping data contains the same sector both as a
+    // claimable parent and as its own child, so a bare "sector:TBD" could restore a parent's
+    // expansion onto that child. Assembling it downwards costs one concatenation per node instead.
+    static string NodeSegment(TreeNode node) => node.Tag switch
     {
-        var segments = new Stack<string>();
-        for (var current = node; current != null; current = current.Parent)
-        {
-            segments.Push(current.Tag switch
-            {
-                SectorsVolumes.Sector sector => "sector:" + sector.Name,
-                SectorChangeRequest request => "request:" + request.Id,
-                _ when ReferenceEquals(current.Tag, CategoryTag) => "category:" + current.Name,
-                _ => "text:" + current.Text
-            });
-        }
+        SectorsVolumes.Sector sector => "sector:" + sector.Name,
+        SectorChangeRequest request => "request:" + request.Id,
+        _ when ReferenceEquals(node.Tag, CategoryTag) => "category:" + node.Name,
+        _ => "text:" + node.Text
+    };
 
-        return string.Join("\u001f", segments);
-    }
+    static string ChildKey(string parentKey, TreeNode node) =>
+        parentKey.Length == 0 ? NodeSegment(node) : parentKey + "" + NodeSegment(node);
 
     sealed class TreeViewState
     {
@@ -1053,20 +1045,28 @@ public class OzServerSectorsWindow : BaseForm
     static TreeViewState CaptureTreeState(TreeViewEx view, ScrollBar scrollBar)
     {
         var state = new TreeViewState { ScrollValue = scrollBar.Value };
-        CaptureExpanded(view.Nodes, state.ExpandedKeys);
-        state.SelectedKey = view.SelectedNode == null ? null : NodeKey(view.SelectedNode);
+        var selected = view.SelectedNode;
+        CaptureExpanded(view.Nodes, "", state, selected);
         return state;
     }
 
-    static void CaptureExpanded(TreeNodeCollection nodes, HashSet<string> expandedInto)
+    // Descends only into branches that are open. A collapsed branch cannot contain an expanded node
+    // by definition, so walking it was pure waste - and it is where nearly all the nodes live.
+    // The selected node's key is picked up on the way past rather than rebuilt from scratch.
+    static void CaptureExpanded(TreeNodeCollection nodes, string parentKey, TreeViewState state, TreeNode? selected)
     {
         foreach (TreeNode node in nodes)
         {
-            var key = NodeKey(node);
-            if (node.IsExpanded)
-                expandedInto.Add(key);
+            var key = ChildKey(parentKey, node);
 
-            CaptureExpanded(node.Nodes, expandedInto);
+            if (ReferenceEquals(node, selected))
+                state.SelectedKey = key;
+
+            if (!node.IsExpanded)
+                continue;
+
+            state.ExpandedKeys.Add(key);
+            CaptureExpanded(node.Nodes, key, state, selected);
         }
     }
 
@@ -1078,23 +1078,27 @@ public class OzServerSectorsWindow : BaseForm
     {
         TreeNode? selected = null;
 
-        void Walk(TreeNodeCollection nodes)
+        void Walk(TreeNodeCollection nodes, string parentKey)
         {
             foreach (TreeNode node in nodes)
             {
-                var key = NodeKey(node);
-                if (state.ExpandedKeys.Contains(key))
-                {
-                    node.Expand();
-                    RefreshDropdownNodeText(node);
-                }
+                var key = ChildKey(parentKey, node);
+
                 if (key == state.SelectedKey)
                     selected = node;
-                Walk(node.Nodes);
+
+                // Nothing below a branch that was closed can have been open either, so there is no
+                // reason to descend into it looking for one.
+                if (!state.ExpandedKeys.Contains(key))
+                    continue;
+
+                node.Expand();
+                RefreshDropdownNodeText(node);
+                Walk(node.Nodes, key);
             }
         }
 
-        Walk(view.Nodes);
+        Walk(view.Nodes, "");
 
         if (selected != null)
             view.SelectedNode = selected;
@@ -1103,10 +1107,12 @@ public class OzServerSectorsWindow : BaseForm
     // Restores the scroll position captured by CaptureTreeState - call after the tree's own
     // Configure*Scrollbar() has already run against the rebuilt content, so PreferredHeight/
     // ActualHeight reflect the new node structure before the old offset is reapplied to it.
-    static void RestoreScroll(TreeViewEx view, ScrollBar scrollBar, TreeViewState state)
+    void RestoreScroll(TreeViewEx view, ScrollBar scrollBar, TreeViewState state)
     {
         var itemHeight = Math.Max(view.ItemHeight, 1);
-        scrollBar.Value = state.ScrollValue;
+        // Guarded for the same reason as SyncScrollValue: this sets the tree's position itself on
+        // the next line, and letting the bar's own Scroll handler do it too scrolled it twice.
+        SetScrollBarValue(scrollBar, state.ScrollValue);
         view.SetScrollPosVert((state.ScrollValue + itemHeight - 1) / itemHeight);
     }
 
@@ -1116,10 +1122,31 @@ public class OzServerSectorsWindow : BaseForm
     // Clamped at zero, which the raw expression is not - at the top of the list (row 0) it evaluates
     // to 1 - ItemHeight, i.e. negative, and assigning that produced exactly the jump-to-nowhere seen
     // when collapsing a group while scrolled to the top.
-    static void SyncScrollValue(TreeViewEx view, ScrollBar scrollBar)
+    void SyncScrollValue(TreeViewEx view, ScrollBar scrollBar)
     {
         var itemHeight = Math.Max(view.ItemHeight, 1);
-        scrollBar.Value = Math.Max(0, view.GetScrollPos().Y * itemHeight - itemHeight + 1);
+        var value = Math.Max(0, view.GetScrollPos().Y * itemHeight - itemHeight + 1);
+        if (scrollBar.Value == value)
+            return;
+
+        SetScrollBarValue(scrollBar, value);
+    }
+
+    // The bar raises Scroll for a value assigned from code exactly as it does for a drag, and its
+    // handler pushes that position straight back into the tree - so syncing the bar after an expand
+    // scrolled the tree a second time and repainted it again. The flag makes the assignment
+    // one-directional: bar follows tree here, tree follows bar only for real user scrolling.
+    void SetScrollBarValue(ScrollBar scrollBar, int value)
+    {
+        _syncingScrollBar = true;
+        try
+        {
+            scrollBar.Value = value;
+        }
+        finally
+        {
+            _syncingScrollBar = false;
+        }
     }
 
     void SyncScrollbarFor(TreeViewEx view)
@@ -1143,36 +1170,76 @@ public class OzServerSectorsWindow : BaseForm
 
     void CurrScrollBar_Scroll(object? sender, EventArgs e)
     {
+        if (_syncingScrollBar)
+            return;
+
         _currSectorsView.SetScrollPosVert((_currScrollBar.Value + _currSectorsView.ItemHeight - 1) / _currSectorsView.ItemHeight);
+    }
+
+    // What TreeViewEx.GetPreferredHeight() computes, without the cost of computing it.
+    //
+    // Its MeasureHeight walks *every* node in the tree - collapsed branches included, since it
+    // recurses on Nodes.Count rather than on expansion - and reads TreeNode.Bounds for each one.
+    // Bounds is not a managed value: it round-trips to the native control (TVM_GETITEMRECT) per
+    // node, and returns an empty rectangle for anything not currently visible. So the result is
+    // simply the visible rows' combined height, arrived at via one SendMessage for every node in
+    // the dataset - several hundred of them here.
+    //
+    // This is called from ConfigureXScrollbar, which runs on every expand, every collapse and every
+    // tree rebuild. That synchronous P/Invoke storm between the expand and the repaint is what made
+    // opening a category look like the list was rebuilding rather than unfolding.
+    //
+    // Same answer, walked in managed code, and only descending into branches that are actually
+    // open - a collapsed tree costs a handful of checks instead of hundreds of messages.
+    static int VisibleContentHeight(TreeViewEx view) =>
+        CountVisibleNodes(view.Nodes) * view.ItemHeight;
+
+    static int CountVisibleNodes(TreeNodeCollection nodes)
+    {
+        var count = 0;
+        foreach (TreeNode node in nodes)
+        {
+            count++;
+            if (node.IsExpanded)
+                count += CountVisibleNodes(node.Nodes);
+        }
+
+        return count;
     }
 
     void ConfigureCurrScrollbar()
     {
-        _currScrollBar.PreferredHeight = _currSectorsView.GetPreferredHeight();
+        _currScrollBar.PreferredHeight = VisibleContentHeight(_currSectorsView);
         _currScrollBar.ActualHeight = _currSectorsView.Height;
         _currScrollBar.Change = _currSectorsView.ItemHeight;
     }
 
     void AvailScrollBar_Scroll(object? sender, EventArgs e)
     {
+        if (_syncingScrollBar)
+            return;
+
         _availSectorsView.SetScrollPosVert((_availScrollBar.Value + _availSectorsView.ItemHeight - 1) / _availSectorsView.ItemHeight);
     }
 
     void ConfigureAvailScrollbar()
     {
-        _availScrollBar.PreferredHeight = _availSectorsView.GetPreferredHeight();
+        _availScrollBar.PreferredHeight = VisibleContentHeight(_availSectorsView);
         _availScrollBar.ActualHeight = _availSectorsView.Height;
         _availScrollBar.Change = _availSectorsView.ItemHeight;
     }
 
     void RequestedScrollBar_Scroll(object? sender, EventArgs e)
     {
+        if (_syncingScrollBar)
+            return;
+
         _requestedChangesView.SetScrollPosVert((_requestedScrollBar.Value + _requestedChangesView.ItemHeight - 1) / _requestedChangesView.ItemHeight);
     }
 
     void ConfigureRequestedScrollbar()
     {
-        _requestedScrollBar.PreferredHeight = _requestedChangesView.GetPreferredHeight();
+        _requestedScrollBar.PreferredHeight = VisibleContentHeight(_requestedChangesView);
         _requestedScrollBar.ActualHeight = _requestedChangesView.Height;
         _requestedScrollBar.Change = _requestedChangesView.ItemHeight;
     }
@@ -1196,7 +1263,7 @@ public class OzServerSectorsWindow : BaseForm
     // the staged list against the server, because that comparison also goes true when the *server*
     // changes underneath (a request of mine accepted, a primary taking a sector back) - which is not
     // something the controller staged, and must not light up Apply or lock the list.
-    bool HasStagedEdits => _stagedNames.Count > 0;
+    bool HasStagedEdits => _stagedNames.Count > 0 || _stagedRequests.Count > 0;
 
     void UpdateApplyCancelButtons()
     {
@@ -1217,6 +1284,17 @@ public class OzServerSectorsWindow : BaseForm
     // clearing it changes no row's text or structure and the rebuild is correctly skipped - which
     // would leave every row still painted yellow after a successful Apply. Repaint explicitly
     // instead of forcing a rebuild nothing else needs.
+    // Pulls every source the three lists read, at once. Called straight after any action this
+    // controller takes so the result is on screen immediately rather than on the next poll tick -
+    // ownership (Owned/Available), the requests list, and the controlled snapshot that Available
+    // filters against all change together when a claim, release, request or accept lands.
+    void RefreshAllListsAsync()
+    {
+        _ = _tracker.RefreshFromServerIfIdleAsync();
+        _ = RefreshRequestedChangesAsync();
+        _ = RefreshControlledSnapshotAsync();
+    }
+
     void RefreshStagedHighlight()
     {
         _currSectorsView.Invalidate();
@@ -1235,7 +1313,7 @@ public class OzServerSectorsWindow : BaseForm
         _controlledModeButton.Invalidate();
 
         // A mode switch is a genuinely different data set, so the old selection deliberately isn't
-        // carried across it - PopulateAvailableList's own state capture/restore (see NodeKey) would
+        // carried across it - PopulateAvailableList's own state capture/restore (see NodeSegment) would
         // otherwise try to find something that plainly no longer applies.
         _availSectorsView.SelectedNode = null;
 
@@ -1401,6 +1479,9 @@ public class OzServerSectorsWindow : BaseForm
             return;
         }
 
+        // Once for the whole pass, not once per sector - see FindController.
+        RefreshOnlineControllerIndex();
+
         var sectorNodes = new List<TreeNode>();
         foreach (var key in SectorsVolumes.Sectors.Where(s =>
                      s.CSECEligible && !_sectorsSelected.Any(ss => !ss.IsDummy && s.Name == ss.Name)))
@@ -1472,6 +1553,9 @@ public class OzServerSectorsWindow : BaseForm
             var firstAnswer = !_hasControlledSnapshot;
 
             _controlledSnapshot = controlled;
+            _controlledNames.Clear();
+            foreach (var dto in controlled)
+                _controlledNames.Add(dto.Name);
             _hasControlledSnapshot = true;
 
             // Only re-render when the answer actually changed. This runs on every poll tick, and
@@ -1514,7 +1598,7 @@ public class OzServerSectorsWindow : BaseForm
     // reached a sector by extending into it is not logged in under that sector's callsign at all, so
     // presence alone never sees them and the sector looked claimable when it was not.
     bool IsOwnedByAnotherController(SectorsVolumes.Sector sector) =>
-        _controlledSnapshot.Any(dto => dto.Name == sector.Name);
+        _controlledNames.Contains(sector.Name);
 
     void ApplyAvailableSectorNodes(List<TreeNode> sectorNodes, string modePrefix)
     {
@@ -1629,9 +1713,27 @@ public class OzServerSectorsWindow : BaseForm
         return controller == null;
     }
 
-    static NetworkATC? FindController(SectorsVolumes.Sector sector) =>
-        (Network.GetOnlineATCs ?? new List<NetworkATC>())
-        .FirstOrDefault(a => a.ValidATC && a.Callsign == sector.Callsign);
+    // Reads the per-populate snapshot, never Network.GetOnlineATCs directly.
+    //
+    // That property is not a cached list: it copies vatSys's live collection into a new List on
+    // every single call. This used to be called once per sector *and* once per sub-sector while
+    // building the Available tree, so one refresh allocated and linearly scanned that whole list
+    // several hundred times. Indexed once per populate instead - see RefreshOnlineControllerIndex.
+    NetworkATC? FindController(SectorsVolumes.Sector sector) =>
+        sector.Callsign != null && _onlineByCallsign.TryGetValue(sector.Callsign, out var atc) ? atc : null;
+
+    // Rebuilt at the start of each populate so every node built in that pass sees one consistent
+    // view of who is online, rather than re-reading a list that can change underneath the walk.
+    void RefreshOnlineControllerIndex()
+    {
+        _onlineByCallsign.Clear();
+
+        foreach (var atc in Network.GetOnlineATCs ?? new List<NetworkATC>())
+        {
+            if (atc.ValidATC && !string.IsNullOrEmpty(atc.Callsign))
+                _onlineByCallsign[atc.Callsign] = atc;
+        }
+    }
 
     static string FormatSectorText(SectorsVolumes.Sector sector, NetworkATC? controller = null)
     {
@@ -1670,7 +1772,9 @@ public class OzServerSectorsWindow : BaseForm
 
         static void AppendNode(StringBuilder into, TreeNode node)
         {
-            AppendValue(into, NodeKey(node));
+            // Own segment, not the full path: this walk already encodes structure through the
+            // child counts below, so re-deriving each node's ancestry here was redundant work.
+            AppendValue(into, NodeSegment(node));
             AppendValue(into, node.Text);
             into.Append('[').Append(node.Nodes.Count).Append(']');
             foreach (TreeNode child in node.Nodes)
@@ -1776,12 +1880,33 @@ public class OzServerSectorsWindow : BaseForm
             .Where(o => _stagedNames.Contains(o.Name) && !staged.Any(s => s.Name == o.Name))
             .ToList();
 
+        // Snapshotted before the await: the staged list is cleared on completion, and the poll can
+        // repopulate the lists while this is in flight.
+        var stagedRequests = _stagedRequests.ToList();
+
         _applyRunning = true;
         UpdateArrowButton();
         UpdateApplyCancelButtons();
         try
         {
             var result = await _tracker.CommitSectorChangesAsync(toClaim, toRelease);
+
+            // Staged requests are sent after the claims and releases: a sector freed by one of those
+            // releases might be exactly what somebody is being asked for, and asking first would
+            // race it.
+            foreach (var sector in stagedRequests)
+            {
+                try
+                {
+                    await _tracker.RequestAsync(sector);
+                    result.Requested.Add(sector.Name);
+                }
+                catch (Exception ex)
+                {
+                    result.Failed.Add(sector.Name);
+                    Errors.Add(new Exception($"Couldn't request {sector.Name}: {ex.Message}", ex), "OzServer");
+                }
+            }
 
             if (IsDisposed || !IsHandleCreated)
                 return;
@@ -1791,7 +1916,12 @@ public class OzServerSectorsWindow : BaseForm
             // resync below adopts the real result - including a claim that turned into a request and
             // therefore did not move.
             _stagedNames.Clear();
+            _stagedRequests.Clear();
             SyncOwnedFromTracker();
+            // Pulls the just-sent requests back as real ones, so they stop being yellow and become
+            // ordinary pending rows under Requested By Me - and refreshes what is claimable, since
+            // this Apply just changed it.
+            RefreshAllListsAsync();
             RefreshStagedHighlight();
             ReportCommitResult(result);
         }
@@ -1811,21 +1941,37 @@ public class OzServerSectorsWindow : BaseForm
     // without this an Apply that turned into a request looks like an Apply that did nothing.
     void ReportCommitResult(SectorCommitResult result)
     {
-        if (result.Requested.Count == 0)
+        var parts = new List<string>();
+
+        if (result.Requested.Count > 0)
+        {
+            var names = string.Join(", ", result.Requested.Distinct());
+            parts.Add(result.Requested.Count == 1
+                ? $"{names} is owned by another controller, so a request has been sent to them."
+                : $"These are owned by other controllers, so requests have been sent: {names}");
+        }
+
+        // Reported rather than silently dropped: these are sub-sectors of something that *was*
+        // claimed, so without saying so the controller sees a claim succeed and has no idea part of
+        // the group stayed behind. They are not requested automatically - staging them is how you
+        // ask for them.
+        if (result.Skipped.Count > 0)
+        {
+            var names = string.Join(", ", result.Skipped.Distinct());
+            parts.Add(result.Skipped.Count == 1
+                ? $"{names} is already owned by another controller and was left with them. Move it across on its own to request it."
+                : $"These are already owned by other controllers and were left with them: {names}. Move one across on its own to request it.");
+        }
+
+        if (parts.Count == 0)
             return;
 
-        var names = string.Join(", ", result.Requested.Distinct());
-        var message = result.Requested.Count == 1
-            ? $"{names} is owned by another controller, so a request has been sent to them."
-            : $"These are owned by other controllers, so requests have been sent: {names}";
-
-        _ = RefreshRequestedChangesAsync();
-        ShowNotice(message, "Sector requested");
+        ShowNotice(string.Join(Environment.NewLine + Environment.NewLine, parts), "Sector changes applied");
     }
 
     static void ShowNotice(string message, string caption)
     {
-        var notice = new SectorRelinquishNoticeWindow(message, caption);
+        var notice = new SectorNoticeWindow(message, caption);
         if (Application.OpenForms["MainForm"] is Form mainForm)
             notice.Show(mainForm);
         else
@@ -1841,8 +1987,10 @@ public class OzServerSectorsWindow : BaseForm
             return;
 
         _stagedNames.Clear();
+        _stagedRequests.Clear();
         SyncOwnedFromTracker();
         PopulateLists();
+        PopulateRequestedChanges();
         RefreshStagedHighlight();
         UpdateArrowButton();
     }
@@ -1933,6 +2081,44 @@ public class OzServerSectorsWindow : BaseForm
     // mid-edit used to overwrite whatever the controller had picked.
     void StageSectorChange(SectorsVolumes.Sector sector, bool owned)
     {
+        // Taking a sector somebody else holds is a request, not a claim, and the window should say
+        // so the moment it is staged rather than pretending it is already in Owned and only
+        // revealing the truth after Apply. It goes to Requested By Me instead, still yellow because
+        // nothing has been sent yet, and the selection is dropped: the row has moved to a different
+        // list and leaving the old one selected points the arrow button at nothing.
+        if (owned && IsOwnedByAnotherController(sector))
+        {
+            if (!_stagedRequests.Any(r => r.Name == sector.Name))
+            {
+                _stagedRequests.Add(sector);
+                _stagedNames.Add(sector.Name);
+            }
+
+            _availSectorsView.SelectedNode = null;
+            _currSectorsView.SelectedNode = null;
+
+            PopulateLists();
+            PopulateRequestedChanges();
+            RefreshStagedHighlight();
+            UpdateArrowButton();
+            UpdateApplyCancelButtons();
+            return;
+        }
+
+        // Moving a staged request back out again just withdraws it - nothing was ever sent.
+        if (!owned && _stagedRequests.Any(r => r.Name == sector.Name))
+        {
+            _stagedRequests.RemoveAll(r => r.Name == sector.Name);
+            _stagedNames.Remove(sector.Name);
+
+            PopulateLists();
+            PopulateRequestedChanges();
+            RefreshStagedHighlight();
+            UpdateArrowButton();
+            UpdateApplyCancelButtons();
+            return;
+        }
+
         // Name comparison, not Contains: it is the footing every other Owned/Available decision in
         // this window uses, and the one vatSys's own SectorsWindow uses too (see PopulateLists).
         var alreadyOwned = _sectorsSelected.Any(s => !s.IsDummy && s.Name == sector.Name);
@@ -2108,7 +2294,7 @@ public class OzServerSectorsWindow : BaseForm
     void PopulateRequestedChanges()
     {
         var byMeNode = CreateCategoryNode(_requestedChangesView, RequestedByMeName);
-        AddRequestNodes(byMeNode, _requestsByMe, NoRequestsByMe);
+        AddRequestNodes(byMeNode, _requestsByMe, NoRequestsByMe, _stagedRequests);
 
         var fromMeNode = CreateCategoryNode(_requestedChangesView, RequestedFromMeName);
         AddRequestNodes(fromMeNode, _requestsFromMe, NoRequestsFromMe);
@@ -2150,11 +2336,31 @@ public class OzServerSectorsWindow : BaseForm
         UpdateRequestActionButtons();
     }
 
-    void AddRequestNodes(TreeNode parent, List<SectorChangeRequest> requests, string emptyText)
+    void AddRequestNodes(TreeNode parent, List<SectorChangeRequest> requests, string emptyText,
+        List<SectorsVolumes.Sector>? staged = null)
     {
+        // Staged rows first: they are the ones the controller just acted on, and they are tagged
+        // with the sector so IsStagedNode paints them yellow. Once Apply sends them the server
+        // returns them as real requests and they render in the ordinary colour instead.
+        if (staged != null)
+        {
+            foreach (var sector in staged.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                var text = FormatSectorText(sector);
+                parent.Nodes.Add(new TreeNode(text)
+                {
+                    Tag = sector,
+                    NodeFont = _requestedChangesView.Font,
+                    ToolTipText = text
+                });
+            }
+        }
+
         if (requests.Count == 0)
         {
-            parent.Nodes.Add(new TreeNode(emptyText) { NodeFont = _requestedChangesView.Font });
+            if (staged == null || staged.Count == 0)
+                parent.Nodes.Add(new TreeNode(emptyText) { NodeFont = _requestedChangesView.Font });
+
             return;
         }
 
@@ -2212,21 +2418,11 @@ public class OzServerSectorsWindow : BaseForm
         return node;
     }
 
+    // Kept as the single "request state changed" notification point even though there are no
+    // buttons left to update: the middle-click menu decides what it offers when it is opened, so
+    // there is nothing to pre-enable, but plenty of callers still want to say "this changed".
     void UpdateRequestActionButtons()
     {
-        if (_requestActionRunning || !Network.IsConnected)
-        {
-            SetRequestButtonsEnabled(false);
-            return;
-        }
-
-        var selected = _requestedChangesView.SelectedNode;
-        var category = CategoryNameOf(selected);
-        var request = FindOwningRequest(selected);
-
-        _acceptButton.Enabled = GetRequestsToAccept().Count > 0;
-        _rejectButton.Enabled = request != null && category == RequestedFromMeName;
-        _cancelRequestButton.Enabled = request != null && category == RequestedByMeName;
     }
 
     // What Accept acts on, entirely from the current selection:
@@ -2318,6 +2514,7 @@ public class OzServerSectorsWindow : BaseForm
             }
 
             await RefreshRequestedChangesAsync();
+            RefreshAllListsAsync();
         }
         catch (Exception ex)
         {
@@ -2341,6 +2538,7 @@ public class OzServerSectorsWindow : BaseForm
         {
             await _api.RejectRequestAsync(request.Id);
             await RefreshRequestedChangesAsync();
+            RefreshAllListsAsync();
         }
         catch (Exception ex)
         {
@@ -2364,6 +2562,7 @@ public class OzServerSectorsWindow : BaseForm
         {
             await _api.CancelRequestAsync(request.Id);
             await RefreshRequestedChangesAsync();
+            RefreshAllListsAsync();
         }
         catch (Exception ex)
         {
@@ -2376,10 +2575,4 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
-    void SetRequestButtonsEnabled(bool enabled)
-    {
-        _acceptButton.Enabled = enabled;
-        _rejectButton.Enabled = enabled;
-        _cancelRequestButton.Enabled = enabled;
-    }
 }

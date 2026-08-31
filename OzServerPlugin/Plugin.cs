@@ -1,3 +1,4 @@
+using System;
 using System.ComponentModel.Composition;
 using System.Drawing;
 using System.Linq;
@@ -60,73 +61,45 @@ public class Plugin : IPlugin
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
 
-        // Hidden until there's an incoming sector request to show. There's no plugin API for a
-        // standalone top-menu-bar button (MMI.AddCustomMenuItem only adds *into* an existing
-        // dropdown, e.g. CustomToolStripMenuItemCategory.Settings adds under Settings - there's no
-        // "Custom" dropdown of its own for CustomToolStripMenuItemCategory.Custom to land in,
-        // which is why an earlier attempt at this never actually appeared anywhere), so this is
-        // inserted directly into vatSys's own top menu strip instead - see InsertRequestNotificationItem
-        // below. _ownershipTracker.PendingRequestCountChanged (not OzServerSectorsWindow's own
-        // _requestsFromMe) drives it, so it lights up even if that window has never been opened.
-        //
-        // BackColor alone does nothing here - vatSys's own menu strip renderer ignores it entirely
-        // for top-level items (confirmed against RealLeviticus/vatsys-mumble-reconnect's
-        // MenuInjector, which hits the exact same wall for its own connection-status colour and
-        // works around it the same way below: paint the fill and text manually).
-        var requestNotificationItem = new ToolStripMenuItem { Visible = false };
-        requestNotificationItem.Click += (_, _) => OpenSectorsWindow();
-        requestNotificationItem.Paint += (sender, e) =>
+        // An incoming request announces itself with a window on screen rather than an indicator
+        // painted into vatSys's own menu bar. The menu-bar item had to be injected directly into
+        // MainForm.MainMenuStrip (MMI.AddCustomMenuItem only adds *into* an existing dropdown) and
+        // custom-painted, because vatSys's renderer ignores BackColor on top-level items - a lot of
+        // machinery for something easy to miss while looking at the radar. A popup naming the sector
+        // and who asked is both simpler and harder to overlook.
+        _ownershipTracker.IncomingRequestsChanged += (_, requests) =>
         {
-            var item = (ToolStripMenuItem)sender!;
-            var rect = new Rectangle(Point.Empty, item.Size);
-            // WindowWarning rather than a hardcoded Color.Orange: this is exactly the "something
-            // needs your attention" role vatSys already has an identity for, so the indicator
-            // follows whatever the loaded profile defines instead of being the one element on the
-            // menu bar that ignores the theme.
-            var background = Colours.GetColour(Colours.Identities.WindowWarning);
-            using var brush = new SolidBrush(background);
-            e.Graphics.FillRectangle(brush, rect);
-            TextRenderer.DrawText(e.Graphics, item.Text, item.Font, rect, ContrastingTextColour(background),
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-        };
-
-        _ownershipTracker.PendingRequestCountChanged += (_, count) =>
-        {
-            void Apply()
+            void Show()
             {
-                requestNotificationItem.Text = $"[{count} SECTOR REQUEST]";
-                requestNotificationItem.Visible = count > 0;
-                requestNotificationItem.Invalidate();
+                if (requests.Count == 0)
+                    return;
+
+                var lines = requests.Select(r =>
+                    $"    {r.Sector?.Name ?? "Unknown"} - requested by {r.RequestingCallsign}");
+
+                var message = (requests.Count == 1
+                                  ? "A controller has requested a sector from you:"
+                                  : $"{requests.Count} controllers have requested sectors from you:")
+                              + Environment.NewLine + Environment.NewLine
+                              + string.Join(Environment.NewLine, lines)
+                              + Environment.NewLine + Environment.NewLine
+                              + "Open OzServer Sectors to accept or reject them.";
+
+                var notice = new SectorNoticeWindow(message, "Sector requested");
+                if (Application.OpenForms["MainForm"] is Form owner)
+                    notice.Show(owner);
+                else
+                    notice.Show();
+
+                notice.BringToFront();
             }
 
+            // The poll this comes from runs on a background timer thread.
             if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-                mainForm.BeginInvoke((MethodInvoker)Apply);
+                mainForm.BeginInvoke((MethodInvoker)Show);
             else
-                Apply();
+                Show();
         };
-
-        // Form.MainMenuStrip is a public, standard WinForms property (vatSys assigns it in
-        // MainForm's own designer code - this isn't a private-field reflection hack), so this reads
-        // as: find the real "Messages" header among the top menu bar's own top-level items, and
-        // insert requestNotificationItem immediately after it. Deferred the same way as the
-        // repositioning below - the menu strip may not exist the instant the plugin constructs.
-        // Relies on "Messages" still being that header's literal text; if a future vatSys build
-        // changes it, this just never finds an anchor and the button silently never appears, rather
-        // than throwing.
-        EventHandler? insertNotificationItem = null;
-        insertNotificationItem = (_, _) =>
-        {
-            if (Application.OpenForms["MainForm"] is not Form mainForm || mainForm.MainMenuStrip == null)
-                return;
-
-            var messagesItem = mainForm.MainMenuStrip.Items.OfType<ToolStripItem>().FirstOrDefault(i => i.Text == "Messages");
-            if (messagesItem == null)
-                return;
-
-            Application.Idle -= insertNotificationItem;
-            mainForm.MainMenuStrip.Items.Insert(mainForm.MainMenuStrip.Items.IndexOf(messagesItem) + 1, requestNotificationItem);
-        };
-        Application.Idle += insertNotificationItem;
 
         var settingsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
