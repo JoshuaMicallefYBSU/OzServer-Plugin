@@ -53,6 +53,12 @@ public class OzServerSectorOwnershipRequestDto
     [JsonProperty("target_callsign")] public string TargetCallsign { get; set; } = "";
     // Only populated by GET /sector-requests, not by POST .../request's own response.
     [JsonProperty("sector")] public OzServerSectorDto? Sector { get; set; }
+    // Set once the owner has denied this request. A rejected request is kept server-side purely so
+    // the controller who asked can be told (SectorOwnershipController::reject) - nothing else would
+    // ever tell them, since the row otherwise just disappears from their list exactly as it does on
+    // an accept, a cancel or a stale prune. Null on every request still awaiting a decision, and
+    // only ever seen in `by_me`: `from_me` is filtered to pending server-side.
+    [JsonProperty("rejected_at")] public DateTimeOffset? RejectedAt { get; set; }
 }
 
 public class OzServerMyRequestsDto
@@ -180,6 +186,10 @@ public class OzServerApiClient
 {
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
 
+    // Enough that the background traffic (FDR batch, two polls, ATIS) can never occupy every slot
+    // and leave a controller-initiated request waiting for one - see CreateClient.
+    const int TargetConnectionLimit = 8;
+
     static readonly HttpClient Http = CreateClient();
 
     // Null properties are left out of a POST body entirely by default (recursively, so this
@@ -200,6 +210,28 @@ public class OzServerApiClient
         catch
         {
             // Best-effort - older Windows builds may not define Tls12 in this enum at all.
+        }
+
+        // .NET Framework caps outbound connections per host at 2 by default (the old RFC 2616
+        // recommendation), and every call in this plugin shares the one HttpClient below - so it
+        // shares one ServicePoint and that one cap. FdrSync flushes a batch every 5s, the ownership
+        // tracker polls every 10s, the Sectors window polls requests on its own 10s timer, and ATIS
+        // pushes on change: between them the two slots are routinely busy, and anything the
+        // controller actually *waits* on queues behind them. That is what made pressing Controlled
+        // take seconds - the GET wasn't slow, it hadn't started yet, stuck behind an FDR batch
+        // upload on a connection that wouldn't free up.
+        //
+        // Raised, never lowered: this property is process-wide, so it belongs to vatSys as much as
+        // to this plugin, and clamping down something the host (or another plugin) had deliberately
+        // raised would be the same bug in reverse.
+        try
+        {
+            if (ServicePointManager.DefaultConnectionLimit < TargetConnectionLimit)
+                ServicePointManager.DefaultConnectionLimit = TargetConnectionLimit;
+        }
+        catch
+        {
+            // Not worth failing construction over - the cap only costs latency, never correctness.
         }
 
         // HttpClient's own default is 100 seconds - long enough that a backend which accepts a
@@ -253,6 +285,13 @@ public class OzServerApiClient
 
     public Task CancelRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/cancel");
 
+    // Confirms this controller has been shown a rejection of their own request, which is what
+    // finally deletes it server-side - see SectorOwnershipController::acknowledgeRejection. Until
+    // this is called the rejection keeps coming back in every `by_me`, so it survives the plugin
+    // being closed before the controller ever saw it.
+    public Task AcknowledgeRejectionAsync(int requestId) =>
+        PostAsync($"/sector-requests/{requestId}/acknowledge-rejection");
+
     public Task<OzServerMyRequestsDto> GetMyRequestsAsync() =>
         GetAsync<OzServerMyRequestsDto>("/sector-requests", () => new OzServerMyRequestsDto());
 
@@ -263,6 +302,12 @@ public class OzServerApiClient
     // was never claimed through here, correctly never shows up).
     public Task<List<OzServerControlledSectorDto>> GetControlledSectorsAsync() =>
         GetAsync<List<OzServerControlledSectorDto>>("/sectors/controlled", () => new List<OzServerControlledSectorDto>());
+
+    // Gives up everything this controller owns in one call - see
+    // SectorOwnershipController::releaseAll. Only ever sent on a *graceful* disconnect: staying
+    // silent is what tells the backend a disconnect was ungraceful, and buys the 5-minute window to
+    // reconnect into the same sectors.
+    public Task ReleaseAllSectorsAsync() => PostAsync("/sectors/release-all");
 
     // The authoritative "what do I actually own" check (SectorOwnershipController::mine) - used to
     // refresh Owned from OzServer's own record every time the Sectors window opens, rather than

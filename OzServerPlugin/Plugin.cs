@@ -38,6 +38,9 @@ public class Plugin : IPlugin
     // Held for the same reason as the two above: it lives entirely off Network's own events, and a
     // position has to be handed back whether or not the Sectors window was ever opened.
     readonly PrimaryPositionWatcher _primaryPositionWatcher;
+    // Also purely event-driven, and has to be alive from plugin load: the disconnect it reacts to
+    // can happen long before the Sectors window is ever opened.
+    readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
 
     public Plugin()
     {
@@ -48,6 +51,7 @@ public class Plugin : IPlugin
         _badVectorsAtisSync = new BadVectorsAtisSync();
         // After the tracker, which it releases through.
         _primaryPositionWatcher = new PrimaryPositionWatcher(_ownershipTracker);
+        _gracefulDisconnectReleaser = new GracefulDisconnectReleaser();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
