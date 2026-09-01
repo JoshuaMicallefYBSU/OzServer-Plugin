@@ -9,7 +9,7 @@ namespace OzServerPlugin;
 // %AppData% (not next to the DLL) since the vatSys Plugins folder isn't guaranteed writable.
 public static class OzServerSettings
 {
-    public const string DefaultBaseUrl = "https://ozserver.org";
+    public const string DefaultBaseUrl = "https://api.ozserver.org";
 
     static readonly string SettingsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
