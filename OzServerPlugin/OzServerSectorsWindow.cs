@@ -144,7 +144,7 @@ public class OzServerSectorsWindow : BaseForm
     readonly ToggleGenericButton _availableModeButton;
     readonly ToggleGenericButton _controlledModeButton;
     // Accept/Reject/Cancel are no longer buttons. Every one of them was only ever a second way to
-    // invoke what the middle-click menu already offers on the row itself, and each needed its own
+    // invoke what the right-click menu already offers on the row itself, and each needed its own
     // enable/disable rules kept in step with that menu's. Removing them gives the list the height
     // back and leaves exactly one place those actions live.
     readonly FlowLayoutPanel _sectorListModePanel;
@@ -755,7 +755,7 @@ public class OzServerSectorsWindow : BaseForm
     }
 
     // A left click only selects a row. Expand/collapse is no longer a mouse button of its own -
-    // it, and every action the window can perform on a row, is a command on the middle-click menu
+    // it, and every action the window can perform on a row, is a command on the right-click menu
     // (see ShowNodeContextMenu). Keeping expansion off left click is what stops a claimable primary
     // sector reflowing the list out from under the pointer at the moment it is being selected.
     void TreeView_BeforeMouseExpandCollapse(object? sender, TreeViewCancelEventArgs e)
@@ -779,7 +779,7 @@ public class OzServerSectorsWindow : BaseForm
         // The category headers - the position types (Approach/Centre/Tower/...) in Owned and
         // Available, and Requested By/From Me - are pure grouping rows with nothing to claim,
         // release or accept, so a left click on one has no other job to do and opening the group is
-        // the only thing it could sensibly mean. Everything else keeps expansion on the middle-click
+        // the only thing it could sensibly mean. Everything else keeps expansion on the right-click
         // menu: those rows are selectable targets first, and reflowing the list underneath the
         // pointer as one is selected is the behaviour this window was moved away from.
         // A heading with no Name is one of the Requested ones - not collapsible, so a left click on
@@ -795,14 +795,13 @@ public class OzServerSectorsWindow : BaseForm
     bool IsFlashingHeading(TreeNode node) =>
         _fromMeHasPending && _flashOn && IsCategoryNode(node) && node.Text == RequestedFromMeName;
 
-    // Middle click deliberately comes off MouseUp rather than NodeMouseClick. NodeMouseClick is
-    // raised from the native tree control's NM_CLICK/NM_RCLICK notifications, and WinForms derives
-    // its Button purely from which of those two arrived - so it only ever reports Left or Right and
-    // a middle click would never reach the menu at all. MouseUp is a plain Control-level message and
-    // sees all three buttons; the node is recovered by hit-testing the click point.
+    // Right click opens the menu. Driven from MouseUp rather than NodeMouseClick because that event
+    // only fires when the click lands on a node's own label - a right click just below the last row,
+    // or in the indent to its left, produces nothing at all. MouseUp always arrives, and the node is
+    // recovered by hit-testing the click point, so a click anywhere on the row works.
     void TreeView_MouseUp(object? sender, MouseEventArgs e)
     {
-        if (e.Button != MouseButtons.Middle)
+        if (e.Button != MouseButtons.Right)
             return;
 
         var treeView = (TreeViewEx)sender!;
@@ -818,7 +817,7 @@ public class OzServerSectorsWindow : BaseForm
         ShowNodeContextMenu(treeView, node, e.Location);
     }
 
-    // The middle-click menu: every command that applies to a row, in one place, on whichever of the
+    // The right-click menu: every command that applies to a row, in one place, on whichever of the
     // three trees was clicked. Commands that don't apply to this row are shown greyed rather than
     // dropped, so the menu keeps one shape and one item order to aim at regardless of what was
     // clicked - a menu that grows and shrinks per row is far harder to use without looking.
@@ -849,7 +848,7 @@ public class OzServerSectorsWindow : BaseForm
         //
         // Gated on the clicked tree being Requested Changes, because both commands resolve what
         // they act on from _requestedChangesView's *selection*, not from the node clicked here (see
-        // GetRequestsToAccept). Middle-clicking a row in Owned or Available leaves that selection
+        // GetRequestsToAccept). Right-clicking a row in Owned or Available leaves that selection
         // untouched, so without this an unrelated request left selected in the other panel would
         // show as Accept-able from a sector row - and accepting it would hand away a sector the
         // controller was not even looking at.
@@ -989,45 +988,37 @@ public class OzServerSectorsWindow : BaseForm
 
     // Every node - group header or leaf - reads dark blue at rest and light blue when selected,
     // with no other status-based colouring anywhere in the tree.
+    // Deliberately the same shape as vatsys.SectorsWindow.SectorsView_DrawNode: save the clip, clip
+    // to the row, clear it to the tree's own BackColor, draw the text, restore the clip. The colour
+    // is HighlightedText when selected and the tree's own ForeColor otherwise - vatSys reads
+    // ForeColor rather than naming an identity, so a tree keeps whatever colour it was given.
+    //
+    // The two additions are this window's own: a staged row (moved but not yet applied) and the
+    // Requested From Me heading while it is flashing both take WindowWarning, the profile's
+    // "needs attention" identity. Selection still wins over both.
     void SectorsView_DrawNode(object? sender, DrawTreeNodeEventArgs e)
     {
         var treeView = (TreeViewEx)sender!;
         var selected = (e.State & TreeNodeStates.Selected) != 0;
 
-        // A staged row - moved across but not yet committed by Apply - is drawn in the profile's
-        // own WindowWarning identity rather than a hardcoded yellow. That is exactly the role
-        // ("warning indications in windows"), it is BrightYellow in the Australia profile, and it
-        // follows the loaded profile the way every other colour in this window does. Selection still
-        // wins over it, so a staged row the controller is pointing at still reads as selected.
         var color = selected
             ? Colours.GetColour(Colours.Identities.HighlightedText)
             : IsStagedNode(e.Node) || IsFlashingHeading(e.Node)
                 ? Colours.GetColour(Colours.Identities.WindowWarning)
-                : Colours.GetColour(Colours.Identities.InteractiveText);
+                : treeView.ForeColor;
 
-        // DrawMode is OwnerDrawText, so the system has already filled the row with the control's
-        // BackColor before this runs - an ordinary row has nothing to erase and only needs its text.
-        //
-        // Only a selected row does: the system paints its highlight block there, and this window
-        // shows selection as coloured text on the normal background instead. Clearing every row
-        // regardless meant allocating and disposing two GDI+ Regions per row per repaint (Clip's
-        // getter allocates a fresh Region, it is not a borrowed reference) for no visible
-        // difference on the vast majority of them.
-        if (selected)
-        {
-            using var previousClip = e.Graphics.Clip;
+        // Graphics.Clip's getter allocates a fresh Region rather than handing back a borrowed one,
+        // so the saved original needs disposing just as much as the replacement does. The setter
+        // copies what it is given, which is what makes disposing the replacement immediately safe.
+        using var previousClip = e.Graphics.Clip;
 
-            using (var clip = new Region(e.Bounds))
-                e.Graphics.Clip = clip;
+        using (var clip = new Region(e.Bounds))
+            e.Graphics.Clip = clip;
 
-            e.Graphics.Clear(treeView.BackColor);
-            TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, color);
-
-            e.Graphics.Clip = previousClip;
-            return;
-        }
-
+        e.Graphics.Clear(treeView.BackColor);
         TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, color);
+
+        e.Graphics.Clip = previousClip;
     }
 
     // Group headers (Approach/Centre/.../Requested By Me/...) get the >/v expand-collapse prefix
@@ -1294,7 +1285,7 @@ public class OzServerSectorsWindow : BaseForm
 
         // Deliberately reads only the Owned and Available trees. A row in Requested is a request in
         // flight, not a sector sitting somewhere it can be moved out of - Accept, Reject, Add and
-        // Remove there are all decisions about that request, which is what the middle-click menu is
+        // Remove there are all decisions about that request, which is what the right-click menu is
         // for. Letting the arrow act on it broke the flow: the button means "move between these two
         // lists", and Requested is neither of them.
         _arrowButton.Text = ownedSelected ? ArrowRight : availSelected ? ArrowLeft : ArrowIdle;
@@ -2493,7 +2484,7 @@ public class OzServerSectorsWindow : BaseForm
     }
 
     // Kept as the single "request state changed" notification point even though there are no
-    // buttons left to update: the middle-click menu decides what it offers when it is opened, so
+    // buttons left to update: the right-click menu decides what it offers when it is opened, so
     // there is nothing to pre-enable, but plenty of callers still want to say "this changed".
     void UpdateRequestActionButtons()
     {

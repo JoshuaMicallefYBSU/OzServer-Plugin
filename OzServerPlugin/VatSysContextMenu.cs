@@ -32,7 +32,7 @@ static class VatSysContextMenu
         menu.Renderer = ComboField.DefaultMenuRenderer ?? (_fallbackRenderer ??= new VatSysMenuRenderer());
 
     // Title row at the top of the menu naming what the menu is acting on (the sector or request the
-    // controller middle-clicked). Deliberately disabled: it is a label, not a command.
+    // controller right-clicked). Deliberately disabled: it is a label, not a command.
     public static ToolStripMenuItem CreateHeader(string text) => new(text) { Enabled = false };
 }
 
