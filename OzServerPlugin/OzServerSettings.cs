@@ -10,6 +10,7 @@ namespace OzServerPlugin;
 public static class OzServerSettings
 {
     public const string DefaultBaseUrl = "https://api.ozserver.org";
+    const string LegacyDefaultBaseUrl = "https://ozserver.org";
 
     static readonly string SettingsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -82,6 +83,19 @@ public static class OzServerSettings
                 if (!string.IsNullOrWhiteSpace(data?.BaseUrl))
                 {
                     var stored = data!.BaseUrl!.TrimEnd('/');
+
+                    // Older releases persisted the then-default website host on first save. Once
+                    // the API moved to its own host that indistinguishable copy of the old default
+                    // otherwise became a permanent override, so an upgraded DLL kept sending its
+                    // (new API) token to the old Laravel API and received a 401. Only migrate the
+                    // exact former production default; real custom/dev endpoints stay untouched.
+                    if (string.Equals(stored, LegacyDefaultBaseUrl, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _baseUrl = DefaultBaseUrl;
+                        Save();
+                        return;
+                    }
+
                     if (IsValidBaseUrl(stored, out var error))
                     {
                         _baseUrl = stored;
