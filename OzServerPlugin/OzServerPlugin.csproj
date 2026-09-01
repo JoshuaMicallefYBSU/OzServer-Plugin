@@ -42,6 +42,9 @@
     </Target>
 
     <ItemGroup>
+        <!-- Exclude any ignored Secrets.cs left over from token-authenticated older builds so an
+             obsolete shared credential cannot be embedded in a new assembly. -->
+        <Compile Remove="Secrets.cs" />
         <!--
           Reference the installed vatSys.exe so the plugin compiles against the
           real vatsys/vatsys.Plugin types (BaseForm, Colours, MMI, IPlugin, etc).

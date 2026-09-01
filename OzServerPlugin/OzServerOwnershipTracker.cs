@@ -582,10 +582,9 @@ public class OzServerOwnershipTracker
     // picture). vatSys's own Sectors window still lets an observer connection populate
     // MMI.SectorsControlled - that's for local situational awareness (watching a sector's tags/
     // strips), not a claim of authority over it - and OzServer's claim endpoint trusts whatever
-    // controller_cid/controller_callsign the plugin sends it with no facility check of its own (see
-    // VerifyPluginToken.php: "the plugin is the trusted party now"). So this is the only place
-    // standing between an observer connection and a real ownership record - see issue #3, "CM_OBS
-    // Can Own Sectors".
+    // controller_cid/controller_callsign the plugin sends it. The API verifies that pair is online,
+    // but the local IsRealATC flag is what distinguishes a controlling connection from an observer -
+    // see issue #3, "CM_OBS Can Own Sectors".
     static bool IsRealAtc => Network.Me?.IsRealATC == true;
 
     public async Task ClaimAsync(SectorsVolumes.Sector sector)

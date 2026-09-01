@@ -257,15 +257,9 @@ public class OzServerAtisUpdateDto
     [JsonProperty("frequency")] public int? Frequency { get; set; }
 }
 
-// Talks to the OzServer backend's sector-ownership API (app/Http/Controllers/SectorOwnershipController.php),
-// authenticated as this plugin via a shared bearer token (Secrets.PluginToken, checked server-side
-// by app/Http/Middleware/VerifyPluginToken.php) rather than by cross-checking the caller against
-// the live VATSIM data feed. The feed lags real connects by up to ~15s, which used to surface as a
-// spurious "not connected to VATSIM under that callsign" right after logging on - the plugin is
-// the trusted party now, so every call just attaches this vatSys session's own CID/callsign (read
-// straight from vatSys's own live connection state, not the feed) and the server takes them at
-// face value once the token checks out. The token itself is never exposed through any vatSys UI or
-// settings file - see Secrets.cs (gitignored; Secrets.cs.example is the checked-in template).
+// Talks to the OzServer backend's sector-ownership API. Every call attaches this vatSys session's
+// CID and callsign; the API accepts it only while that exact pair is in the live VATSIM controller
+// feed. No shared credential is compiled into or sent by the plugin.
 public class OzServerApiClient
 {
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
@@ -332,12 +326,6 @@ public class OzServerApiClient
         // hitting the live API directly: identical request, text/html without this header,
         // application/json with it.
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        // See the class comment - this is what authenticates every call as this plugin, in place
-        // of the old live-datafeed cross-check. Left unset (rather than sent as an empty Bearer
-        // header) when Secrets.cs hasn't been filled in, so a from-source build fails with the
-        // server's own "Invalid or missing plugin token" instead of a confusing malformed header.
-        if (!string.IsNullOrEmpty(Secrets.PluginToken))
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", Secrets.PluginToken);
         return client;
     }
 

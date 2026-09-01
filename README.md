@@ -155,14 +155,13 @@ logging on (`PrimaryPositionWatcher`), and a deliberate disconnect (`GracefulDis
 
 ## Configuration
 
-**Settings → OzServer Settings** sets the backend base URL. It defaults to `https://ozserver.org` and
+**Settings → OzServer Settings** sets the backend base URL. It defaults to `https://api.ozserver.org` and
 is stored in `%AppData%\OzServerPlugin\settings.json` — not beside the DLL, since the vatSys
 `Plugins` folder isn't guaranteed writable.
 
 Only `https://` is accepted, with `http://` allowed for loopback addresses so a local dev server
-still works. Every request carries the plugin token, so this is a security boundary rather than a
-convenience — see [Security](#security). A URL hand-edited into `settings.json` is held to the same
-rule and ignored (with an entry in the vatSys error log) if it fails.
+still works. A URL hand-edited into `settings.json` is held to the same rule and ignored (with an
+entry in the vatSys error log) if it fails.
 
 **Note for backend maintainers:** since a flight is now only ever pushed to while a controller
 actually holds it (see Tag ownership / Flight data above), a row nothing has pushed to in 10 minutes
@@ -191,17 +190,7 @@ types and the plugin silently fails to load.
 
 **Steps**
 
-1. Create `OzServerPlugin/Secrets.cs` from the template and fill in the token:
-
-   ```bash
-   cp OzServerPlugin/Secrets.cs.example OzServerPlugin/Secrets.cs
-   ```
-
-   It must match `PLUGIN_TOKEN` in the OzServer backend's `.env`. The file is gitignored. Leaving it
-   empty still compiles — no `Authorization` header is sent, and the backend answers with its own
-   *"Invalid or missing plugin token"* rather than something more confusing.
-
-2. Build:
+1. Build:
 
    ```bash
    dotnet build OzServerPlugin/OzServerPlugin.csproj -c Release
@@ -221,20 +210,11 @@ load into the vatSys process at all.
 
 ## Security
 
-The plugin authenticates with a **single shared bearer token compiled into the assembly**. Two things
-follow from that, and both matter:
-
-- **`PluginToken` is `const`, so the compiler inlines its value into the IL at every use site.**
-  Gitignoring `Secrets.cs` protects the source file, not the build output. Never commit `bin/` or
-  `obj/` — `.gitignore` covers both, and a compiled DLL gives the token up to `strings` in seconds.
-- **The token proves "this is a plugin build", not "this is a legitimate controller."** Every
-  controller running the plugin holds the same value, and the backend takes the CID and callsign each
-  request supplies at face value once it checks out. Per-controller authentication (VATSIM Connect)
-  would be the durable fix.
-
-If the token is ever exposed, rotating `PLUGIN_TOKEN` in the backend `.env` is the only thing that
-actually revokes it. Rewriting git history does not — anything already cloned, forked, or cached
-keeps working.
+The API accepts plugin actions only when the CID and callsign reported by the current vatSys session
+match a controller currently present in the VATSIM datafeed. If that feed is unavailable, protected
+requests fail closed until verification is available again. This intentionally follows the project's
+operational trust model; it verifies an online network identity, not that the HTTP process itself is
+vatSys, because the public datafeed exposes the same CID and callsign to other clients.
 
 **The updater executes what it downloads**, on the next vatSys start, so it is worth being explicit
 about what does and does not guard that:

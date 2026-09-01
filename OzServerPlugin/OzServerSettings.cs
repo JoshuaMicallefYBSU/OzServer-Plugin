@@ -34,16 +34,14 @@ public static class OzServerSettings
         }
     }
 
-    // Every request carries the plugin's shared bearer token (see OzServerApiClient's class
-    // comment), so where the base URL points is a security decision, not just a convenience -
-    // whatever host is named here is handed that token. Two things are checked:
+    // Keep remote traffic encrypted and reject URI schemes HttpClient was never intended to use.
+    // Two things are checked:
     //   - The scheme must be http or https. Uri.TryCreate(..., UriKind.Absolute) on its own is far
     //     too permissive for this: "mailto:x", "file:///c:/", and "foo:bar" are all absolute URIs
     //     and all passed the old check, leaving every call to fail in a way that pointed nowhere
     //     near the actual cause.
     //   - Plain http is allowed only for a loopback host, so a dev server on localhost still
-    //     works while a typo'd or hand-edited "http://someone-elses-host" can't put the token on
-    //     the wire in cleartext.
+    //     works while remote traffic cannot be sent in cleartext.
     public static bool IsValidBaseUrl(string? url, out string error)
     {
         error = "";
