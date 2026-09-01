@@ -119,6 +119,11 @@ public class OzServerCommitResultDto
 public class OzServerResumeResponseDto
 {
     [JsonProperty("resumed")] public List<string> Resumed { get; set; } = new();
+    // Tags the backend actually handed back - flights this controller was working before they
+    // dropped, minus any another controller picked up while they were away (the backend refuses to
+    // take those). These come straight back to the controller rather than flashing for acceptance;
+    // see TagOwnershipSync.OnTagsResumed.
+    [JsonProperty("flights")] public List<string> Flights { get; set; } = new();
     [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
 }
 

@@ -82,6 +82,11 @@ public class OzServerOwnershipTracker
     // controllers claim and release - and that never reaches OwnedChanged, since an
     // observer's own Owned is permanently empty.
     public event EventHandler? Refreshed;
+    // Callsigns the backend restored to this controller on a reconnect inside the resume window.
+    // Consumed by TagOwnershipSync, which brings them back without the usual acceptance flash -
+    // they were already this controller's a moment ago, and the backend has confirmed nobody else
+    // took them in the meantime.
+    public event EventHandler<IReadOnlyList<string>>? TagsResumed;
     // Fires whenever the set of incoming ("Requested From Me") requests changes - polled here
     // rather than left to OzServerSectorsWindow alone so the notification works even if that window
     // has never been opened this session.
@@ -451,6 +456,22 @@ public class OzServerOwnershipTracker
         if (!Network.IsConnected)
             return;
 
+        // POST /sectors/resume hands ownership back server-side, and the backend has no notion of an
+        // observer to refuse it with - every guard against a non-ATC session taking sectors is on
+        // this side. This path had none, so an observer reconnecting on a callsign that still had a
+        // resume snapshot was simply given its sectors.
+        //
+        // Network.Me is briefly null after Connected, so the check has to wait for an answer rather
+        // than read the gap as either verdict: treating null as "real ATC" resumes for an observer,
+        // and treating it as "observer" silently drops a genuine controller's reconnect. If it never
+        // resolves, not resuming is the safe way to be wrong - the controller can reclaim by hand,
+        // whereas an observer holding sectors is exactly what this prevents.
+        for (var attempt = 0; attempt < 20 && Network.IsConnected && Network.Me == null; attempt++)
+            await Task.Delay(500).ConfigureAwait(false);
+
+        if (!Network.IsConnected || !IsRealAtc)
+            return;
+
         try
         {
             var response = await _api.ResumeAsync();
@@ -459,6 +480,9 @@ public class OzServerOwnershipTracker
                 ApplySync(response.Sync);
             else
                 await RefreshFromServerAsync();
+
+            if (response.Flights.Count > 0)
+                TagsResumed?.Invoke(this, response.Flights);
 
             if (response.Resumed.Count > 0)
             {

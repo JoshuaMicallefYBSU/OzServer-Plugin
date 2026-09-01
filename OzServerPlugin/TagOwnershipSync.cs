@@ -62,6 +62,12 @@ public class TagOwnershipSync
     // sweep/FDR tick. Cleared only by a real event (see OnFdrsChanged/OnOwnershipChanged), never by
     // the ordinary re-evaluation that would otherwise undo the drop within seconds.
     readonly HashSet<string> _pickupSuppressed = new(StringComparer.OrdinalIgnoreCase);
+    // Tags the backend handed back on a reconnect inside the resume window. These come back to the
+    // controller directly instead of flashing for acceptance: they were this controller's moments
+    // ago, and the backend has already confirmed nobody else picked them up while they were gone.
+    // Entries are consumed as each tag becomes eligible, and dropped wholesale on disconnect so a
+    // later session can never inherit them.
+    readonly HashSet<string> _resumeAutoAccept = new(StringComparer.OrdinalIgnoreCase);
 
     public TagOwnershipSync(OzServerOwnershipTracker tracker, FdrSync fdrSync, FdrActivationSync fdrActivationSync)
     {
@@ -69,6 +75,7 @@ public class TagOwnershipSync
         _fdrSync = fdrSync;
         _fdrActivationSync = fdrActivationSync;
         _tracker.OwnershipChanged += (_, diff) => RunOnUiThread(() => OnOwnershipChanged(diff));
+        _tracker.TagsResumed += (_, callsigns) => RunOnUiThread(() => OnTagsResumed(callsigns));
         // Public and static on FDP2 itself - fires for every jurisdiction/handoff state change vatSys
         // makes to any FDR, including MMI.HandoffToNone (see OnFdrsChanged for why that one matters).
         FDP2.FDRsChanged += OnFdrsChanged;
@@ -86,6 +93,10 @@ public class TagOwnershipSync
             {
                 _pickupSuppressed.Clear();
                 _trackedByMe.Clear();
+                // A queued reclaim belongs to the session that asked for it. Left behind, a tag
+                // never re-evaluated before the disconnect would be taken without acceptance in
+                // whatever session came next.
+                _resumeAutoAccept.Clear();
             }
         };
 
@@ -299,7 +310,65 @@ public class TagOwnershipSync
                 return;
         }
 
-        OfferPickup(fdr, mmiSector);
+        // A tag restored by the backend on a reconnect comes straight back rather than flashing.
+        // Everything above still applies - it is still activated if it needed activating, still
+        // checked against suppression, and still skipped entirely if anyone is tracking it - so this
+        // only changes whether the controller has to accept something that was already theirs.
+        bool restoredOnReconnect;
+        lock (_pickupStateLock)
+            restoredOnReconnect = _resumeAutoAccept.Remove(fdr.Callsign);
+
+        if (restoredOnReconnect)
+            ReclaimAfterReconnect(fdr, mmiSector);
+        else
+            OfferPickup(fdr, mmiSector);
+    }
+
+    void OnTagsResumed(IReadOnlyList<string> callsigns)
+    {
+        lock (_pickupStateLock)
+        {
+            foreach (var callsign in callsigns)
+            {
+                // Suppression is cleared on disconnect (see the Network.Disconnected handler), so
+                // this normally has nothing to skip. It matters only for a tag dropped to none in
+                // the narrow window between reconnecting and the resume landing - that drop is a
+                // decision this session made, and reclaiming over it would undo it.
+                if (_pickupSuppressed.Contains(callsign))
+                    continue;
+
+                _resumeAutoAccept.Add(callsign);
+            }
+        }
+
+        // Re-evaluated immediately rather than left to the next sweep, so the tags are back by the
+        // time the controller has finished reconnecting. Each is still put through the full
+        // eligibility path - this only queues them.
+        foreach (var fdr in FDP2.GetFDRs)
+            EvaluatePickup(fdr);
+    }
+
+    // Same as OfferPickup but accepted straight away, mirroring vatSys's own FDP2.FDRDeparted -
+    // which calls HandoffFirst and then immediately accepts. The handoff is what actually assigns
+    // jurisdiction, so it still has to happen; all that is skipped is the waiting.
+    static void ReclaimAfterReconnect(FDP2.FDR fdr, SectorsVolumes.Sector mmiSector)
+    {
+        FDP2.HandoffFirst(fdr);
+        fdr.HandoffSector = mmiSector;
+
+        MMI.AcceptJurisdiction(fdr);
+
+        // Reasserted after the accept for the same reason OfferPickup overwrites HandoffSector:
+        // vatSys resolves jurisdiction against its own default geometry, which knows nothing about
+        // OzServer subsectors and can land on a different sector of this controller's than the one
+        // the tag actually resolved under.
+        fdr.ControllingSector = mmiSector;
+
+        var track = MMI.FindTrack(fdr);
+        if (track != null)
+            MMI.SetTrackState(track);
+
+        ActionLog.Log("Tag", $"Reclaimed {fdr.Callsign} into {mmiSector.Name} after reconnect");
     }
 
     // Flashes fdr in as an incoming handover rather than silently assuming jurisdiction - the
