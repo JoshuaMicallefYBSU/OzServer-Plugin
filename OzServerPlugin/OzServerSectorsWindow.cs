@@ -292,7 +292,7 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView.BeforeSelect += TreeView_BeforeSelect;
         _requestedChangesView.NodeMouseClick += TreeView_NodeMouseClick;
         _requestedChangesView.MouseWheel += RequestedChangesView_MouseWheel;
-        _requestedChangesView.AfterSelect += (_, _) => UpdateRequestActionButtons();
+        _requestedChangesView.AfterSelect += RequestedChangesView_AfterSelect;
         _requestedChangesView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
         _requestedChangesView.BeforeExpand += TreeView_BeforeMouseExpandCollapse;
         _requestedChangesView.AfterCollapse += RequestedChangesView_AfterExpandCollapse;
@@ -1402,6 +1402,16 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView.SetScrollPosVert((_requestedScrollBar.Value + _requestedChangesView.ItemHeight - 1) / _requestedChangesView.ItemHeight);
     }
 
+    // An observer may look at every list in this window but act on none of it: the backend
+    // refuses a claim from a session that is not real ATC, so any control offered here would
+    // only ever produce a refusal. Hidden rather than disabled, for the same reason the arrow
+    // is hidden on an incoming request - a greyed control reads as "not right now", and for an
+    // observer the answer is never.
+    //
+    // Tested as "Me exists and is not real ATC": Network.Me is briefly null after Connected,
+    // and treating that as an observer would blank a real controller's buttons on every login.
+    static bool IsObserver => Network.Me is { IsRealATC: false };
+
     void UpdateArrowButton()
     {
         var ownedSelected = _currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
@@ -1414,6 +1424,17 @@ public class OzServerSectorsWindow : BaseForm
         // lists", and Requested is neither of them.
         _arrowButton.Text = ownedSelected ? ArrowRight : availSelected ? ArrowLeft : ArrowIdle;
         _arrowButton.Enabled = !_applyRunning && (ownedSelected || availSelected);
+
+        // An incoming request is an Accept-or-Reject decision, not a list move. The arrow acts on
+        // whatever is selected over in Owned/Available, and that selection stays highlighted while a
+        // request is being read - so leaving the arrow available invited pressing it and staging a
+        // release of an entirely unrelated sector.
+        //
+        // Hidden rather than disabled: a greyed-out button still reads as "this is the control for
+        // what I am looking at, just not right now", which is the opposite of true here. Accept and
+        // Reject are the only actions an incoming request has.
+        _arrowButton.Visible = !IsObserver
+                               && CategoryNameOf(_requestedChangesView.SelectedNode) != RequestedFromMeName;
     }
 
     // Compares on exactly the footing ApplyButton_Click actually applies: non-dummy sectors, as a
@@ -1439,6 +1460,8 @@ public class OzServerSectorsWindow : BaseForm
         // Nothing to commit and nothing to discard while an Apply is still in flight.
         var pending = HasStagedEdits && !_applyRunning;
 
+        _applyButton.Visible = !IsObserver;
+        _cancelButton.Visible = !IsObserver;
         _applyButton.Enabled = pending;
         _cancelButton.Enabled = pending;
     }
@@ -1785,6 +1808,19 @@ public class OzServerSectorsWindow : BaseForm
         {
             foreach (var child in children)
             {
+                // A sub-sector this controller owns is not "controlled by someone else", even when
+                // the group above it belongs to someone else. Exactly the same trap as
+                // BuildOwnedSectorNode: this tree is built from the local dataset's groupings, which
+                // know nothing about a sub-sector having been handed over individually. The symptom
+                // was taking a sub-sector off another controller and watching it sit in Controlled -
+                // correctly gone from their side, but never showing up as ours.
+                //
+                // Only our own are filtered. A sub-sector held by a third controller still belongs
+                // in this tree: every node here is labelled with its actual holder, so the nesting
+                // reads correctly rather than misleading.
+                if (!ReferenceEquals(child, sector) && _tracker.IsMine(child))
+                    continue;
+
                 node.Nodes.Add(ReferenceEquals(child, sector)
                     ? new TreeNode(LeafText(ControlledSectorText(child, owners))) { Tag = child, NodeFont = node.NodeFont, ToolTipText = LeafText(ControlledSectorText(child, owners)) }
                     : BuildControlledSectorNode(child, owners, depth + 1));
@@ -2344,17 +2380,50 @@ public class OzServerSectorsWindow : BaseForm
         UpdateArrowButton();
     }
 
+    // Exactly one row in the window is selected at any time. Owned and Available already cleared
+    // each other; Requested is now part of the same exclusion. Without it a highlight left behind in
+    // Owned sat there while the controller worked in Requested, and the arrow - which reads the
+    // Owned/Available selection - appeared to be offering an action on the request being read while
+    // actually pointing at an unrelated sector.
+    //
+    // Every one of these is guarded on e.Node != null for the same reason: clearing a selection
+    // raises AfterSelect again with a null node, and acting on that would immediately undo the
+    // selection the controller just made.
     void AvailSectorsView_AfterSelect(object? sender, TreeViewEventArgs e)
     {
         if (e.Node != null)
+        {
             _currSectorsView.SelectedNode = null;
+            _requestedChangesView.SelectedNode = null;
+        }
+
         UpdateArrowButton();
+        UpdateRequestActionButtons();
     }
 
     void CurrSectorsView_AfterSelect(object? sender, TreeViewEventArgs e)
     {
         if (e.Node != null)
+        {
             _availSectorsView.SelectedNode = null;
+            _requestedChangesView.SelectedNode = null;
+        }
+
+        UpdateArrowButton();
+        UpdateRequestActionButtons();
+    }
+
+    void RequestedChangesView_AfterSelect(object? sender, TreeViewEventArgs e)
+    {
+        if (e.Node != null)
+        {
+            _currSectorsView.SelectedNode = null;
+            _availSectorsView.SelectedNode = null;
+        }
+
+        UpdateRequestActionButtons();
+        // The arrow hides while an incoming request is selected, so it has to re-evaluate on a
+        // selection change in this tree too, not only in Owned/Available.
         UpdateArrowButton();
     }
 
@@ -2805,6 +2874,8 @@ public class OzServerSectorsWindow : BaseForm
         var requestsActionable = !_requestActionRunning && Network.IsConnected;
         var category = CategoryNameOf(selected);
 
+        _acceptButton.Visible = !IsObserver;
+        _rejectButton.Visible = !IsObserver;
         _acceptButton.Enabled = requestsActionable && GetRequestsToAccept(selected).Count > 0;
         _rejectButton.Enabled = requestsActionable
                                  && FindOwningRequest(selected) != null

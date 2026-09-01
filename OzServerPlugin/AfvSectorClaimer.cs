@@ -85,6 +85,17 @@ public class AfvSectorClaimer
             return;
         }
 
+        // An observer is never granted a position of their own: their airspace is mirrored
+        // from whoever actually holds it (ObserverPositionMirror), so there is nothing to
+        // retry here. Tested as "Me exists and is not real ATC" rather than "is not real
+        // ATC", because Network.Me is still null for a moment after Connected - reading that
+        // as an observer would abandon a genuine controller's grant before it could run.
+        if (Network.Me is { IsRealATC: false })
+        {
+            StopInitRetries();
+            return;
+        }
+
         if (Init() || --_initAttemptsLeft <= 0)
         {
             StopInitRetries();

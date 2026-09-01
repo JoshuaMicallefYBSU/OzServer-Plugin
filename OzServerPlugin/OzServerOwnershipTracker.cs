@@ -51,8 +51,10 @@ public class SectorOwnershipDiff
 // Ownership also flows the other way now: whenever Owned actually changes (see
 // ReconcileMmiWithOwned), MMI.SectorsControlled and the matching VSCS line are updated to match -
 // a sector gained (most notably: someone accepted a request I sent them) is added to
-// MMI.SectorsControlled and its VSCS line switched to Transmit; a sector lost (I accepted an
-// incoming request, giving it away, or released it myself) is removed and dropped back to Idle.
+// MMI.SectorsControlled - but its VSCS line is deliberately left alone (issue #5), since putting a
+// controller on a frequency is not a side effect accepting a sector should have; a sector lost (I
+// accepted an incoming request, giving it away, or released it myself) is removed and its line
+// dropped back to Idle, which is releasing something rather than taking it on their behalf.
 // Polls independently of OzServerSectorsWindow (RefreshTimer below) specifically so an accepted
 // request still reaches this controller's VSCS panel even if they never open that window - the
 // other controller's Accept click only changes ownership on the server, with no direct signal to
@@ -75,6 +77,11 @@ public class OzServerOwnershipTracker
     static readonly TimeSpan PendingPollInterval = TimeSpan.FromSeconds(2);
 
     public event EventHandler? OwnedChanged;
+    // Raised after every successful refresh, whether or not anything changed.
+    // ObserverPositionMirror follows ControlledByOthers - which moves when *other*
+    // controllers claim and release - and that never reaches OwnedChanged, since an
+    // observer's own Owned is permanently empty.
+    public event EventHandler? Refreshed;
     // Fires whenever the set of incoming ("Requested From Me") requests changes - polled here
     // rather than left to OzServerSectorsWindow alone so the notification works even if that window
     // has never been opened this session.
@@ -352,6 +359,8 @@ public class OzServerOwnershipTracker
 
         // A request in either direction means a handoff is mid-flight: either this controller is
         // waiting to hear back, or someone is waiting on them. Poll faster until it resolves.
+        Refreshed?.Invoke(this, EventArgs.Empty);
+
         SetPollCadence(requests.ByMe.Count > 0 || requests.FromMe.Count > 0);
 
         // Compared on request ids, not on the count: one request being accepted while another
@@ -554,14 +563,16 @@ public class OzServerOwnershipTracker
 
         var mmiSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
+        // Gaining a sector adds it to MMI (so the airspace and its tags appear) but deliberately does
+        // NOT switch its VSCS line to Transmit - issue #5. Forcing Transmit on put the controller on
+        // a frequency they never asked to be on, as a side effect of accepting a request; whether to
+        // actually talk on a sector is theirs to decide, and the VSCS panel is where they decide it.
+        // Losing a sector still drops its line to Idle below, which is cleanup of something this
+        // plugin is giving up rather than something it is taking on the controller's behalf.
         foreach (var sector in gained)
         {
             if (!mmiSectors.Any(s => s.Equals(sector)))
                 mmiSectors.Add(sector);
-
-            var freq = Audio.VSCSFrequencies.FirstOrDefault(f => f.Name == sector.Callsign);
-            if (freq is { Transmit: false })
-                freq.Transmit = true;
         }
 
         foreach (var sector in lost)
@@ -842,6 +853,26 @@ public class OzServerOwnershipTracker
             await RefreshFromServerAsync();
 
         return response.Results;
+    }
+
+    // Mirrors AcceptRequestsBatchAsync. Declining a grouped request is one call, so the whole
+    // group is refused as the single decision it was made as - rejecting sector by sector would
+    // leave a partially-answered request that neither controller can reason about.
+    public async Task<List<int>> RejectRequestsBatchAsync(IEnumerable<int> requestIds)
+    {
+        if (!Network.IsConnected)
+            return new List<int>();
+
+        var response = await _api.RejectRequestsBatchAsync(requestIds);
+        foreach (var id in response.Rejected)
+            ActionLog.Log("Ownership", $"Rejected request #{id}");
+
+        if (response.Sync != null)
+            ApplySync(response.Sync);
+        else
+            await RefreshFromServerAsync();
+
+        return response.Rejected;
     }
 
     // MMI.SectorsControlled can change through paths nothing OzServer-aware drives directly -
