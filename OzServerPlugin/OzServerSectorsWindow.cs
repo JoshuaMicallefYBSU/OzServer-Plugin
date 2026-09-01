@@ -1715,10 +1715,42 @@ public class OzServerSectorsWindow : BaseForm
         // Once for the whole pass, not once per sector - see FindController.
         RefreshOnlineControllerIndex();
 
-        var sectorNodes = new List<TreeNode>();
-        foreach (var key in SectorsVolumes.Sectors.Where(s =>
-                     s.CSECEligible && !_sectorsSelected.Any(ss => !ss.IsDummy && s.Name == ss.Name)))
+        var claimable = SectorsVolumes.Sectors.Where(s => s.CSECEligible && IsClaimable(s)).ToList();
+
+        // The same subordination rule PopulateOwnedList and RenderControlledList already apply, and
+        // whose absence here was a real bug rather than an inconsistency: a sector covered by
+        // another claimable sector belongs nested inside that sector's subtree, not at top level as
+        // well.
+        //
+        // BuildAvailableSectorNode renders a grouping sector's whole covered set as children, so
+        // without this every one of those sectors was drawn twice - once under its parent and once
+        // as its own row. Brisbane Approach is the clearest case: BAN declares
+        // ResponsibleSectors="BAS,BDN,BDS,SHN", so all four appeared under BAN *and* separately, and
+        // moving one row left the other sitting there looking like the move had not happened.
+        //
+        // Built as a set in one pass rather than an Any() per sector: this runs on every poll over
+        // ~300 sectors, and the pairwise form is a hundred thousand list scans a tick.
+        var subordinate = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var sector in claimable)
         {
+            if (!SectorsVolumes.SectorGroupings.TryGetValue(sector, out var covered))
+                continue;
+
+            foreach (var child in covered)
+            {
+                // A sector that lists itself in its own grouping (see BuildOwnedSectorNode) is not
+                // subordinate to itself - suppressing it would drop it from the list entirely.
+                if (!child.Equals(sector))
+                    subordinate.Add(child.Name);
+            }
+        }
+
+        var sectorNodes = new List<TreeNode>();
+        foreach (var key in claimable)
+        {
+            if (subordinate.Contains(key.Name))
+                continue;
+
             var node = BuildAvailableSectorNode(key);
             if (node != null)
                 sectorNodes.Add(node);
@@ -1876,6 +1908,38 @@ public class OzServerSectorsWindow : BaseForm
     bool IsOwnedByAnotherController(SectorsVolumes.Sector sector) =>
         _controlledNames.Contains(sector.Name);
 
+    // Whether something already in Owned covers this sector - that is, it is held through a
+    // grouping sector rather than in its own right.
+    //
+    // Available used to test Owned for an exact name match only, which left a grouping sector's
+    // covered sectors listed as claimable after the group itself was taken. Owned was already
+    // drawing them nested under their parent, and PopulateOwnedList's subordination rule stopped
+    // them from getting a row of their own, so staging one out of Available changed precisely
+    // nothing on screen - the row stayed put and the move looked broken.
+    //
+    // Brisbane Approach is where this shows up: BAN declares
+    // ResponsibleSectors="BAS,BDN,BDS,SHN", so holding BAN silently made all four unmovable.
+    bool IsCoveredByOwned(SectorsVolumes.Sector sector) =>
+        _sectorsSelected.Any(owned =>
+            !owned.Equals(sector)
+            && SectorsVolumes.SectorGroupings.TryGetValue(owned, out var covered)
+            && covered.Contains(sector));
+
+    // Everything that makes a sector claimable by this controller right now, in one place so the
+    // Available list and the nodes it builds can never disagree about which sectors are in it -
+    // PopulateAvailableList works out its nesting from this set, so a sector it considers claimable
+    // that BuildAvailableSectorNode then rejects would vanish from the list altogether.
+    //
+    // Name comparison for the Owned test, not Contains: it is the footing every other
+    // Owned/Available decision in this window uses (see StageSectorChange), and the two used to
+    // disagree here - the list filtered by name while the node builder filtered by Sector.Equals,
+    // which is callsign-based.
+    bool IsClaimable(SectorsVolumes.Sector sector) =>
+        !_sectorsSelected.Any(owned => !owned.IsDummy && owned.Name == sector.Name)
+        && !IsCoveredByOwned(sector)
+        && !IsOwnedByAnotherController(sector)
+        && TryMatchAvailable(sector, out _);
+
     void ApplyAvailableSectorNodes(List<TreeNode> sectorNodes, string modePrefix)
     {
         // An empty result is a real answer, not a missing one, and rendering it as a bare empty box
@@ -1947,8 +2011,7 @@ public class OzServerSectorsWindow : BaseForm
         // another controller's. The last one is what an extending controller looks like - they hold
         // it without ever being logged in under its callsign - and missing it made Available offer
         // sectors whose claim could only ever come back as a request.
-        if (_sectorsSelected.Contains(sector) || IsOwnedByAnotherController(sector)
-            || !TryMatchAvailable(sector, out var controller))
+        if (!IsClaimable(sector) || !TryMatchAvailable(sector, out var controller))
             return null;
 
         var node = new TreeNode { Tag = sector, NodeFont = _availSectorsView.Font };
