@@ -91,6 +91,10 @@ public class OzServerSectorsWindow : BaseForm
     bool _suspendScrollSync;
     // See SetScrollBarValue - stops a code-assigned scrollbar value bouncing back into the tree.
     bool _syncingScrollBar;
+    // Last content height each scrollbar was configured for - see the Configure*Scrollbar methods.
+    int _currContentHeight = -1;
+    int _availContentHeight = -1;
+    int _requestedContentHeight = -1;
     bool _allowTreeToggle;
     // Avoid clearing and recreating an unchanged tree. Owned is refreshed every ten seconds even
     // when it has not changed, Available also reacts to every network-controller change, and
@@ -894,6 +898,46 @@ public class OzServerSectorsWindow : BaseForm
         menu.Show(treeView, location);
     }
 
+    // Removes the row for one sector, and the group heading with it if that leaves it empty - which
+    // is what a rebuild would have produced. Only ever touches top-level group children: a sector
+    // nested under a grouping sector is shown as part of that group's own subtree, and pulling it
+    // out from under its parent would misrepresent what the parent covers.
+    // Returns false when the row is not a plain top-level group child - a sector nested inside a
+    // grouping sector's subtree, say. Those cannot simply be pulled out: the subtree shows what the
+    // parent covers, so removing one row from it would misrepresent the parent. The caller falls
+    // back to a full rebuild, which works the nesting out properly.
+    //
+    // Reporting this rather than silently doing nothing matters: the first version returned quietly
+    // when it found no match, which left the sector showing in Available *and* Owned at once - so a
+    // move looked like it had not happened.
+    static bool RemoveSectorRow(TreeViewEx view, string sectorName)
+    {
+        foreach (TreeNode group in view.Nodes)
+        {
+            for (var i = group.Nodes.Count - 1; i >= 0; i--)
+            {
+                var candidate = group.Nodes[i];
+
+                if (candidate.Tag is not SectorsVolumes.Sector sector || sector.Name != sectorName)
+                    continue;
+
+                // Has its own children, so it is a grouping sector whose subtree other rows sit in.
+                // Rebuilding is the only way to work out what should remain.
+                if (candidate.Nodes.Count > 0)
+                    return false;
+
+                group.Nodes.RemoveAt(i);
+
+                if (group.Nodes.Count == 0)
+                    group.Remove();
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // What the menu is acting on, as its title row. Category headers carry the plain name in Name
     // (Text has the >/v prefix bolted on); sector rows carry it in Text, with the trailing "*" that
     // marks "bundles sub-sectors" trimmed off - it is list notation, not part of the sector's name.
@@ -1076,6 +1120,10 @@ public class OzServerSectorsWindow : BaseForm
     sealed class TreeViewState
     {
         public readonly HashSet<string> ExpandedKeys = new();
+        // Every key present before the rebuild, expanded or not. Capture only records what was
+        // *open*, which makes a group the controller deliberately closed indistinguishable from one
+        // that has never been seen - and those two want opposite treatment on a rebuild.
+        public readonly HashSet<string> KnownKeys = new();
         public string? SelectedKey;
         public int ScrollValue;
     }
@@ -1096,6 +1144,7 @@ public class OzServerSectorsWindow : BaseForm
         foreach (TreeNode node in nodes)
         {
             var key = ChildKey(parentKey, node);
+            state.KnownKeys.Add(key);
 
             if (ReferenceEquals(node, selected))
                 state.SelectedKey = key;
@@ -1112,7 +1161,14 @@ public class OzServerSectorsWindow : BaseForm
     // still exists post-refresh - so a poll tick (every 10s) can't collapse an open dropdown or
     // move the selection out from under the controller mid-action. Must run inside the caller's
     // BeginUpdate/EndUpdate.
-    static void RestoreExpandedAndSelection(TreeViewEx view, TreeViewState state)
+    static void RestoreExpandedAndSelection(TreeViewEx view, TreeViewState state) =>
+        RestoreExpandedAndSelection(view, state, expandNewGroups: false);
+
+    // expandNewGroups opens any top-level group the previous state had never seen. Used by Owned, so
+    // a sector staged into a category that wasn't on screen a moment ago is visible immediately
+    // rather than hidden behind a dropdown the controller has to find and open. A group they
+    // deliberately closed stays closed - it is in KnownKeys, so it isn't "new".
+    static void RestoreExpandedAndSelection(TreeViewEx view, TreeViewState state, bool expandNewGroups)
     {
         TreeNode? selected = null;
 
@@ -1125,9 +1181,14 @@ public class OzServerSectorsWindow : BaseForm
                 if (key == state.SelectedKey)
                     selected = node;
 
+                var isNewGroup = expandNewGroups
+                                 && parentKey.Length == 0
+                                 && node.Nodes.Count > 0
+                                 && !state.KnownKeys.Contains(key);
+
                 // Nothing below a branch that was closed can have been open either, so there is no
                 // reason to descend into it looking for one.
-                if (!state.ExpandedKeys.Contains(key))
+                if (!isNewGroup && !state.ExpandedKeys.Contains(key))
                     continue;
 
                 node.Expand();
@@ -1235,21 +1296,45 @@ public class OzServerSectorsWindow : BaseForm
     // vatSys down the moment the window opened. The flicker it was chasing is cosmetic; this is not.
     void ConfigureCurrScrollbar()
     {
-        _currScrollBar.PreferredHeight = VisibleContentHeight(_currSectorsView);
+        // Only touched when the content height actually moved. Each of these setters repaints the
+        // scrollbar, and this runs on every expand, collapse and rebuild - so re-asserting values
+        // that had not changed was a visible flicker beside the list for no reason at all.
+        var content = VisibleContentHeight(_currSectorsView);
+        if (content == _currContentHeight && _currScrollBar.ActualHeight == _currSectorsView.Height)
+            return;
+
+        _currContentHeight = content;
+        _currScrollBar.PreferredHeight = content;
         _currScrollBar.ActualHeight = _currSectorsView.Height;
         _currScrollBar.Change = Math.Max(_currSectorsView.ItemHeight, 1);
     }
 
     void ConfigureAvailScrollbar()
     {
-        _availScrollBar.PreferredHeight = VisibleContentHeight(_availSectorsView);
+        // Only touched when the content height actually moved. Each of these setters repaints the
+        // scrollbar, and this runs on every expand, collapse and rebuild - so re-asserting values
+        // that had not changed was a visible flicker beside the list for no reason at all.
+        var content = VisibleContentHeight(_availSectorsView);
+        if (content == _availContentHeight && _availScrollBar.ActualHeight == _availSectorsView.Height)
+            return;
+
+        _availContentHeight = content;
+        _availScrollBar.PreferredHeight = content;
         _availScrollBar.ActualHeight = _availSectorsView.Height;
         _availScrollBar.Change = Math.Max(_availSectorsView.ItemHeight, 1);
     }
 
     void ConfigureRequestedScrollbar()
     {
-        _requestedScrollBar.PreferredHeight = VisibleContentHeight(_requestedChangesView);
+        // Only touched when the content height actually moved. Each of these setters repaints the
+        // scrollbar, and this runs on every expand, collapse and rebuild - so re-asserting values
+        // that had not changed was a visible flicker beside the list for no reason at all.
+        var content = VisibleContentHeight(_requestedChangesView);
+        if (content == _requestedContentHeight && _requestedScrollBar.ActualHeight == _requestedChangesView.Height)
+            return;
+
+        _requestedContentHeight = content;
+        _requestedScrollBar.PreferredHeight = content;
         _requestedScrollBar.ActualHeight = _requestedChangesView.Height;
         _requestedScrollBar.Change = Math.Max(_requestedChangesView.ItemHeight, 1);
     }
@@ -1455,7 +1540,7 @@ public class OzServerSectorsWindow : BaseForm
                 // ExpandAll() on first open, which meant the window came up fully unfolded and the
                 // controller had to close everything by hand. Nodes are built collapsed, so there is
                 // nothing to do here beyond restoring whatever they had opened themselves.
-                RestoreExpandedAndSelection(_currSectorsView, state);
+                RestoreExpandedAndSelection(_currSectorsView, state, expandNewGroups: true);
             }
             finally
             {
@@ -2233,7 +2318,39 @@ public class OzServerSectorsWindow : BaseForm
         else
             _stagedNames.Add(sector.Name);
 
-        PopulateLists();
+        PopulateOwnedList();
+
+        if (owned)
+        {
+            // Available -> Owned, the move that has to feel immediate.
+            //
+            // Rebuilding Available means clearing and re-adding around 266 nodes, and every one of
+            // those is a separate insert into the native tree control - that teardown is what read
+            // as the list reloading rather than the row simply moving. Taking the one row out
+            // directly is a single operation, and the result on screen is identical.
+            //
+            // The signature is dropped so the next refresh still does a full, authoritative rebuild:
+            // this is a shortcut to the same picture, not a replacement for deriving it properly.
+            if (RemoveSectorRow(_availSectorsView, sector.Name))
+            {
+                _availableTreeSignature = null;
+                ConfigureAvailScrollbar();
+            }
+            else
+            {
+                // Nested, or already gone - rebuild so Available genuinely reflects the move rather
+                // than keeping a row that is now staged into Owned.
+                PopulateAvailableList();
+            }
+        }
+        else
+        {
+            // Owned -> Available has to put the row back in its correct group and sort position,
+            // which is exactly what a rebuild works out. Far rarer, and not the direction anyone is
+            // waiting on.
+            PopulateAvailableList();
+        }
+
         RefreshStagedHighlight();
         UpdateApplyCancelButtons();
     }
