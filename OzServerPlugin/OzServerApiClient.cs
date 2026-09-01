@@ -237,6 +237,12 @@ public class OzServerFdrUpdateDto
 public class OzServerFdrRecordDto
 {
     [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    // Who OzServer says is working this flight. GET /fdr/sync has always returned these; nothing
+    // mapped them, so the plugin had no way to tell a tag another controller holds from a free one.
+    // vatSys keeps jurisdiction per client with no cross-controller sync - the whole reason this
+    // backend exists - so fdr.IsTracked only ever describes this session.
+    [JsonProperty("controlling_cid")] public int? ControllingCid { get; set; }
+    [JsonProperty("controlling_callsign")] public string? ControllingCallsign { get; set; }
     [JsonProperty("state")] public string? State { get; set; }
     [JsonProperty("flight_rules")] public string? FlightRules { get; set; }
     [JsonProperty("aircraft_type")] public string? AircraftType { get; set; }

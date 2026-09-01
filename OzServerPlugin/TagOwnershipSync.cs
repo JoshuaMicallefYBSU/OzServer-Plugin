@@ -239,6 +239,16 @@ public class TagOwnershipSync
         if (mmiSector == null)
             return;
 
+        // Leave a tag someone else is working alone, even though it is sitting in this controller's
+        // airspace. fdr.IsTracked below only describes *this* client - vatSys has no cross-controller
+        // jurisdiction sync - so on a reconnect it reads false for everything, and every tag in the
+        // sector looked free, including ones another controller had taken over in the meantime.
+        //
+        // This never blocks the reconnect reclaim: those tags are ones OzServer still records against
+        // this very CID, so the "another controller" test does not match them.
+        if (_fdrActivationSync.IsHeldByAnotherController(fdr.Callsign))
+            return;
+
         // Cheap filter before ever touching the UI thread - re-checked for real inside
         // TryActivateAndFlashIn, since fdr.State can move between this read and the posted
         // callback actually running.

@@ -44,6 +44,9 @@ public class FdrActivationSync
     // event-driven callbacks, which can arrive on a different thread again.
     readonly object _knownLock = new();
     HashSet<string> _knownCallsigns = new(StringComparer.OrdinalIgnoreCase);
+    // Callsign -> the CID OzServer records as working it. Read by TagOwnershipSync so a tag another
+    // controller already holds is never offered to this one for pickup.
+    Dictionary<string, int> _controllingCids = new(StringComparer.OrdinalIgnoreCase);
 
     // Every FDR push by any controller publishes an "fdr" signal, and FdrSync pushes every 5s per
     // controller - so across a busy sector group these arrive many times a second. Pulling the
@@ -107,6 +110,26 @@ public class FdrActivationSync
             return _knownCallsigns.Contains(callsign);
     }
 
+    // Whether somebody other than this session is working the flight, according to OzServer.
+    //
+    // This is the only source for that question. vatSys's own fdr.IsTracked describes this client
+    // alone, and on a reconnect it is false for every flight - which made every tag inside the
+    // controller's sectors look free to pick up, including ones another controller had taken over
+    // while they were away.
+    //
+    // A flight OzServer has no record for answers false: unknown is not the same as held, and
+    // refusing to work an aircraft nobody has claimed would be worse than the problem being fixed.
+    public bool IsHeldByAnotherController(string callsign)
+    {
+        if (string.IsNullOrEmpty(callsign))
+            return false;
+
+        var me = NetworkIdentity.CidOrZero;
+
+        lock (_knownLock)
+            return _controllingCids.TryGetValue(callsign, out var cid) && cid != 0 && cid != me;
+    }
+
     async Task PollAsync()
     {
         if (!Network.IsConnected)
@@ -137,6 +160,11 @@ public class FdrActivationSync
             _knownCallsigns = new HashSet<string>(
                 records.Select(r => r.Callsign).Where(c => !string.IsNullOrEmpty(c)),
                 StringComparer.OrdinalIgnoreCase);
+
+            _controllingCids = records
+                .Where(r => !string.IsNullOrEmpty(r.Callsign) && r.ControllingCid is > 0)
+                .GroupBy(r => r.Callsign, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().ControllingCid!.Value, StringComparer.OrdinalIgnoreCase);
         }
 
         var candidates = FDP2.GetFDRs
