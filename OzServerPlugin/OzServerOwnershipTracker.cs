@@ -453,24 +453,33 @@ public class OzServerOwnershipTracker
     // something out from under someone actively working it.
     async Task ResumePreviousSessionAsync()
     {
-        if (!Network.IsConnected)
-            return;
-
-        // POST /sectors/resume hands ownership back server-side, and the backend has no notion of an
-        // observer to refuse it with - every guard against a non-ATC session taking sectors is on
-        // this side. This path had none, so an observer reconnecting on a callsign that still had a
-        // resume snapshot was simply given its sectors.
+        // Waits for IsConnected and Me to settle. Network.Connected fires before either has -
+        // AfvSectorClaimer retries for exactly that reason - and this used to read IsConnected once
+        // at entry, find it false, and return silently, with nothing logged and nothing to retry it.
         //
-        // Network.Me is briefly null after Connected, so the check has to wait for an answer rather
-        // than read the gap as either verdict: treating null as "real ATC" resumes for an observer,
-        // and treating it as "observer" silently drops a genuine controller's reconnect. If it never
-        // resolves, not resuming is the safe way to be wrong - the controller can reclaim by hand,
-        // whereas an observer holding sectors is exactly what this prevents.
-        for (var attempt = 0; attempt < 20 && Network.IsConnected && Network.Me == null; attempt++)
-            await Task.Delay(500).ConfigureAwait(false);
+        // The observer test reads Position/Rating from the connection itself (NetworkIdentity), not
+        // Network.Me.IsRealATC. Keying it on that flag is what skipped resume for a real
+        // ML-ASP_CTR session twice over - it reads false for a genuine controller for seconds after
+        // Connected. Position and Rating are correct the moment the session exists.
+        //
+        // No ConfigureAwait(false), matching the rest of this file: callers reached from the UI rely
+        // on their continuation resuming on the UI thread.
+        for (var attempt = 0; attempt < 25 && (!Network.IsConnected || Network.Me == null); attempt++)
+            await Task.Delay(200);
 
-        if (!Network.IsConnected || !IsRealAtc)
+        if (!Network.IsConnected)
+        {
+            ActionLog.Log("Resume", "skipped - network still not connected");
             return;
+        }
+
+        if (NetworkIdentity.IsObserver)
+        {
+            ActionLog.Log("Resume", "skipped - observer session, sectors are mirrored not owned");
+            return;
+        }
+
+        ActionLog.Log("Resume", $"requesting for {Network.Me?.Callsign ?? "(callsign unknown)"}");
 
         try
         {
@@ -480,6 +489,10 @@ public class OzServerOwnershipTracker
                 ApplySync(response.Sync);
             else
                 await RefreshFromServerAsync();
+
+            ActionLog.Log("Resume",
+                $"backend returned {response.Resumed.Count} sector(s), {response.Flights.Count} tag(s)"
+                + (response.Flights.Count > 0 ? ": " + string.Join(", ", response.Flights) : ""));
 
             if (response.Flights.Count > 0)
                 TagsResumed?.Invoke(this, response.Flights);
@@ -620,7 +633,11 @@ public class OzServerOwnershipTracker
     // controller_cid/controller_callsign the plugin sends it. The local IsRealATC flag is what
     // distinguishes a controlling connection from an observer - see issue #3, "CM_OBS Can Own
     // Sectors".
-    static bool IsRealAtc => Network.Me?.IsRealATC == true;
+    // Reads the connection's own Position/Rating rather than Network.Me.IsRealATC - see
+    // NetworkIdentity.IsObserver for why that flag cannot be trusted at connect time. As a bonus
+    // this is correct immediately, so a claim made in the first seconds of a session is no longer
+    // silently dropped while the published ATC record catches up.
+    static bool IsRealAtc => !NetworkIdentity.IsObserver;
 
     public async Task ClaimAsync(SectorsVolumes.Sector sector)
     {

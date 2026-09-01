@@ -1,3 +1,4 @@
+using RossCarlson.Vatsim.Network;
 using vatsys;
 
 namespace OzServerPlugin;
@@ -29,6 +30,19 @@ static class NetworkIdentity
                 : (cid, callsign);
         }
     }
+
+    // Whether this session connected as an observer, read from the two fields the vatSys connection
+    // window actually sets: Position (Network.Facility) and Rating (Network.Rating). OBS in either
+    // is an observer connection - the same rule the connection window itself presents.
+    //
+    // Deliberately NOT Network.Me.IsRealATC, which every observer check here used to key on. That
+    // flag describes the ATC record the network has published about us, not what we connected as,
+    // and it reads false for a genuine controller for some seconds after Connected. Gating anything
+    // at connect time on it therefore refuses real controllers: it cost a live ML-ASP_CTR session
+    // its resume and, through the same test in the position mirror, its entire sector allocation.
+    // Facility and Rating are set from the connection window and are correct immediately.
+    public static bool IsObserver =>
+        Network.Rating == NetworkRating.OBS || Network.Facility == NetworkFacility.OBS;
 
     // 0 when not connected. Only for callers where "not me" is the right reading of an absent
     // identity - never for attributing ownership, where 0 would be a real controller id.

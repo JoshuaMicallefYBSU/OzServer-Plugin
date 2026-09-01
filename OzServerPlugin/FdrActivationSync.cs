@@ -150,9 +150,20 @@ public class FdrActivationSync
             .GroupBy(r => r.Callsign, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
+        var mine = MMI.SectorsControlled.Where(sector => !sector.IsDummy).ToList();
+
         foreach (var fdr in candidates)
         {
             if (!byCallsign.TryGetValue(fdr.Callsign, out var record))
+                continue;
+
+            // Out of our airspace, leave it exactly as vatSys left it. This used to restore every
+            // flight the backend held, which meant activating aircraft nowhere near this controller
+            // and leaving them sitting blue - STATE_COORDINATED, known but nobody's - on a scope
+            // where they mean nothing. A flight that is neither inside a controlled sector nor
+            // approaching one stays at STATE_PREACTIVE, and is restored the moment it does arrive:
+            // this runs on every poll and on every fdr push, so nothing is lost by waiting.
+            if (!SectorLocator.IsWithinOrNear(fdr, mine))
                 continue;
 
             // The server counts as "further along" the same way ESTed does locally - a state past
@@ -213,7 +224,22 @@ public class FdrActivationSync
         if (record.CflLower is > 0) fdr.CFLLower = record.CflLower.Value;
         if (record.CflUpper is > 0) fdr.CFLUpper = record.CflUpper.Value;
         if (record.AssignedSsrCode is >= 0) fdr.AssignedSSRCode = record.AssignedSsrCode.Value;
-        if (record.Atd != null) fdr.ATD = record.Atd.Value;
+        // Departure is replayed through vatSys rather than written as a field. Assigning fdr.ATD
+        // directly recorded the time but skipped FDP2's own departure processing entirely, so a
+        // flight the previous controller had departed came back with a departure time and yet had
+        // never actually been Departed as far as vatSys was concerned - which is why tags recoupled
+        // but showed as neither Departed nor Activated.
+        //
+        // sendMessages: false is not optional. It defaults to true, and this is replaying something
+        // that already happened - the default would re-broadcast a departure message onto the
+        // network for every restored flight, on every reconnect.
+        if (record.Atd is { } atd && atd != default)
+        {
+            if (fdr.ATD == default)
+                FDP2.DepartFDR(fdr, atd, false);
+            else
+                fdr.ATD = atd;
+        }
         if (record.Etd != null) fdr.ETD = record.Etd.Value;
         if (record.EetMinutes is > 0) fdr.EET = TimeSpan.FromMinutes(record.EetMinutes.Value);
         if (record.Tas is > 0) fdr.TAS = record.Tas.Value;
@@ -226,7 +252,7 @@ public class FdrActivationSync
         // class that declares it, a public event only permits += / -=, not a direct invocation.
         FDP2.Process(fdr, true);
 
-        ActionLog.Log("Tag", $"Activated {fdr.Callsign} from OzServer (server state was {record.State})");
+        ActionLog.Log("Tag", $"Restored {fdr.Callsign} from OzServer to {fdr.State} (server state was {record.State})");
     }
 
     // Same fire-and-forget marshaling every other class in this plugin uses for a timer/event
