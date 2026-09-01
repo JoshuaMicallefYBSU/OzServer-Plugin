@@ -44,6 +44,51 @@ Both windows live under **Settings**, slotted in directly beneath the built-in *
 - **Settings → OzServer Sectors**
 - **Settings → OzServer Settings**
 
+### Staying up to date
+
+Step 1 is only needed once. After that the plugin updates itself from this repository's
+[GitHub releases](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases), silently and with
+nothing to click. It checks two minutes after vatSys starts and every six hours afterwards.
+
+A running session is never disturbed: **an update always takes effect at the next vatSys start**, not
+the moment it is found. That isn't a policy choice, it's the only thing Windows permits. vatSys holds
+`OzServerPlugin.dll` open for the whole session, so it cannot be overwritten or deleted while
+running — which is exactly why installing a build by hand means closing vatSys first. It *can* be
+renamed, though, so `PluginUpdater` stages the swap instead:
+
+1. download the new DLL beside the current one, as `OzServerPlugin.dll.update`
+2. verify it before it is allowed anywhere near the live name
+3. rename the running DLL to `OzServerPlugin.dll.backup`, and move `.update` into its place
+4. next start, vatSys loads the new one and the `.backup` is deleted
+
+Neither staging file can be mistaken for a plugin — vatSys enumerates `*.dll`, and these end in
+`.update`/`.backup` (short names `OZSERV~1.UPD` / `OZSERV~1.BAC`, so the 8.3 wildcard trap doesn't
+apply either). A half-finished download is never something vatSys tries to load.
+
+Step 2 is the one that matters. A download is only installed if it is a real managed assembly, named
+`OzServerPlugin`, with a version genuinely higher than the running one — read via
+`AssemblyName.GetAssemblyName`, which reads the metadata without loading the file, because whether it
+can be trusted is not a question to answer by first running it. A truncated download or an error page
+saved under a `.dll` name is discarded, not installed.
+
+Nothing is deleted while it might still be needed. Step 4 only runs once the new version has
+successfully loaded, so if a release ever ships something that won't load, the previous version is
+still sitting there as `.backup` and **recovering is renaming that one file back**.
+
+A successful install is the one thing that does say so, as a single line in the vatSys Errors window:
+
+> `OzServer: An update (0.1.2) was detected and installed. It will be loaded at the next vatSys launch.`
+
+Not an error, but that window is the only notification surface vatSys gives a plugin, and it behaves
+well for the purpose — `ErrorWindow.AddError` shows it with `SW_SHOWNOACTIVATE`, so it appears above
+the main form without taking focus off whatever the controller is doing. It's worth the one line: the
+controller is now running a version that is no longer the one on disk, and restarting is what closes
+that gap.
+
+Failures, by contrast, are quiet by design: being offline, or the repo having no releases yet, goes to
+the daily `ozserver_<date>.txt` log and nothing else. There is nothing a controller can do about it
+mid-session, and the version they already have keeps working.
+
 ---
 
 ## Using it
@@ -191,6 +236,20 @@ If the token is ever exposed, rotating `PLUGIN_TOKEN` in the backend `.env` is t
 actually revokes it. Rewriting git history does not — anything already cloned, forked, or cached
 keeps working.
 
+**The updater executes what it downloads**, on the next vatSys start, so it is worth being explicit
+about what does and does not guard that:
+
+- Transport is HTTPS to `api.github.com` and GitHub's own asset host, with TLS 1.2 forced (4.7.2
+  otherwise picks its protocol from an older default). The URL is a `const` — nothing the backend or
+  a settings field says can redirect it.
+- Only a real managed assembly named `OzServerPlugin`, versioned higher than the running one, is
+  installed. That catches corruption and mistakes.
+- It does **not** verify a signature or a publisher. Anyone who can publish a release to this
+  repository can therefore run code inside every controller's vatSys. **Write access to the repo is
+  the trust boundary** — treat it accordingly, and keep releases restricted to people who should have
+  that. Signing the assembly and checking the key before install is the durable fix, in the same way
+  VATSIM Connect is for the token above.
+
 ---
 
 ## Matching the vatSys look
@@ -232,6 +291,7 @@ Four rules if you touch the styling:
 | File | Role |
 | --- | --- |
 | `Plugin.cs` | MEF entry point; menu items and the incoming-request flash trail |
+| `PluginUpdater.cs` | Silent self-update from GitHub releases, staged so it lands at the next vatSys start |
 | `OzServerOwnershipTracker.cs` | Source of truth for owned sectors; syncs both ways with MMI/VSCS |
 | `OzServerApiClient.cs` | HTTP client and DTOs for the backend API |
 | `OzServerSectorsWindow.cs` | The Owned / Available / Controlled / Requested Changes window |
@@ -287,6 +347,7 @@ All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` at
 | ATISPlugin rescan (looking for its slots) | 5s |
 | HTTP request timeout | 20s |
 | Max concurrent HTTP connections | 8 (raised from .NET's default of 2) |
+| Update check | 2 min after start, then every 6h (30s timeout, its own client) |
 
 All three views arrive in one `GET /sectors/sync`, so a poll tick is a single request rather than
 three. A failed sync leaves all three as they were rather than half-updating them.
@@ -297,6 +358,24 @@ three. A failed sync leaves all three as they were rather than half-updating the
 
 **There is no CI build.** Compiling requires a vatSys installation, and its assemblies aren't ours to
 redistribute to a build runner. Build and test locally against a real install.
+
+**Publishing a release — bump `<Version>` and the tag together.** Everyone's copy updates itself from
+GitHub releases (see [Staying up to date](#staying-up-to-date)), and it trusts the *assembly's* version,
+not the tag. So a release must be:
+
+1. `<Version>` raised in `OzServerPlugin.csproj`, and built from that
+2. tagged to match (`v0.1.2` for `0.1.2` — a leading `v` is fine, it's stripped)
+3. published with the built `OzServerPlugin.dll` attached as an asset under exactly that name
+
+Tag a release `v0.1.2` but attach a DLL still stamped `0.1.1` and every client downloads it, sees it
+isn't actually newer, discards it and logs why — then does the same six hours later, forever. It fails
+safe rather than looping installs, but the release still reaches nobody. Drafts and prereleases are
+ignored, so a release only goes out when it is actually published.
+
+Building locally with the same `<Version>` as a published release is fine — it's only ever replaced by
+a *higher* one. Leave `<Version>` behind the latest release, though, and the updater will helpfully
+overwrite your own build with the released one at the next start; the `.backup` beside it is the
+previous file if you want it back.
 
 **The comments carry real history.** Several explain a specific bug a previous shape caused and why
 the current one avoids it — the claim/release loop, the stack overflow from a self-referencing sector

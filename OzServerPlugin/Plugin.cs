@@ -43,6 +43,9 @@ public class Plugin : IPlugin
     // Also purely event-driven, and has to be alive from plugin load: the disconnect it reacts to
     // can happen long before the Sectors window is ever opened.
     readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
+    // Timer-driven and entirely invisible - it never touches the running session, only what is on
+    // disk for the next one. See its own class comment for why it can't just overwrite the DLL.
+    readonly PluginUpdater _updater;
 
     // Incoming requests waiting on this controller, driving the Settings header's flash.
     int _pendingRequests;
@@ -69,6 +72,9 @@ public class Plugin : IPlugin
         // After the tracker, which it releases through.
         _primaryPositionWatcher = new PrimaryPositionWatcher(_ownershipTracker);
         _gracefulDisconnectReleaser = new GracefulDisconnectReleaser();
+        // Last, and dependent on nothing: it only ever reads GitHub and writes files next to this
+        // assembly, so it has no ordering relationship with anything above it.
+        _updater = new PluginUpdater();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
