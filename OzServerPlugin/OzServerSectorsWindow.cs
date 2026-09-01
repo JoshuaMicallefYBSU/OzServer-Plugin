@@ -1604,6 +1604,22 @@ public class OzServerSectorsWindow : BaseForm
         {
             foreach (var child in children)
             {
+                // A sub-sector OzServer says belongs to someone else is not ours to draw, even
+                // though its parent grouping is ours. Claiming a group does cover its sub-sectors,
+                // but any one of them can be handed away individually afterwards - and this tree is
+                // built from the local dataset's groupings, which know nothing about that. The
+                // symptom was a transferred sector still sitting under Owned while the Controlled
+                // pane simultaneously, and correctly, showed its new owner: vatSys had already
+                // taken the airspace away, so this window was the only thing still disagreeing.
+                //
+                // OwnerOf returns a synthetic "me" for anything in Owned, so the IsMine test is
+                // what stops our own sub-sectors being filtered out here. A child nobody owns
+                // returns null and is still drawn, which is correct - claiming the group covers it.
+                // The self-reference case (a grouping sector listing itself, see above) is exempt,
+                // since that node is the sector already being drawn.
+                if (!ReferenceEquals(child, sector) && !_tracker.IsMine(child) && _tracker.OwnerOf(child) != null)
+                    continue;
+
                 node.Nodes.Add(ReferenceEquals(child, sector)
                     ? new TreeNode(LeafText(FormatSectorText(child))) { Tag = child, NodeFont = node.NodeFont, ToolTipText = LeafText(FormatSectorText(child)) }
                     : BuildOwnedSectorNode(child, depth + 1));
