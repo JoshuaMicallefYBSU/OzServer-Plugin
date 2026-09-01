@@ -27,12 +27,27 @@ namespace OzServerPlugin;
 // No explicit "gained" handling is needed for (b): the controller who just gained a sector picks up
 // whatever aircraft that leaves untracked on their own very next (sub-second) OnRadarTrackUpdate,
 // through (a) above.
+//
+// A third trigger, ActivateIfEligible, sits outside that "moves a tag between controllers"
+// guarantee entirely - it only ever gets a flight out of STATE_PREACTIVE, pre-emptively, once it's
+// known to OzServer, airborne (a live radar/ADS-B return, not just a filed flight plan's predicted
+// position), and within NearSectorThresholdNm of the boundary of a sector this controller currently
+// has selected - so its data is ready and EvaluatePickup's own ownership-gated flash can fire the
+// moment it actually crosses in, rather than only starting the activation dance right as (or after)
+// it already has. See its own comment for the full detail on each condition. Loosely tied to
+// ownership - proximity, not containment - since the whole point is to run ahead of the containment
+// test. Never touches jurisdiction/tracking/ControllingSector.
 public class TagOwnershipSync
 {
     static readonly TimeSpan SweepInterval = TimeSpan.FromSeconds(5);
 
+    // How close (nm) an aircraft has to be to the boundary of a sector this controller currently has
+    // selected before its FDR gets pre-activated ahead of arrival - see ActivateIfEligible.
+    const double NearSectorThresholdNm = 50.0;
+
     readonly OzServerOwnershipTracker _tracker;
     readonly FdrSync _fdrSync;
+    readonly FdrActivationSync _fdrActivationSync;
     readonly System.Threading.Timer _sweepTimer;
 
     // Guards _trackedByMe and _pickupSuppressed below - FDP2.FDRsChanged and
@@ -48,10 +63,11 @@ public class TagOwnershipSync
     // the ordinary re-evaluation that would otherwise undo the drop within seconds.
     readonly HashSet<string> _pickupSuppressed = new(StringComparer.OrdinalIgnoreCase);
 
-    public TagOwnershipSync(OzServerOwnershipTracker tracker, FdrSync fdrSync)
+    public TagOwnershipSync(OzServerOwnershipTracker tracker, FdrSync fdrSync, FdrActivationSync fdrActivationSync)
     {
         _tracker = tracker;
         _fdrSync = fdrSync;
+        _fdrActivationSync = fdrActivationSync;
         _tracker.OwnershipChanged += (_, diff) => RunOnUiThread(() => OnOwnershipChanged(diff));
         // Public and static on FDP2 itself - fires for every jurisdiction/handoff state change vatSys
         // makes to any FDR, including MMI.HandoffToNone (see OnFdrsChanged for why that one matters).
@@ -106,6 +122,72 @@ public class TagOwnershipSync
             EvaluatePickup(track.CoupledFDR);
     }
 
+    // A third, independent trigger, alongside (a) and (b) in the class comment - deliberately not
+    // scoped to sector ownership the way either of those is. Pre-activates a flight before it
+    // actually arrives, so its data is ready and EvaluatePickup's own ownership-gated flash can fire
+    // the moment it does cross in, rather than only starting the activation dance right as (or
+    // after) it already has. All three of the following have to hold:
+    //   - Known to OzServer (FdrActivationSync.IsKnownToServer) - a flight plan OzServer has no FDR
+    //     row for at all isn't something this session should be reaching out and activating off its
+    //     own back; only flights already part of the OzServer-coordinated picture qualify.
+    //   - Airborne - a live radar/ADS-B return (fdr.CoupledTrack with OnGround false), not just a
+    //     filed flight plan's predicted position. fdr.GetLocation() falls back to
+    //     PredictedPosition.Location whenever CoupledTrack is null (see FDP2.cs), which is exactly
+    //     what let a still-on-ground aircraft near a controlled sector's boundary get activated
+    //     before this was tightened to require the live track's own position instead.
+    //   - Within NearSectorThresholdNm of the boundary of a sector this controller currently has
+    //     selected (MMI.SectorsControlled) - loosely tied to ownership, proximity rather than
+    //     containment, since the whole point is to run ahead of the containment test.
+    //
+    // Activation only - never jurisdiction/tracking/ControllingSector. Getting the tag out of
+    // STATE_PREACTIVE is this method's whole job; EvaluatePickup's own sector-ownership-gated path,
+    // right below, remains solely responsible for who actually holds and flashes in for it.
+    void ActivateIfEligible(FDP2.FDR fdr)
+    {
+        if (fdr.State != FDP2.FDR.FDRStates.STATE_PREACTIVE || !_fdrActivationSync.IsKnownToServer(fdr.Callsign))
+            return;
+
+        var reason = ActivationReason(fdr);
+        if (reason == null)
+            return;
+
+        RunOnUiThread(() =>
+        {
+            // Re-checked here (already checked once above) - this callback can run some time after
+            // it was posted, and something else (a controller's own manual Activate, the
+            // ownership-gated path below, a second update that got there first) may have already
+            // moved this flight on in the meantime. FDP2.EstFDR itself is idempotent regardless, but
+            // there's no reason to log a no-op as if it were a real activation.
+            if (fdr.State != FDP2.FDR.FDRStates.STATE_PREACTIVE)
+                return;
+
+            MMI.EstFDR(fdr);
+
+            if (fdr.State != FDP2.FDR.FDRStates.STATE_PREACTIVE)
+                ActionLog.Log("Tag", $"Activated {fdr.Callsign} ({reason})");
+        });
+    }
+
+    static string? ActivationReason(FDP2.FDR fdr)
+    {
+        // Live track required - see the class comment on ActivateIfEligible for why this can't fall
+        // back to fdr.GetLocation()'s predicted-position case the way SectorLocator.Resolve's own
+        // candidates elsewhere in this plugin are allowed to.
+        if (fdr.CoupledTrack is not { OnGround: false } track)
+            return null;
+
+        var nearest = MMI.SectorsControlled.Where(s => !s.IsDummy)
+            .Select(s => SectorLocator.DistanceToBoundaryNm(s, track.LatLong))
+            .Where(d => d != null)
+            .Select(d => d!.Value)
+            .DefaultIfEmpty(double.MaxValue)
+            .Min();
+
+        return nearest <= NearSectorThresholdNm
+            ? $"airborne, within {NearSectorThresholdNm:0}nm of a controlled sector boundary"
+            : null;
+    }
+
     // Trigger (a) - see the class comment. Activates and/or assumes fdr if it's physically sitting,
     // right now, in a subsector this controller currently owns on OzServer. Covers both a flight
     // plan that hasn't been activated yet and a tag nobody currently holds - the same two cases the
@@ -119,12 +201,21 @@ public class TagOwnershipSync
         if (!Network.IsConnected || string.IsNullOrEmpty(fdr.Callsign))
             return;
 
-        var sector = ResolveSector(fdr);
-        if (sector == null)
-            return;
+        // Unconditional on sector ownership, unlike everything below it - see ActivateIfEligible's
+        // own comment for why. This only ever activates; it never touches jurisdiction/tracking, so
+        // it can't interfere with the ownership-gated flash-to-handover path that follows.
+        ActivateIfEligible(fdr);
 
-        var owner = _tracker.OwnerOf(sector);
-        if (owner == null || !int.TryParse(Network.ControllerId, out var myCid) || owner.Cid != myCid)
+        // Resolved directly against the sectors this controller has actually selected right now
+        // (MMI.SectorsControlled - the same "not dummy" filter every other MMI.SectorsControlled
+        // read in this plugin already applies), not indirectly through OzServer's own ownership
+        // tracker (tracker.OwnerOf/ClaimedSectors). The two are supposed to stay in step (see
+        // OzServerOwnershipTracker.ReconcileMmiWithOwned) but the tracker only refreshes on its own
+        // ~10s poll, and a flash-to-handover has to reflect what the controller is actually working
+        // right now - not what OzServer's last refresh happened to say, which could still show a
+        // sector this controller just released, or not yet show one just claimed.
+        var mmiSector = SectorLocator.Resolve(fdr, MMI.SectorsControlled.Where(s => !s.IsDummy));
+        if (mmiSector == null)
             return;
 
         // Cheap filter before ever touching the UI thread - re-checked for real inside
@@ -141,7 +232,7 @@ public class TagOwnershipSync
                 return;
         }
 
-        RunOnUiThread(() => TryActivateAndFlashIn(fdr, sector));
+        RunOnUiThread(() => TryActivateAndFlashIn(fdr, mmiSector));
     }
 
     // Activating (if needed) and deciding whether to flash in happen together, on the UI thread, in
@@ -150,17 +241,14 @@ public class TagOwnershipSync
     // still-stale fdr.State) meant a flight plan nobody had ever activated only got as far as
     // flashing in on some *later* sweep pass, once the queued Est call had finally caught up - if it
     // ever did (see below).
-    void TryActivateAndFlashIn(FDP2.FDR fdr, SectorsVolumes.Sector sector)
+    //
+    // mmiSector is already the exact MMI.SectorsControlled entry the tag resolved under (see
+    // EvaluatePickup) - no separate lookup needed here to translate it, unlike before this was
+    // resolved directly against MMI.SectorsControlled instead of OzServer's own ownership record.
+    void TryActivateAndFlashIn(FDP2.FDR fdr, SectorsVolumes.Sector mmiSector)
     {
         if (fdr.IsTracked)
             return;
-
-        // The MMI.SectorsControlled entry sector actually resolves under - may be sector's own
-        // covering primary (see ClaimMmiControlledSectorsAsync's own comment on why an owned
-        // sub-sector need not appear in MMI.SectorsControlled by itself). Needed below regardless of
-        // whether this pass ends up activating anything.
-        var mmiSector = MMI.SectorsControlled.FirstOrDefault(s => s.Equals(sector))
-                         ?? MMI.SectorsControlled.FirstOrDefault(s => s.SubSectors.Any(sub => sub.Equals(sector)));
 
         if (!fdr.ESTed)
         {
@@ -176,12 +264,13 @@ public class TagOwnershipSync
             // - see MMI.EstFDR's own body) resolves against vatSys's native default-jurisdiction
             // geometry, which has no idea OzServer subsectors exist: it can leave ControllingSector on
             // whichever of this controller's sectors happens to be MMI.SectorsControlled.First(), or on
-            // its own geometric guess, either of which can disagree with the specific sector OzServer
-            // says this controller owns here. Reasserted only for the flight this call itself just
-            // activated - the already-activated branch below never touches ControllingSector, exactly
-            // as before this change.
-            if (mmiSector != null)
-                fdr.ControllingSector = mmiSector;
+            // its own geometric guess, either of which can disagree with the specific sector the tag
+            // actually resolved under. Reasserted only for the flight this call itself just activated
+            // - the already-activated branch below never touches ControllingSector, exactly as before
+            // this change.
+            fdr.ControllingSector = mmiSector;
+
+            ActionLog.Log("Tag", $"Activated {fdr.Callsign} into {mmiSector.Name} (was never activated)");
         }
 
         // Still not eligible even after activating - e.g. no route to establish against - or already
@@ -210,11 +299,6 @@ public class TagOwnershipSync
                 return;
         }
 
-        // This is what MMI.SetTrackState's STATE_HANDOVER_FIRST case matches HandoffSector against
-        // to decide HandoverIn - get it wrong and the flash silently never lights.
-        if (mmiSector == null)
-            return;
-
         OfferPickup(fdr, mmiSector);
     }
 
@@ -240,6 +324,8 @@ public class TagOwnershipSync
         var track = MMI.FindTrack(fdr);
         if (track != null)
             MMI.SetTrackState(track);
+
+        ActionLog.Log("Tag", $"Flashed {fdr.Callsign} in for pickup into {mmiSector.Name}");
     }
 
     // Trigger (b) - see the class comment. Every flight this controller is tracking that was
@@ -258,7 +344,10 @@ public class TagOwnershipSync
             foreach (var fdr in FDP2.GetFDRs.Where(f => f.IsTrackedByMe))
             {
                 if (ResolveSector(fdr)?.Equals(lost) == true)
+                {
                     MMI.HandoffJurisdiction(fdr, lost);
+                    ActionLog.Log("Tag", $"Handed off {fdr.Callsign} - lost {lost.Name}");
+                }
             }
         }
 

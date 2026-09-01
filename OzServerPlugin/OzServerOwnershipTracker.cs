@@ -468,6 +468,7 @@ public class OzServerOwnershipTracker
         try
         {
             await _api.ClaimSectorAsync(sector.Name);
+            ActionLog.Log("Ownership", $"Claimed {sector.Name}");
         }
         catch (OzServerApiException ex) when (ex.StatusCode == 409 && ex.Conflicts.Count > 0)
         {
@@ -518,6 +519,7 @@ public class OzServerOwnershipTracker
             {
                 await _api.ReleaseSectorAsync(sector.Name);
                 result.Released.Add(sector.Name);
+                ActionLog.Log("Ownership", $"Released {sector.Name}");
             }
             catch (Exception ex)
             {
@@ -534,6 +536,7 @@ public class OzServerOwnershipTracker
             {
                 await _api.ClaimSectorAsync(sector.Name);
                 result.Claimed.Add(sector.Name);
+                ActionLog.Log("Ownership", $"Claimed {sector.Name}");
             }
             catch (OzServerApiException ex) when (ex.StatusCode == 409 && ex.Conflicts.Count > 0)
             {
@@ -570,6 +573,7 @@ public class OzServerOwnershipTracker
             {
                 await _api.ClaimSectorAsync(sector.Name, conflicts.Select(c => c.Sector));
                 result.Claimed.Add(sector.Name);
+                ActionLog.Log("Ownership", $"Claimed {sector.Name} (excluding {string.Join(", ", conflicts.Select(c => c.Sector))})");
             }
             catch (Exception ex)
             {
@@ -591,6 +595,7 @@ public class OzServerOwnershipTracker
         try
         {
             await _api.ReleaseSectorAsync(sector.Name);
+            ActionLog.Log("Ownership", $"Released {sector.Name}");
         }
         catch (Exception ex)
         {
@@ -605,7 +610,9 @@ public class OzServerOwnershipTracker
         if (!Network.IsConnected)
             return null;
 
-        return await _api.RequestSectorAsync(sector.Name);
+        var request = await _api.RequestSectorAsync(sector.Name);
+        ActionLog.Log("Request", $"Requested {sector.Name} from {request.TargetCallsign}");
+        return request;
     }
 
     public async Task AcceptRequestAsync(int requestId)
@@ -614,6 +621,7 @@ public class OzServerOwnershipTracker
             return;
 
         await _api.AcceptRequestAsync(requestId);
+        ActionLog.Log("Ownership", $"Accepted request #{requestId}");
         await RefreshFromServerAsync();
     }
 
@@ -628,6 +636,8 @@ public class OzServerOwnershipTracker
             return new List<OzServerAcceptBatchResultDto>();
 
         var response = await _api.AcceptRequestsBatchAsync(requestIds);
+        foreach (var result in response.Results)
+            ActionLog.Log("Ownership", $"Accepted request #{result.RequestId} ({result.Sector}): {(result.Accepted ? "ok" : result.Message)}");
         await RefreshFromServerAsync();
         return response.Results;
     }
@@ -750,7 +760,8 @@ public class OzServerOwnershipTracker
 
                 try
                 {
-                    await _api.RequestSectorAsync(conflictSector.Name);
+                    var request = await _api.RequestSectorAsync(conflictSector.Name);
+                    ActionLog.Log("Request", $"Requested {conflictSector.Name} from {request.TargetCallsign}");
                 }
                 catch (Exception ex)
                 {

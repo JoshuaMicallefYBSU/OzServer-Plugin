@@ -179,6 +179,37 @@ public class OzServerFdrUpdateDto
     [JsonProperty("current_sector")] public string? CurrentSector { get; set; }
 }
 
+// One row from GET /fdr/sync (FlightDataRecordController::sync) - OzServer's own live copy of a
+// flight, for FdrActivationSync to compare against this client's local FDP2.FDR. Same field set as
+// OzServerFdrUpdateDto (same table) plus the three fields that DTO never needs to send back up:
+// State/Callsign (needed here just to identify and compare rows) and LastSeenAt (not currently
+// used - the endpoint itself only ever returns live rows, see its own comment - but kept so a
+// future caller doesn't have to touch the DTO to get at it).
+public class OzServerFdrRecordDto
+{
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    [JsonProperty("state")] public string? State { get; set; }
+    [JsonProperty("flight_rules")] public string? FlightRules { get; set; }
+    [JsonProperty("aircraft_type")] public string? AircraftType { get; set; }
+    [JsonProperty("aircraft_equip")] public string? AircraftEquip { get; set; }
+    [JsonProperty("aircraft_surv_equip")] public string? AircraftSurvEquip { get; set; }
+    [JsonProperty("aircraft_count")] public int? AircraftCount { get; set; }
+    [JsonProperty("dep_airport")] public string? DepAirport { get; set; }
+    [JsonProperty("des_airport")] public string? DesAirport { get; set; }
+    [JsonProperty("route")] public string? Route { get; set; }
+    [JsonProperty("rfl")] public int? Rfl { get; set; }
+    [JsonProperty("cfl_lower")] public int? CflLower { get; set; }
+    [JsonProperty("cfl_upper")] public int? CflUpper { get; set; }
+    [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
+    [JsonProperty("atd")] public DateTime? Atd { get; set; }
+    [JsonProperty("etd")] public DateTime? Etd { get; set; }
+    [JsonProperty("eet_minutes")] public int? EetMinutes { get; set; }
+    [JsonProperty("tas")] public int? Tas { get; set; }
+    [JsonProperty("label_op_data")] public string? LabelOpData { get; set; }
+    [JsonProperty("remarks")] public string? Remarks { get; set; }
+    [JsonProperty("last_seen_at")] public DateTimeOffset? LastSeenAt { get; set; }
+}
+
 // AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
 // vatsys.ATIS's own content/letter actually changes (there is deliberately no periodic heartbeat -
 // see AtisSync's own comment), so this always represents a real broadcast update, not a liveness
@@ -354,6 +385,11 @@ public class OzServerApiClient
     public Task UpdateFdrBatchAsync(IEnumerable<OzServerFdrUpdateDto> flights) =>
         PostAsync("/fdr/batch", new { flights = flights.ToArray() });
 
+    // FlightDataRecordController::sync - every FDR row OzServer currently holds, for
+    // FdrActivationSync's own comparison against local FDP2.FDR state.
+    public Task<List<OzServerFdrRecordDto>> GetFdrSyncAsync() =>
+        GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
+
     // AtisController::update - upserts this ICAO's current ATIS state, keyed by icao.
     public Task UpdateAtisAsync(OzServerAtisUpdateDto atis) => PostAsync("/atis", atis);
 
@@ -369,7 +405,9 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException(DescribeTransportFailure(ex));
+            var transportMessage = DescribeTransportFailure(ex);
+            ActionLog.LogAttempt("GET", path, false, transportMessage);
+            throw new OzServerApiException(transportMessage);
         }
 
         using (response)
@@ -378,9 +416,11 @@ public class OzServerApiClient
             if (!response.IsSuccessStatusCode)
             {
                 var (message, conflicts) = ParseError(body, (int)response.StatusCode);
+                ActionLog.LogAttempt("GET", path, false, message);
                 throw new OzServerApiException(message, (int)response.StatusCode, conflicts);
             }
 
+            ActionLog.LogAttempt("GET", path, true);
             return JsonConvert.DeserializeObject<T>(body) ?? empty();
         }
     }
@@ -421,7 +461,9 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException(DescribeTransportFailure(ex));
+            var transportMessage = DescribeTransportFailure(ex);
+            ActionLog.LogAttempt("POST", path, false, transportMessage);
+            throw new OzServerApiException(transportMessage);
         }
 
         using (response)
@@ -430,9 +472,11 @@ public class OzServerApiClient
             if (!response.IsSuccessStatusCode)
             {
                 var (message, conflicts) = ParseError(responseBody, (int)response.StatusCode);
+                ActionLog.LogAttempt("POST", path, false, message);
                 throw new OzServerApiException(message, (int)response.StatusCode, conflicts);
             }
 
+            ActionLog.LogAttempt("POST", path, true);
             return responseBody;
         }
     }

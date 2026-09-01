@@ -33,6 +33,7 @@ public class Plugin : IPlugin
     readonly AfvSectorClaimer _afvSectorClaimer;
     readonly OzServerOwnershipTracker _ownershipTracker;
     readonly FdrSync _fdrSync;
+    readonly FdrActivationSync _fdrActivationSync;
     readonly TagOwnershipSync _tagOwnershipSync;
     readonly AtisSync _atisSync;
     readonly BadVectorsAtisSync _badVectorsAtisSync;
@@ -53,10 +54,16 @@ public class Plugin : IPlugin
         _ownershipTracker = new OzServerOwnershipTracker();
         _afvSectorClaimer = new AfvSectorClaimer();
         _fdrSync = new FdrSync();
-        // After the tracker, which it reads live subsector ownership through, and after FdrSync,
-        // which it calls into to clear OzServer's own record of who holds a tag the moment this
-        // controller drops it to none (see TagOwnershipSync.OnFdrsChanged).
-        _tagOwnershipSync = new TagOwnershipSync(_ownershipTracker, _fdrSync);
+        // Purely timer/poll-driven, same as _ownershipTracker - constructed unconditionally so a
+        // flight stuck at STATE_PREACTIVE gets corrected whether or not any plugin window is ever
+        // opened. See its own class comment for why this is a separate concern from FdrSync/
+        // TagOwnershipSync rather than folded into either.
+        _fdrActivationSync = new FdrActivationSync();
+        // After the tracker, which it reads live subsector ownership through; after FdrSync, which
+        // it calls into to clear OzServer's own record of who holds a tag the moment this controller
+        // drops it to none (see TagOwnershipSync.OnFdrsChanged); and after FdrActivationSync, whose
+        // IsKnownToServer it reads to gate its own airborne/near-boundary pre-activation trigger.
+        _tagOwnershipSync = new TagOwnershipSync(_ownershipTracker, _fdrSync, _fdrActivationSync);
         _atisSync = new AtisSync();
         _badVectorsAtisSync = new BadVectorsAtisSync();
         // After the tracker, which it releases through.

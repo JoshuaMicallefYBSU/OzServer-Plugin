@@ -2614,6 +2614,7 @@ public class OzServerSectorsWindow : BaseForm
         try
         {
             await _api.RejectRequestAsync(request.Id);
+            ActionLog.Log("Ownership", $"Rejected request #{request.Id} for {request.Sector.Name} from {request.Controller}");
             await RefreshRequestedChangesAsync();
             RefreshAllListsAsync();
         }
@@ -2638,6 +2639,7 @@ public class OzServerSectorsWindow : BaseForm
         try
         {
             await _api.CancelRequestAsync(request.Id);
+            ActionLog.Log("Ownership", $"Cancelled request #{request.Id} for {request.Sector.Name}");
             await RefreshRequestedChangesAsync();
             RefreshAllListsAsync();
         }
