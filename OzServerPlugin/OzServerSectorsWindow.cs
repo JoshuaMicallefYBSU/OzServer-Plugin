@@ -128,6 +128,23 @@ public class OzServerSectorsWindow : BaseForm
     // everything else rather than only when Controlled happens to be showing.
     // Online controllers by callsign, rebuilt once per populate - see RefreshOnlineControllerIndex.
     readonly Dictionary<string, NetworkATC> _onlineByCallsign = new(StringComparer.OrdinalIgnoreCase);
+    // Memoizes ShouldListAsAvailable/ResolveDisplayController for the lifetime of one
+    // PopulateAvailableList pass - see the Clear() calls there. Keyed by name, not the Sector
+    // instance, for the same reason every other Owned/Available comparison in this window is.
+    readonly Dictionary<string, bool> _availabilityCache = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, NetworkATC?> _displayControllerCache = new(StringComparer.OrdinalIgnoreCase);
+    // One canonical TreeNode built per sector per populate pass, cloned (TreeNode.Clone() is a
+    // plain managed deep copy - Text/Name/Tag/NodeFont/ToolTipText and every descendant node, no
+    // native calls) wherever else that same sector needs to appear: its own top-level row and again
+    // under every other primary that covers it (Available - see PopulateAvailableList), or under
+    // more than one owned primary at once (Owned, when two held primaries' groupings overlap).
+    // Rebuilding the whole recursive subtree from scratch for every placement - re-walking
+    // SectorGroupings, re-formatting text, re-running IsCoveredByOwned/FindController - was the
+    // actual cost behind a category with several such primaries feeling slow to redraw on expand.
+    // Cleared at the top of the matching Populate* method; see BuildOwnedSectorNode/
+    // BuildAvailableSectorNode.
+    readonly Dictionary<string, TreeNode> _ownedNodeCache = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, TreeNode?> _availableNodeCache = new(StringComparer.OrdinalIgnoreCase);
     // Names from _controlledSnapshot as a set, so the Available filter is a hash lookup per sector
     // rather than a linear scan of the whole response per sector.
     readonly HashSet<string> _controlledNames = new(StringComparer.OrdinalIgnoreCase);
@@ -1523,6 +1540,9 @@ public class OzServerSectorsWindow : BaseForm
     // dropdown or scroll the list back to the top out from under them.
     void PopulateOwnedList()
     {
+        // See _ownedNodeCache - cleared per pass, not per call site.
+        _ownedNodeCache.Clear();
+
         var sectorNodes = new List<TreeNode>();
         foreach (var key in _sectorsSelected)
         {
@@ -1582,11 +1602,26 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
+    // Cached and cloned per sector name for the lifetime of one PopulateOwnedList pass (see
+    // _ownedNodeCache) - two held primaries whose groupings overlap on a shared sub-sector would
+    // otherwise have that sub-sector's whole subtree rebuilt from scratch a second time. The
+    // recursive call below goes through this wrapper, not the Core method directly, so a deeply
+    // nested repeat benefits too.
+    TreeNode BuildOwnedSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    {
+        if (_ownedNodeCache.TryGetValue(sector.Name, out var cached))
+            return (TreeNode)cached.Clone();
+
+        var node = BuildOwnedSectorNodeCore(sector, depth);
+        _ownedNodeCache[sector.Name] = node;
+        return (TreeNode)node.Clone();
+    }
+
     // Recurses through a grouping sector's own sub-sectors (e.g. TBD > AAE > AAW/AAR) - always
     // shown regardless of whether those sub-sectors are also independent _sectorsSelected entries,
     // since a grouping sector owns them outright. Every level that ends up with children gets its
     // own >/v treatment (see ApplySectorNodeText), not just the outermost one.
-    TreeNode BuildOwnedSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    TreeNode BuildOwnedSectorNodeCore(SectorsVolumes.Sector sector, int depth)
     {
         var node = new TreeNode { Tag = sector, NodeFont = _currSectorsView.Font };
 
@@ -1656,6 +1691,12 @@ public class OzServerSectorsWindow : BaseForm
 
         // Once for the whole pass, not once per sector - see FindController.
         RefreshOnlineControllerIndex();
+
+        // See _availabilityCache/_displayControllerCache/_availableNodeCache - cleared per pass,
+        // not per call site.
+        _availabilityCache.Clear();
+        _displayControllerCache.Clear();
+        _availableNodeCache.Clear();
 
         var candidates = SectorsVolumes.Sectors.Where(s => s.CSECEligible && ShouldListAsAvailable(s)).ToList();
 
@@ -1860,9 +1901,22 @@ public class OzServerSectorsWindow : BaseForm
     // Owned/Available decision in this window uses (see StageSectorChange), and the two used to
     // disagree here - the list filtered by name while the node builder filtered by Sector.Equals,
     // which is callsign-based.
-    bool ShouldListAsAvailable(SectorsVolumes.Sector sector) =>
-        !_sectorsSelected.Any(owned => !owned.IsDummy && owned.Name == sector.Name)
-        && !IsCoveredByOwned(sector);
+    //
+    // Memoized per populate pass (see _availabilityCache) - called once for every sector in
+    // SectorsVolumes.Sectors by the top-level candidate filter, and again by
+    // BuildAvailableSectorNode's own entry check for that same sector. The answer never changes
+    // mid-pass (_sectorsSelected is fixed for the duration), so recomputing IsCoveredByOwned's scan
+    // on every one of those calls was pure waste.
+    bool ShouldListAsAvailable(SectorsVolumes.Sector sector)
+    {
+        if (_availabilityCache.TryGetValue(sector.Name, out var cached))
+            return cached;
+
+        var result = !_sectorsSelected.Any(owned => !owned.IsDummy && owned.Name == sector.Name)
+                     && !IsCoveredByOwned(sector);
+        _availabilityCache[sector.Name] = result;
+        return result;
+    }
 
     void ApplyAvailableSectorNodes(List<TreeNode> sectorNodes, string modePrefix)
     {
@@ -1924,12 +1978,30 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
+    // Cached and cloned per sector name for the lifetime of one PopulateAvailableList pass (see
+    // _availableNodeCache) - a sub-sector now deliberately gets built more than once per pass (its
+    // own top-level row, and again wherever a different primary nests it - see
+    // PopulateAvailableList), which used to mean re-walking that sector's own SectorGroupings and
+    // re-running ShouldListAsAvailable/ResolveDisplayController on every one of those repeats. The
+    // recursive call below goes through this wrapper, not the Core method directly, so a deeply
+    // nested repeat benefits too. null is cached like any other result - a sector that doesn't
+    // belong in Available at all is just as stable for the pass as one that does.
+    TreeNode? BuildAvailableSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    {
+        if (_availableNodeCache.TryGetValue(sector.Name, out var cached))
+            return (TreeNode?)cached?.Clone();
+
+        var node = BuildAvailableSectorNodeCore(sector, depth);
+        _availableNodeCache[sector.Name] = node;
+        return (TreeNode?)node?.Clone();
+    }
+
     // Recurses through a sector's own sub-sectors so a primary position nested at any depth (e.g.
     // AAE inside TBD, or AAW/AAR inside AAE) still gets its own dropdown treatment and its own
     // "who's on it" annotation. Returns null only if this sector doesn't belong in Available at all
     // - already this controller's own, in one form or another (see ShouldListAsAvailable); being
     // occupied or owned by someone else is no longer a reason to hide it, only to say so.
-    TreeNode? BuildAvailableSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    TreeNode? BuildAvailableSectorNodeCore(SectorsVolumes.Sector sector, int depth)
     {
         if (!ShouldListAsAvailable(sector))
             return null;
@@ -1968,10 +2040,18 @@ public class OzServerSectorsWindow : BaseForm
     // theirs, so seeing themselves here means the network hasn't caught up with a local unstage yet,
     // and displaying "(me)" on a row about to disappear on its own is more confusing than showing
     // nothing.
+    //
+    // Memoized per populate pass (see _displayControllerCache), same reasoning as
+    // ShouldListAsAvailable.
     NetworkATC? ResolveDisplayController(SectorsVolumes.Sector sector)
     {
+        if (_displayControllerCache.TryGetValue(sector.Name, out var cached))
+            return cached;
+
         var controller = FindController(sector);
-        return controller != null && controller.Callsign == Network.Callsign ? null : controller;
+        var result = controller != null && controller.Callsign == Network.Callsign ? null : controller;
+        _displayControllerCache[sector.Name] = result;
+        return result;
     }
 
     // Reads the per-populate snapshot, never Network.GetOnlineATCs directly.
