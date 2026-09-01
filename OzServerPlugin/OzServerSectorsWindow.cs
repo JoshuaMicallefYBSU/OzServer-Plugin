@@ -14,10 +14,15 @@ namespace OzServerPlugin;
 // "Sector Configuration Window") - see vatsys.SectorsWindow via the decompiled reference project.
 // They've since diverged: sectors are grouped under Flow/Centre/Approach/Tower/Other headers (by
 // Callsign suffix, matching the real Sectors.xml), and the right-hand list can toggle between
-// sectors nobody's on ("Available") and sectors someone else currently is ("Controlled"), so a
-// controller can browse to find who to ask. The arrow button below Requested Changes
-// claims/releases/requests depending on what's selected in Owned/Available; Accept/Reject/Cancel
-// act on whatever's selected in the Requested Changes tree.
+// every sector this controller doesn't already hold ("Available", annotated with who's on one if
+// anyone - see ShouldListAsAvailable) and specifically the ones OzServer says someone else actively
+// owns ("Controlled"), so a controller can browse to find who to ask. The arrow button, above
+// Accept/Reject and spanning
+// the same width as the Requested Changes list, claims/releases/requests depending on what's
+// selected in Owned/Available; Accept/Reject act on whatever's selected in the Requested Changes
+// tree and are disabled until that selection means something. There is no right-click menu - a
+// left click on any row with children (a category header, or a primary sector that bundles its
+// own sub-sectors) both selects and expands/collapses it.
 //
 // This window is a view, not the source of truth: _sectorsSelected always mirrors _tracker.Owned
 // (an OzServerOwnershipTracker shared across the whole plugin, constructed once in Plugin and
@@ -56,6 +61,10 @@ public class OzServerSectorsWindow : BaseForm
     const string ArrowIdle = "<<>>";
     const string CollapsedPrefix = "> ";
     const string ExpandedPrefix = "v ";
+    // Same width as CollapsedPrefix/ExpandedPrefix, so a leaf row's own text still lines up under a
+    // sibling that does have the arrow, instead of starting two characters further left - see
+    // ApplySectorNodeText and LeafText.
+    const string BlankPrefix = "  ";
 
     // Marks a TreeNode as a group header (Approach/Centre/.../Requested By Me/...) rather than a
     // selectable leaf, regardless of which tree it's in or what leaf-Tag type that tree otherwise
@@ -144,13 +153,6 @@ public class OzServerSectorsWindow : BaseForm
     readonly List<SectorsVolumes.Sector> _stagedRequests = new();
     bool _applyRunning;
 
-    // One menu for the window's lifetime, its items rebuilt per click, rather than a fresh
-    // ContextMenuStrip each time. The renderer it is given is vatSys's own shared instance (see
-    // VatSysContextMenu) - disposing a menu that holds it would take vatSys's built-in ComboField
-    // menus down with it, so there must be nothing here that ever gets disposed.
-    readonly ContextMenuStrip _nodeMenu = VatSysContextMenu.Create();
-
-
     readonly TableLayoutPanel _tableLayoutPanel1;
     readonly TextLabel _currentSectorsLabel;
     readonly TextLabel _requestedChangesLabel;
@@ -159,10 +161,12 @@ public class OzServerSectorsWindow : BaseForm
     readonly GenericButton _arrowButton;
     readonly ToggleGenericButton _availableModeButton;
     readonly ToggleGenericButton _controlledModeButton;
-    // Accept/Reject/Cancel are no longer buttons. Every one of them was only ever a second way to
-    // invoke what the right-click menu already offers on the row itself, and each needed its own
-    // enable/disable rules kept in step with that menu's. Removing them gives the list the height
-    // back and leaves exactly one place those actions live.
+    // Act on whatever's selected in _requestedChangesView - see UpdateRequestActionButtons for the
+    // enable rules (the same two rules the old right-click menu used to gate its own Accept/Reject
+    // on).
+    readonly GenericButton _acceptButton;
+    readonly GenericButton _rejectButton;
+    readonly FlowLayoutPanel _requestActionsPanel;
     readonly FlowLayoutPanel _sectorListModePanel;
     readonly FlowLayoutPanel _currSectorsFlowPanel;
     readonly FlowLayoutPanel _addRemoveLayoutPanel;
@@ -212,7 +216,6 @@ public class OzServerSectorsWindow : BaseForm
         _availSectorsView.DrawNode += SectorsView_DrawNode;
         _availSectorsView.BeforeSelect += TreeView_BeforeSelect;
         _availSectorsView.NodeMouseClick += TreeView_NodeMouseClick;
-        _availSectorsView.MouseUp += TreeView_MouseUp;
         _availSectorsView.MouseWheel += AvailSectorsView_MouseWheel;
         _availSectorsView.AfterSelect += AvailSectorsView_AfterSelect;
         _availSectorsView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
@@ -239,7 +242,6 @@ public class OzServerSectorsWindow : BaseForm
         _currSectorsView.DrawNode += SectorsView_DrawNode;
         _currSectorsView.BeforeSelect += TreeView_BeforeSelect;
         _currSectorsView.NodeMouseClick += TreeView_NodeMouseClick;
-        _currSectorsView.MouseUp += TreeView_MouseUp;
         _currSectorsView.MouseWheel += CurrSectorsView_MouseWheel;
         _currSectorsView.AfterSelect += CurrSectorsView_AfterSelect;
         _currSectorsView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
@@ -272,7 +274,6 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView.DrawNode += SectorsView_DrawNode;
         _requestedChangesView.BeforeSelect += TreeView_BeforeSelect;
         _requestedChangesView.NodeMouseClick += TreeView_NodeMouseClick;
-        _requestedChangesView.MouseUp += TreeView_MouseUp;
         _requestedChangesView.MouseWheel += RequestedChangesView_MouseWheel;
         _requestedChangesView.AfterSelect += (_, _) => UpdateRequestActionButtons();
         _requestedChangesView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
@@ -407,16 +408,40 @@ public class OzServerSectorsWindow : BaseForm
         {
             Anchor = AnchorStyles.None,
             Enabled = false,
-            Margin = new Padding(3, 8, 3, 3),
+            Margin = new Padding(0, 8, 0, 3),
             Name = "arrowButton",
-            // 90x28, matching vatsys.SectorsWindow's own addButton exactly - every other metric in
-            // this window (inset panels 270x331, trees 265x324, scrollbars 20x331, column panels
-            // 298x337, Apply/Cancel 80x30) already matches it; this button did not.
-            Size = new Size(90, 28),
+            // As wide as the Requested Changes list above it (298, see _requestedListRow) rather
+            // than vatsys.SectorsWindow's own 90x28 addButton - sitting between that list and
+            // Accept/Reject below, it reads as a divider spanning the column, not a small button
+            // floating in the middle of it.
+            Size = new Size(298, 28),
             TabIndex = 16,
             Text = ArrowIdle,
         };
         _arrowButton.Click += ArrowButton_Click;
+
+        _acceptButton = CreateRequestActionButton("Accept");
+        _acceptButton.Size = new Size(145, 30);
+        _acceptButton.TabIndex = 23;
+        _acceptButton.Click += (_, _) => _ = AcceptSelectedRequestsAsync(_requestedChangesView.SelectedNode);
+
+        _rejectButton = CreateRequestActionButton("Reject");
+        _rejectButton.Size = new Size(145, 30);
+        _rejectButton.TabIndex = 24;
+        _rejectButton.Click += (_, _) => _ = RejectSelectedRequestAsync(_requestedChangesView.SelectedNode);
+
+        _requestActionsPanel = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = new Padding(0, 3, 0, 0),
+            Name = "requestActionsPanel",
+            TabIndex = 25
+        };
+        _requestActionsPanel.Controls.Add(_acceptButton);
+        _requestActionsPanel.Controls.Add(_rejectButton);
 
         _requestedChangesPanel = new FlowLayoutPanel
         {
@@ -431,6 +456,7 @@ public class OzServerSectorsWindow : BaseForm
         };
         _requestedChangesPanel.Controls.Add(_requestedListRow);
         _requestedChangesPanel.Controls.Add(_arrowButton);
+        _requestedChangesPanel.Controls.Add(_requestActionsPanel);
 
         _currentSectorsLabel = new TextLabel
         {
@@ -794,16 +820,12 @@ public class OzServerSectorsWindow : BaseForm
         ConfigureRequestedScrollbar();
     }
 
-    // A left click only selects a row. Expand/collapse is no longer a mouse button of its own -
-    // it, and every action the window can perform on a row, is a command on the right-click menu
-    // (see ShowNodeContextMenu). Keeping expansion off left click is what stops a claimable primary
-    // sector reflowing the list out from under the pointer at the moment it is being selected.
+    // TreeView's native left-button double-click toggles a node even with ShowPlusMinus=false.
+    // TreeViewCancelEventArgs does not distinguish that native toggle from a direct
+    // TreeNode.Expand/Collapse call, so explicitly allow only ToggleNodeExpansion's own call and
+    // the programmatic expansion-state restore performed during a rebuild.
     void TreeView_BeforeMouseExpandCollapse(object? sender, TreeViewCancelEventArgs e)
     {
-        // TreeView's native left-button double-click toggles a node even with ShowPlusMinus=false.
-        // TreeViewCancelEventArgs does not distinguish that native toggle from a direct
-        // TreeNode.Expand/Collapse call, so explicitly allow only the menu's own Expand/Collapse
-        // command and the programmatic expansion-state restore performed during a rebuild.
         if (!_allowTreeToggle && !_rebuildingTree)
             e.Cancel = true;
     }
@@ -819,16 +841,14 @@ public class OzServerSectorsWindow : BaseForm
         // simply be cancelled, so it is only done for rows that can actually take it.
         treeView.SelectedNode = e.Node;
 
-        // The category headers - the position types (Approach/Centre/Tower/...) in Owned and
-        // Available, and Requested By/From Me - are pure grouping rows with nothing to claim,
-        // release or accept, so a left click on one has no other job to do and opening the group is
-        // the only thing it could sensibly mean. Everything else keeps expansion on the right-click
-        // menu: those rows are selectable targets first, and reflowing the list underneath the
-        // pointer as one is selected is the behaviour this window was moved away from.
-        // A heading with no Name is one of the Requested ones - not collapsible, so a left click on
-        // it only selects (which is still meaningful: selecting "Requested From Me" is the
+        // Any row with children - a category header (Approach/Centre/Tower/..., Requested By/From
+        // Me), or a primary sector that bundles its own sub-sectors (see ApplySectorNodeText) -
+        // toggles open/closed on the same click that selects it. There is no right-click menu to
+        // fall back on for expanding a primary any more, so the one click has to do both. A heading
+        // with no Name is one of the Requested ones - not collapsible, so a left click on it only
+        // selects (which is still meaningful: selecting "Requested From Me" is the
         // accept-everything-incoming gesture).
-        if (IsCategoryNode(e.Node) && !string.IsNullOrEmpty(e.Node.Name))
+        if (!string.IsNullOrEmpty(e.Node.Name))
             ToggleNodeExpansion(treeView, e.Node);
     }
 
@@ -849,105 +869,6 @@ public class OzServerSectorsWindow : BaseForm
     // The Requested From Me heading, on the lit half of its flash cycle, while requests are waiting.
     bool IsFlashingHeading(TreeNode node) =>
         _fromMeHasPending && _flashOn && IsCategoryNode(node) && node.Text == RequestedFromMeName;
-
-    // Right click opens the menu. Driven from MouseUp rather than NodeMouseClick because that event
-    // only fires when the click lands on a node's own label - a right click just below the last row,
-    // or in the indent to its left, produces nothing at all. MouseUp always arrives, and the node is
-    // recovered by hit-testing the click point, so a click anywhere on the row works.
-    void TreeView_MouseUp(object? sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Right)
-            return;
-
-        var treeView = (TreeViewEx)sender!;
-        var node = treeView.GetNodeAt(e.Location);
-        if (node == null)
-            return;
-
-        // Select first: every command the menu offers derives from the selection rather than being
-        // handed the node separately - Accept's "one row or the whole category" split (see
-        // GetRequestsToAccept) most of all - so the clicked row has to *be* the selection for the
-        // menu to describe what it will actually do.
-        treeView.SelectedNode = node;
-        ShowNodeContextMenu(treeView, node, e.Location);
-    }
-
-    // The right-click menu: every command that applies to a row, in one place, on whichever of the
-    // three trees was clicked. Commands that don't apply to this row are shown greyed rather than
-    // dropped, so the menu keeps one shape and one item order to aim at regardless of what was
-    // clicked - a menu that grows and shrinks per row is far harder to use without looking.
-    void ShowNodeContextMenu(TreeViewEx treeView, TreeNode node, Point location)
-    {
-        var menu = _nodeMenu;
-
-        // Rebuilt rather than recreated. Items.Clear() does not dispose what it removes and each
-        // rebuild allocates a fresh set, so the old ones are disposed explicitly - but the menu
-        // itself never is, because it holds vatSys's shared renderer (see the _nodeMenu field).
-        var previousItems = menu.Items.Cast<ToolStripItem>().ToList();
-        menu.Items.Clear();
-        foreach (var item in previousItems)
-            item.Dispose();
-
-        VatSysContextMenu.ApplyRenderer(menu);
-
-        menu.Items.Add(VatSysContextMenu.CreateHeader(HeaderTextFor(node)));
-        menu.Items.Add(new ToolStripSeparator());
-
-        var expandCollapse = new ToolStripMenuItem("Expand/Collapse") { Enabled = node.Nodes.Count > 0 };
-        expandCollapse.Click += (_, _) => ToggleNodeExpansion(treeView, node);
-        menu.Items.Add(expandCollapse);
-        menu.Items.Add(new ToolStripSeparator());
-
-        // Request commands read the same state the Accept/Reject buttons do, so a row that the
-        // buttons would refuse to act on greys out here for the identical reason.
-        //
-        // Gated on the clicked tree being Requested Changes, because both commands resolve what
-        // they act on from _requestedChangesView's *selection*, not from the node clicked here (see
-        // GetRequestsToAccept). Right-clicking a row in Owned or Available leaves that selection
-        // untouched, so without this an unrelated request left selected in the other panel would
-        // show as Accept-able from a sector row - and accepting it would hand away a sector the
-        // controller was not even looking at.
-        var request = FindOwningRequest(node);
-        var requestsActionable = ReferenceEquals(treeView, _requestedChangesView)
-                                 && !_requestActionRunning
-                                 && Network.IsConnected;
-
-        var accept = new ToolStripMenuItem("Accept")
-        {
-            Enabled = requestsActionable && GetRequestsToAccept(node).Count > 0
-        };
-        accept.Click += (_, _) => _ = AcceptSelectedRequestsAsync(node);
-        menu.Items.Add(accept);
-
-        var reject = new ToolStripMenuItem("Reject")
-        {
-            Enabled = requestsActionable && request != null && CategoryNameOf(node) == RequestedFromMeName
-        };
-        reject.Click += (_, _) => _ = RejectSelectedRequestAsync(node);
-        menu.Items.Add(reject);
-        menu.Items.Add(new ToolStripSeparator());
-
-        // Add/Remove are this menu's wording for the same staged move the arrow button makes, and
-        // work from any of the three trees: a request row resolves to the sector it is about, so an
-        // incoming request can be staged without first hunting that sector down in Available.
-        //
-        // Not gated on being connected: staging is local, and Apply is the only thing that needs the
-        // network. Only an Apply already in flight blocks it, so the selection being committed can't
-        // move underneath it.
-        var sector = SectorForNode(node);
-        var owned = sector != null && IsOwned(sector);
-        var sectorActionable = sector != null && !_applyRunning;
-
-        var add = new ToolStripMenuItem("Add") { Enabled = sectorActionable && !owned };
-        add.Click += (_, _) => RunSectorAction(sector!, add: true);
-        menu.Items.Add(add);
-
-        var remove = new ToolStripMenuItem("Remove") { Enabled = sectorActionable && owned };
-        remove.Click += (_, _) => RunSectorAction(sector!, add: false);
-        menu.Items.Add(remove);
-
-        menu.Show(treeView, location);
-    }
 
     // Removes the row for one sector, and the group heading with it if that leaves it empty - which
     // is what a rebuild would have produced. Only ever touches top-level group children: a sector
@@ -992,26 +913,6 @@ public class OzServerSectorsWindow : BaseForm
 
         return false;
     }
-
-    // What the menu is acting on, as its title row. Category headers carry the plain name in Name
-    // (Text has the >/v prefix bolted on); sector rows carry it in Text, with the trailing "*" that
-    // marks "bundles sub-sectors" trimmed off - it is list notation, not part of the sector's name.
-    static string HeaderTextFor(TreeNode node) =>
-        string.IsNullOrEmpty(node.Name) ? node.Text.TrimEnd('*') : node.Name;
-
-    // The sector a row is about, whichever tree it came from: Owned and Available rows are tagged
-    // with the sector itself, Requested Changes rows with the request, whose Sector is the subject.
-    static SectorsVolumes.Sector? SectorForNode(TreeNode node) => node.Tag switch
-    {
-        SectorsVolumes.Sector sector => sector,
-        SectorChangeRequest request => request.Sector,
-        _ => FindOwningRequest(node)?.Sector
-    };
-
-    // Name comparison rather than Contains - the same footing vatsys.SectorsWindow's own
-    // available-list filter uses (see PopulateAvailableList).
-    bool IsOwned(SectorsVolumes.Sector sector) =>
-        _sectorsSelected.Any(s => !s.IsDummy && s.Name == sector.Name);
 
     // Whether this row is part of an uncommitted change - a sector staged into Owned that OzServer
     // does not yet record as this controller's, or one staged out that it still does. Both
@@ -1141,16 +1042,32 @@ public class OzServerSectorsWindow : BaseForm
         e.Graphics.Clip = previousClip;
     }
 
-    // Group headers (Approach/Centre/.../Requested By Me/...) get the >/v expand-collapse prefix
-    // (see RefreshDropdownNodeText below) since ShowPlusMinus is off. Primary-position sectors
-    // that bundle their own sub-sectors (e.g. AAE, TBD) instead get a trailing "*" - matching
-    // vatsys.SectorsWindow's own convention for this case - and no dynamic refresh, since a plain
-    // suffix doesn't need to track expand state the way the header prefix does.
+    // Group headers (Approach/Centre/.../Requested By Me/...) and primary-position sectors that
+    // bundle their own sub-sectors (e.g. AAE, TBD) both get the same >/v expand-collapse prefix
+    // (see SetDropdownNodeText) since ShowPlusMinus is off - there is no right-click menu left to
+    // fall back on for expanding a primary, so it needs the same click affordance a header has.
+    // baseText becomes the node's Name, which is what both SetDropdownNodeText and
+    // TreeView_NodeMouseClick's toggle-on-click key off; a leaf sector keeps Name empty so it reads
+    // as plain text and does not toggle.
     static void ApplySectorNodeText(TreeNode node, string baseText)
     {
-        node.Text = node.Nodes.Count > 0 ? baseText + "*" : baseText;
+        if (node.Nodes.Count > 0)
+        {
+            node.Name = baseText;
+            SetDropdownNodeText(node, node.IsExpanded);
+            return;
+        }
+
+        node.Name = string.Empty;
+        node.Text = LeafText(baseText);
         node.ToolTipText = node.Text;
     }
+
+    // A leaf row's text, padded to reserve the space a sibling's >/v prefix would occupy - see
+    // BlankPrefix. Used by ApplySectorNodeText and everywhere else a leaf is built directly (the
+    // self-referencing "primary that is also its own sub-sector" case - see BuildOwnedSectorNode -
+    // and a not-yet-applied staged request row).
+    static string LeafText(string baseText) => BlankPrefix + baseText;
 
     static void RefreshDropdownNodeText(TreeNode node) => SetDropdownNodeText(node, node.IsExpanded);
 
@@ -1668,7 +1585,7 @@ public class OzServerSectorsWindow : BaseForm
     // Recurses through a grouping sector's own sub-sectors (e.g. TBD > AAE > AAW/AAR) - always
     // shown regardless of whether those sub-sectors are also independent _sectorsSelected entries,
     // since a grouping sector owns them outright. Every level that ends up with children gets its
-    // own "*" treatment (see ApplySectorNodeText), not just the outermost one.
+    // own >/v treatment (see ApplySectorNodeText), not just the outermost one.
     TreeNode BuildOwnedSectorNode(SectorsVolumes.Sector sector, int depth = 0)
     {
         var node = new TreeNode { Tag = sector, NodeFont = _currSectorsView.Font };
@@ -1688,7 +1605,7 @@ public class OzServerSectorsWindow : BaseForm
             foreach (var child in children)
             {
                 node.Nodes.Add(ReferenceEquals(child, sector)
-                    ? new TreeNode(FormatSectorText(child)) { Tag = child, NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
+                    ? new TreeNode(LeafText(FormatSectorText(child))) { Tag = child, NodeFont = node.NodeFont, ToolTipText = LeafText(FormatSectorText(child)) }
                     : BuildOwnedSectorNode(child, depth + 1));
             }
         }
@@ -1697,13 +1614,22 @@ public class OzServerSectorsWindow : BaseForm
         return node;
     }
 
-    // Available and Controlled are two genuinely different data sources, not just a filter over
-    // the same one: Available is "nobody's live on this frequency right now" (checked locally,
-    // synchronously, against the live VATSIM feed - see TryMatchAvailable), because that's a
-    // meaningful thing to know even for a sector OzServer's database has never heard of. Controlled
-    // is specifically "OzServer has an active ownership record for this, owned by someone else"
-    // (see PopulateControlledListAsync) - a sector some stray callsign is logged into on VATSIM
-    // but that was never actually claimed through here correctly does *not* show up as Controlled.
+    // Available lists every CSEC-eligible sector this controller doesn't already hold - the same
+    // basic rule vatsys.SectorsWindow.PopulateLists uses for its own single list (CSECEligible,
+    // not already in sectorsSelected) - annotated with who's currently on it, if anyone, purely for
+    // information (see ResolveDisplayController). It does NOT hide a sector because someone else is
+    // on it or OzServer already has an ownership record for them: that used to gate inclusion
+    // entirely (see ShouldListAsAvailable's predecessor, IsClaimable), which meant a sector nobody
+    // had "cleanly" claimed yet was invisible here even though vatsys's own window would show it -
+    // the controller had no way to even see it existed in order to request it. Staging one anyway
+    // still does the right thing on Apply: IsOwnedByAnotherController is what StageSectorChange
+    // reads to turn that into a request instead of a claim, and the server has its own final say
+    // regardless of what this list chose to show.
+    //
+    // Controlled is a different data source entirely: "OzServer has an active ownership record for
+    // this, owned by someone else" (see RenderControlledList) - a sector some stray callsign is
+    // logged into on VATSIM but that was never actually claimed through here correctly does *not*
+    // show up as Controlled, and Controlled is unaffected by any of the above.
     void PopulateAvailableList()
     {
         if (_sectorListMode == SectorListMode.Controlled)
@@ -1715,42 +1641,17 @@ public class OzServerSectorsWindow : BaseForm
         // Once for the whole pass, not once per sector - see FindController.
         RefreshOnlineControllerIndex();
 
-        var claimable = SectorsVolumes.Sectors.Where(s => s.CSECEligible && IsClaimable(s)).ToList();
+        var candidates = SectorsVolumes.Sectors.Where(s => s.CSECEligible && ShouldListAsAvailable(s)).ToList();
 
-        // The same subordination rule PopulateOwnedList and RenderControlledList already apply, and
-        // whose absence here was a real bug rather than an inconsistency: a sector covered by
-        // another claimable sector belongs nested inside that sector's subtree, not at top level as
-        // well.
-        //
-        // BuildAvailableSectorNode renders a grouping sector's whole covered set as children, so
-        // without this every one of those sectors was drawn twice - once under its parent and once
-        // as its own row. Brisbane Approach is the clearest case: BAN declares
-        // ResponsibleSectors="BAS,BDN,BDS,SHN", so all four appeared under BAN *and* separately, and
-        // moving one row left the other sitting there looking like the move had not happened.
-        //
-        // Built as a set in one pass rather than an Any() per sector: this runs on every poll over
-        // ~300 sectors, and the pairwise form is a hundred thousand list scans a tick.
-        var subordinate = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var sector in claimable)
-        {
-            if (!SectorsVolumes.SectorGroupings.TryGetValue(sector, out var covered))
-                continue;
-
-            foreach (var child in covered)
-            {
-                // A sector that lists itself in its own grouping (see BuildOwnedSectorNode) is not
-                // subordinate to itself - suppressing it would drop it from the list entirely.
-                if (!child.Equals(sector))
-                    subordinate.Add(child.Name);
-            }
-        }
-
+        // Every candidate gets its own top-level row, in alphabetical order within its category
+        // (see OrderSectorNodes) - matching vatsys.SectorsWindow's own list exactly: a sub-sector is
+        // itself independently CSECEligible, so it is not suppressed here just because it also shows
+        // up nested under its primary's dropdown (see BuildAvailableSectorNode). Both are correct at
+        // once - "every sector, alphabetically" and "a primary also shows what it covers" are not in
+        // tension, they are just two different rows for the same sector.
         var sectorNodes = new List<TreeNode>();
-        foreach (var key in claimable)
+        foreach (var key in candidates)
         {
-            if (subordinate.Contains(key.Name))
-                continue;
-
             var node = BuildAvailableSectorNode(key);
             if (node != null)
                 sectorNodes.Add(node);
@@ -1828,7 +1729,7 @@ public class OzServerSectorsWindow : BaseForm
             foreach (var child in children)
             {
                 node.Nodes.Add(ReferenceEquals(child, sector)
-                    ? new TreeNode(ControlledSectorText(child, owners)) { Tag = child, NodeFont = node.NodeFont, ToolTipText = ControlledSectorText(child, owners) }
+                    ? new TreeNode(LeafText(ControlledSectorText(child, owners))) { Tag = child, NodeFont = node.NodeFont, ToolTipText = LeafText(ControlledSectorText(child, owners)) }
                     : BuildControlledSectorNode(child, owners, depth + 1));
             }
         }
@@ -1901,10 +1802,10 @@ public class OzServerSectorsWindow : BaseForm
         PopulateAvailableList();
     }
 
-    // Whether OzServer records this sector as someone else's right now. Distinct from the live
-    // VATSIM presence test in TryMatchAvailable, and the reason both are needed: a controller who
-    // reached a sector by extending into it is not logged in under that sector's callsign at all, so
-    // presence alone never sees them and the sector looked claimable when it was not.
+    // Whether OzServer records this sector as someone else's right now. Distinct from live VATSIM
+    // presence (see ResolveDisplayController/FindController) - a controller who reached a sector by
+    // extending into it is not logged in under that sector's callsign at all, so presence alone
+    // never sees them. This is what StageSectorChange reads to decide claim vs. request.
     bool IsOwnedByAnotherController(SectorsVolumes.Sector sector) =>
         _controlledNames.Contains(sector.Name);
 
@@ -1925,20 +1826,27 @@ public class OzServerSectorsWindow : BaseForm
             && SectorsVolumes.SectorGroupings.TryGetValue(owned, out var covered)
             && covered.Contains(sector));
 
-    // Everything that makes a sector claimable by this controller right now, in one place so the
-    // Available list and the nodes it builds can never disagree about which sectors are in it -
-    // PopulateAvailableList works out its nesting from this set, so a sector it considers claimable
-    // that BuildAvailableSectorNode then rejects would vanish from the list altogether.
+    // Whether a sector belongs in the Available list at all - matching vatsys.SectorsWindow's own
+    // rule for its one list (CSECEligible, not already sectorsSelected), not the narrower
+    // "claimable right now" test this used to be (nobody live on it, no OzServer ownership record
+    // for anyone else). That narrower test hid a sector the moment anyone else was on it, which
+    // meant a controller could not even see it existed here in order to request it - the sector was
+    // simply invisible until whoever had it left. What actually happens when one is staged and
+    // Apply'd is unaffected: StageSectorChange still reads IsOwnedByAnotherController itself to
+    // decide claim vs. request, independently of whether this list chose to show the sector.
+    //
+    // Only the two "this is already effectively mine" cases still exclude a sector - not "someone
+    // else has it": PopulateAvailableList works out its nesting from this same set, so a sector this
+    // considers a candidate that BuildAvailableSectorNode then rejects would vanish from the list
+    // altogether.
     //
     // Name comparison for the Owned test, not Contains: it is the footing every other
     // Owned/Available decision in this window uses (see StageSectorChange), and the two used to
     // disagree here - the list filtered by name while the node builder filtered by Sector.Equals,
     // which is callsign-based.
-    bool IsClaimable(SectorsVolumes.Sector sector) =>
+    bool ShouldListAsAvailable(SectorsVolumes.Sector sector) =>
         !_sectorsSelected.Any(owned => !owned.IsDummy && owned.Name == sector.Name)
-        && !IsCoveredByOwned(sector)
-        && !IsOwnedByAnotherController(sector)
-        && TryMatchAvailable(sector, out _);
+        && !IsCoveredByOwned(sector);
 
     void ApplyAvailableSectorNodes(List<TreeNode> sectorNodes, string modePrefix)
     {
@@ -1958,9 +1866,9 @@ public class OzServerSectorsWindow : BaseForm
             view => AddNodesGroupedByCategory(view, sectorNodes));
     }
 
-    // A single untagged row explaining why the list is empty. Untagged deliberately: SectorForNode
-    // and the arrow button both key off the tag, so a placeholder can never be selected into
-    // something claimable the way a real row can.
+    // A single untagged row explaining why the list is empty. Untagged deliberately: the arrow
+    // button keys off the tag, so a placeholder can never be selected into something claimable the
+    // way a real row can.
     void ShowAvailablePlaceholder(string modePrefix, string text) =>
         ApplyAvailableTree(modePrefix + "placeholder|" + text,
             view => view.Nodes.Add(new TreeNode(text) { NodeFont = view.Font, ToolTipText = text }));
@@ -2001,19 +1909,16 @@ public class OzServerSectorsWindow : BaseForm
     }
 
     // Recurses through a sector's own sub-sectors so a primary position nested at any depth (e.g.
-    // AAE inside TBD, or AAW/AAR inside AAE) still gets checked against live VATSIM presence and
-    // gets its own dropdown treatment. Returns null if this sector doesn't belong in Available at
-    // all (already owned, or someone's live on it).
+    // AAE inside TBD, or AAW/AAR inside AAE) still gets its own dropdown treatment and its own
+    // "who's on it" annotation. Returns null only if this sector doesn't belong in Available at all
+    // - already this controller's own, in one form or another (see ShouldListAsAvailable); being
+    // occupied or owned by someone else is no longer a reason to hide it, only to say so.
     TreeNode? BuildAvailableSectorNode(SectorsVolumes.Sector sector, int depth = 0)
     {
-        // Three separate reasons a sector is not claimable, and all three have to be checked: it is
-        // already this controller's, somebody is live on its frequency, or OzServer records it as
-        // another controller's. The last one is what an extending controller looks like - they hold
-        // it without ever being logged in under its callsign - and missing it made Available offer
-        // sectors whose claim could only ever come back as a request.
-        if (!IsClaimable(sector) || !TryMatchAvailable(sector, out var controller))
+        if (!ShouldListAsAvailable(sector))
             return null;
 
+        var controller = ResolveDisplayController(sector);
         var node = new TreeNode { Tag = sector, NodeFont = _availSectorsView.Font };
 
         // See BuildOwnedSectorNode for why the self-reference case (e.g. TBD listing itself in its
@@ -2026,7 +1931,7 @@ public class OzServerSectorsWindow : BaseForm
             {
                 if (ReferenceEquals(child, sector))
                 {
-                    var text = FormatSectorText(child, controller);
+                    var text = LeafText(FormatSectorText(child, controller));
                     node.Nodes.Add(new TreeNode(text) { Tag = child, NodeFont = node.NodeFont, ToolTipText = text });
                     continue;
                 }
@@ -2041,17 +1946,16 @@ public class OzServerSectorsWindow : BaseForm
         return node;
     }
 
-    // Whether nobody's currently live on this sector's frequency on VATSIM.
-    bool TryMatchAvailable(SectorsVolumes.Sector sector, out NetworkATC? controller)
+    // Who to annotate an Available row with, if anyone - purely informational now that presence no
+    // longer gates inclusion (see ShouldListAsAvailable). Never this controller's own callsign: this
+    // list only shows a sector at all when ShouldListAsAvailable has already excluded anything of
+    // theirs, so seeing themselves here means the network hasn't caught up with a local unstage yet,
+    // and displaying "(me)" on a row about to disappear on its own is more confusing than showing
+    // nothing.
+    NetworkATC? ResolveDisplayController(SectorsVolumes.Sector sector)
     {
-        controller = FindController(sector);
-
-        // Still mine on the network even if I've locally unpicked it and haven't hit Apply yet -
-        // don't show it as something to browse/request either way.
-        if (controller != null && controller.Callsign == Network.Callsign)
-            return false;
-
-        return controller == null;
+        var controller = FindController(sector);
+        return controller != null && controller.Callsign == Network.Callsign ? null : controller;
     }
 
     // Reads the per-populate snapshot, never Network.GetOnlineATCs directly.
@@ -2382,8 +2286,8 @@ public class OzServerSectorsWindow : BaseForm
         UpdateArrowButton();
     }
 
-    // Shared by the Accept button and the menu's Accept, so both act on the identical selection
-    // rule (see GetRequestsToAccept) rather than drifting apart.
+    // Called from the Accept button's own click handler (see GetRequestsToAccept for the selection
+    // rule it acts on).
     async Task AcceptSelectedRequestsAsync(TreeNode? node)
     {
         try
@@ -2399,6 +2303,10 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
+    // Reject is the one button covering both directions: on an incoming request (Requested From
+    // Me) it declines it, on this controller's own outgoing one (Requested By Me) it deletes it -
+    // there is no separate Cancel any more, since "reject my own request" and "cancel my own
+    // request" are the same gesture from the controller's side.
     async Task RejectSelectedRequestAsync(TreeNode? node)
     {
         try
@@ -2406,8 +2314,14 @@ public class OzServerSectorsWindow : BaseForm
             // FindOwningRequest, not a direct Tag test - a request that bundles sub-sectors
             // renders them as rows underneath it, and clicking one of those means that request.
             var request = FindOwningRequest(node);
-            if (request != null && CategoryNameOf(node) == RequestedFromMeName)
+            if (request == null)
+                return;
+
+            var category = CategoryNameOf(node);
+            if (category == RequestedFromMeName)
                 await RejectRequestAsync(request);
+            else if (category == RequestedByMeName)
+                await CancelRequestAsync(request);
         }
         catch (Exception ex)
         {
@@ -2711,7 +2625,7 @@ public class OzServerSectorsWindow : BaseForm
         {
             foreach (var sector in staged.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
             {
-                var text = FormatSectorText(sector);
+                var text = LeafText(FormatSectorText(sector));
                 parent.Nodes.Add(new TreeNode(text)
                 {
                     Tag = sector,
@@ -2752,7 +2666,7 @@ public class OzServerSectorsWindow : BaseForm
             foreach (var child in children)
             {
                 node.Nodes.Add(ReferenceEquals(child, request.Sector)
-                    ? new TreeNode(FormatSectorText(child)) { NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
+                    ? new TreeNode(LeafText(FormatSectorText(child))) { NodeFont = node.NodeFont, ToolTipText = LeafText(FormatSectorText(child)) }
                     : BuildRequestDescendantNode(child));
             }
         }
@@ -2774,7 +2688,7 @@ public class OzServerSectorsWindow : BaseForm
             foreach (var child in children)
             {
                 node.Nodes.Add(ReferenceEquals(child, sector)
-                    ? new TreeNode(FormatSectorText(child)) { NodeFont = node.NodeFont, ToolTipText = FormatSectorText(child) }
+                    ? new TreeNode(LeafText(FormatSectorText(child))) { NodeFont = node.NodeFont, ToolTipText = LeafText(FormatSectorText(child)) }
                     : BuildRequestDescendantNode(child, depth + 1));
             }
         }
@@ -2783,11 +2697,22 @@ public class OzServerSectorsWindow : BaseForm
         return node;
     }
 
-    // Kept as the single "request state changed" notification point even though there are no
-    // buttons left to update: the right-click menu decides what it offers when it is opened, so
-    // there is nothing to pre-enable, but plenty of callers still want to say "this changed".
+    // The single "request state changed" notification point - called after every rebuild of
+    // Requested Changes, every selection change in it, and every Accept/Reject/connectivity change,
+    // so the two buttons can never show enabled for something they would actually refuse to act on.
+    // Accept only ever means something for an incoming request; Reject covers both directions (see
+    // RejectSelectedRequestAsync) so it enables for either category, as long as a real request - not
+    // a placeholder row or a not-yet-applied staged one - is what's actually selected.
     void UpdateRequestActionButtons()
     {
+        var selected = _requestedChangesView.SelectedNode;
+        var requestsActionable = !_requestActionRunning && Network.IsConnected;
+        var category = CategoryNameOf(selected);
+
+        _acceptButton.Enabled = requestsActionable && GetRequestsToAccept(selected).Count > 0;
+        _rejectButton.Enabled = requestsActionable
+                                 && FindOwningRequest(selected) != null
+                                 && (category == RequestedFromMeName || category == RequestedByMeName);
     }
 
     // What Accept acts on, entirely from the current selection:

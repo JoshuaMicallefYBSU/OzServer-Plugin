@@ -538,9 +538,21 @@ public class OzServerOwnershipTracker
         MMI.SetControlledSectors(mmiSectors);
     }
 
+    // Whether this session is actually connected as ATC, not merely a connection that happens to
+    // have parsed into a valid-looking position - see NetworkATC.IsRealATC (the same check
+    // PrimaryPosition.OnlineRealAtcs already uses to keep observers out of the online-controller
+    // picture). vatSys's own Sectors window still lets an observer connection populate
+    // MMI.SectorsControlled - that's for local situational awareness (watching a sector's tags/
+    // strips), not a claim of authority over it - and OzServer's claim endpoint trusts whatever
+    // controller_cid/controller_callsign the plugin sends it with no facility check of its own (see
+    // VerifyPluginToken.php: "the plugin is the trusted party now"). So this is the only place
+    // standing between an observer connection and a real ownership record - see issue #3, "CM_OBS
+    // Can Own Sectors".
+    static bool IsRealAtc => Network.Me?.IsRealATC == true;
+
     public async Task ClaimAsync(SectorsVolumes.Sector sector)
     {
-        if (!Network.IsConnected)
+        if (!Network.IsConnected || !IsRealAtc)
             return;
 
         // The conflict is handled *after* the try block, not inside the catch clause that detects
@@ -597,6 +609,20 @@ public class OzServerOwnershipTracker
         var result = new SectorCommitResult();
         if (!Network.IsConnected)
             return result;
+
+        // Same rule as ClaimAsync/ClaimMmiControlledSectorsAsync - an observer connection can still
+        // stage a claim in the Sectors window (nothing there checks facility either), but is not
+        // entitled to actually take ownership of it. Release and request are left alone: giving back
+        // something already held, or asking for something, aren't the problem IsRealAtc guards
+        // against.
+        if (!IsRealAtc && toClaim.Count > 0)
+        {
+            Errors.Add(new Exception(
+                "Not connected as a real ATC position - sectors can't be claimed while observing."),
+                "OzServer");
+            result.Failed.AddRange(toClaim.Select(s => s.Name));
+            toClaim = Array.Empty<SectorsVolumes.Sector>();
+        }
 
         // One call for the whole Apply, answering with the resulting state - so committing several
         // staged sectors costs one round trip rather than one per sector plus a refresh, and the
@@ -812,6 +838,12 @@ public class OzServerOwnershipTracker
     // this only skips the redundant case, never substitutes one sector for another.
     async Task ClaimMmiControlledSectorsAsync()
     {
+        // An observer connection can still end up with entries in MMI.SectorsControlled - vatSys's
+        // own Sectors window doesn't gate that on facility either - but isn't entitled to turn that
+        // into a real OzServer ownership record. See IsRealAtc.
+        if (!IsRealAtc)
+            return;
+
         var target = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
         foreach (var sector in target)
