@@ -30,7 +30,7 @@ public class OzServerSettingsWindow : BaseForm
             AutoSize = true,
             HasBorder = false,
             InteractiveText = false,
-            ForeColor = Colours.GetColour(Colours.Identities.InteractiveText),
+            ForeColor = Colours.GetColour(Colours.Identities.GenericText),
             Location = new Point(12, 14),
             Text = "OzServer Base URL:",
             TextAlign = ContentAlignment.MiddleLeft
@@ -40,7 +40,7 @@ public class OzServerSettingsWindow : BaseForm
         {
             BackColor = Colours.GetColour(Colours.Identities.WindowBackground),
             BorderStyle = BorderStyle.FixedSingle,
-            Font = new Font("Terminus (TTF)", 14f, FontStyle.Regular, GraphicsUnit.Pixel),
+            Font = MMI.eurofont_winverysml,
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText),
             Location = new Point(12, 36),
             Size = new Size(416, 24)
@@ -51,7 +51,7 @@ public class OzServerSettingsWindow : BaseForm
             AutoSize = true,
             HasBorder = false,
             InteractiveText = false,
-            ForeColor = Colours.GetColour(Colours.Identities.InteractiveText),
+            ForeColor = Colours.GetColour(Colours.Identities.GenericText),
             Location = new Point(12, 68),
             Text = "",
             TextAlign = ContentAlignment.MiddleLeft
@@ -59,34 +59,25 @@ public class OzServerSettingsWindow : BaseForm
 
         _resetButton = new GenericButton
         {
-            Font = new Font("Terminus (TTF)", 18f, FontStyle.Bold, GraphicsUnit.Pixel),
             Location = new Point(12, 96),
             Size = new Size(120, 30),
-            SubText = "",
             Text = "Reset",
-            UseVisualStyleBackColor = true
         };
         _resetButton.Click += (_, _) => _baseUrlBox.Text = OzServerSettings.DefaultBaseUrl;
 
         _saveButton = new GenericButton
         {
-            Font = new Font("Terminus (TTF)", 18f, FontStyle.Bold, GraphicsUnit.Pixel),
             Location = new Point(264, 96),
             Size = new Size(80, 30),
-            SubText = "",
             Text = "Save",
-            UseVisualStyleBackColor = true
         };
         _saveButton.Click += SaveButton_Click;
 
         _closeButton = new GenericButton
         {
-            Font = new Font("Terminus (TTF)", 18f, FontStyle.Bold, GraphicsUnit.Pixel),
             Location = new Point(348, 96),
             Size = new Size(80, 30),
-            SubText = "",
             Text = "Close",
-            UseVisualStyleBackColor = true
         };
         _closeButton.Click += (_, _) => Close();
 
@@ -111,9 +102,12 @@ public class OzServerSettingsWindow : BaseForm
     void SaveButton_Click(object? sender, EventArgs e)
     {
         var url = _baseUrlBox.Text.Trim();
-        if (!Uri.TryCreate(url, UriKind.Absolute, out _))
+        // Shares OzServerSettings' own rule rather than re-checking here, so a URL typed into this
+        // box and one hand-edited into settings.json are held to the same standard - see
+        // IsValidBaseUrl for why an absolute-URI check on its own isn't enough.
+        if (!OzServerSettings.IsValidBaseUrl(url, out var error))
         {
-            _statusLabel.Text = "That doesn't look like a valid URL.";
+            _statusLabel.Text = error;
             return;
         }
 

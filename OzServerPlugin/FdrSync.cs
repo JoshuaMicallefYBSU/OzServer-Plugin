@@ -10,17 +10,28 @@ namespace OzServerPlugin;
 
 // Pushes FDR/position updates vatSys hands the plugin (Plugin.OnFDRUpdate, Plugin.OnRadarTrackUpdate
 // - both fire per flight, for every flight vatSys is tracking, not just this controller's own
-// traffic) to OzServer's /fdr/batch endpoint, attributing datalink authority from FDP2.FDR's own
-// tracking state rather than this session's identity:
-//   - Assumed by me (fdr.IsTrackedByMe) -> authority is this session's own cid/callsign.
-//   - Assumed by someone else (fdr.IsTracked, not by me) -> authority is their callsign
-//     (fdr.ControllerTracking.Callsign) - vatSys doesn't expose their CID, only OzServerFdrUpdateDto
-//     itself only ever needs one for the "assumed by me" case anyway.
-//   - Untracked (!fdr.IsTracked) -> no authority (both left null) - free, anyone can update it.
-// See OzServerFdrUpdateDto's own comment for why this is safe to just trust and forward as-is, and
-// FlightDataRecordController::upsert (backend) for what actually happens with it - the backend, not
-// this class, is what enforces that only a currently-online, sector-holding authority controller
-// can overwrite another flight's data.
+// traffic) to OzServer's /fdr/batch endpoint - but only for a flight this controller currently holds
+// and has activated: fdr.IsTrackedByMe && fdr.ESTed, checked fresh on every update (see ShouldPush).
+// No grace period, no "used to own it" carve-out: the moment either goes false, nothing more is
+// pushed for that flight until (if ever) this controller holds it again. TagOwnershipSync is what
+// keeps IsTrackedByMe in step with live subsector ownership on OzServer, so this single condition
+// already captures both "owned by this controller" and "not merely a flight plan sitting inactive" -
+// see its own class comment for the two things allowed to move a tag between controllers.
+//
+// Because a push only ever happens while this controller holds the flight, the datalink authority it
+// reports is always this session's own identity (see FillAuthority) - there is no "assumed by
+// someone else" or "free" case left to report. See OzServerFdrUpdateDto's own comment for why that's
+// safe to just trust and forward as-is, and FlightDataRecordController::upsert (backend) for what
+// actually happens with it. A row nothing has pushed to in 10 minutes - the natural backend
+// counterpart to a controller simply no longer pushing anything once they've let go of a flight - is
+// dropped server-side; that's a backend-only follow-up (same precedent as the existing 90-minute
+// ATIS TTL - see AtisSync/README), not implemented in this repo.
+//
+// Also reports current_sector (see FillCurrentSector) - the real geographic subsector the aircraft
+// is physically inside of right now, resolved via SectorLocator against every sector vatSys knows
+// about, not just ones OzServer has an active ownership record for. That's deliberately a different
+// question from the datalink authority above: who owns the tag vs. which airspace the aircraft is
+// actually in, regardless of whether anyone has claimed it there yet.
 //
 // Updates are batched rather than sent one request per flight: OnFDRUpdate/OnRadarTrackUpdate just
 // merge into _pending (keyed by callsign, newer non-null fields overwriting older ones - a
@@ -29,12 +40,25 @@ namespace OzServerPlugin;
 public class FdrSync
 {
     static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(5);
-    static readonly PropertyInfo[] DtoProperties = typeof(OzServerFdrUpdateDto).GetProperties();
+
+    // Everything except the two datalink-authority fields, which CopyNonNull handles separately -
+    // see its own comment for why they can't go through the same "skip nulls" merge as the rest.
+    static readonly PropertyInfo[] MergeProperties = typeof(OzServerFdrUpdateDto).GetProperties()
+        .Where(p => p.Name != nameof(OzServerFdrUpdateDto.ControllingCid)
+                    && p.Name != nameof(OzServerFdrUpdateDto.ControllingCallsign))
+        .ToArray();
 
     readonly OzServerApiClient _api = new();
     readonly object _lock = new();
     readonly Dictionary<string, OzServerFdrUpdateDto> _pending = new();
     readonly Timer _flushTimer;
+    // 0 = idle, 1 = a flush is in flight. The timer keeps ticking every FlushInterval regardless of
+    // whether the previous flush has come back, so without this a backend slower than the interval
+    // accumulates overlapping batches - and because each one takes its own snapshot of _pending and
+    // clears it, they carry *different* data and can land out of order, letting an older batch
+    // overwrite a newer one's positions server-side. A tick that finds a flush already running just
+    // skips; nothing is lost, since whatever accumulates meanwhile goes out on the next one.
+    int _flushing;
 
     public FdrSync()
     {
@@ -46,21 +70,53 @@ public class FdrSync
         if (string.IsNullOrEmpty(fdr.Callsign))
             return;
 
+        if (!ShouldPush(fdr))
+            return;
+
         Merge(BuildFdrDto(fdr));
     }
 
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
         var fdr = track.CoupledFDR;
-        var callsign = fdr?.Callsign;
+        if (string.IsNullOrEmpty(fdr?.Callsign))
+            return;
+
+        if (!ShouldPush(fdr!))
+            return;
+
+        var dto = new OzServerFdrUpdateDto { Callsign = fdr!.Callsign };
+        FillPosition(dto, track);
+        FillAuthority(dto);
+        FillCurrentSector(dto, fdr);
+
+        Merge(dto);
+    }
+
+    // Gates every push on this session's own relationship to the flight, checked fresh every time -
+    // see the class comment.
+    static bool ShouldPush(FDP2.FDR fdr) => fdr.IsTrackedByMe && fdr.ESTed;
+
+    // Called by TagOwnershipSync when this controller drops a tag to none. ShouldPush's "the moment
+    // IsTrackedByMe goes false, nothing more is pushed for that flight" (see the class comment)
+    // otherwise leaves OzServer's own record of who holds it exactly as it was the instant before
+    // the drop - stale, and actively misleading, since nobody is pushing anything to correct it
+    // until (if ever) some controller picks the flight back up, or the 10-minute idle drop mentioned
+    // in the class comment eventually clears the row. This pushes the correction immediately instead
+    // of waiting on either.
+    //
+    // Goes through the same batched _pending/flush path as every other update rather than firing its
+    // own request - one more field changing for a flight already due to go out on the next tick is
+    // exactly what merging into _pending is for. ControllingCid/ControllingCallsign are the two
+    // fields marked NullValueHandling.Include on OzServerFdrUpdateDto specifically so a deliberate
+    // null like this one actually reaches the server instead of being skipped like every other unset
+    // field - see CopyNonNull's own comment.
+    public void ClearControllingAuthority(string callsign)
+    {
         if (string.IsNullOrEmpty(callsign))
             return;
 
-        var dto = new OzServerFdrUpdateDto { Callsign = callsign! };
-        FillPosition(dto, track);
-        FillAuthority(dto, fdr!);
-
-        Merge(dto);
+        Merge(new OzServerFdrUpdateDto { Callsign = callsign, ControllingCid = null, ControllingCallsign = null });
     }
 
     void Merge(OzServerFdrUpdateDto dto)
@@ -81,24 +137,35 @@ public class FdrSync
         if (!Network.IsConnected)
             return;
 
-        List<OzServerFdrUpdateDto> batch;
-
-        lock (_lock)
-        {
-            if (_pending.Count == 0)
-                return;
-
-            batch = _pending.Values.ToList();
-            _pending.Clear();
-        }
+        // See _flushing - one batch in flight at a time, no overlapping pushes.
+        if (Interlocked.CompareExchange(ref _flushing, 1, 0) != 0)
+            return;
 
         try
         {
-            await _api.UpdateFdrBatchAsync(batch);
+            List<OzServerFdrUpdateDto> batch;
+
+            lock (_lock)
+            {
+                if (_pending.Count == 0)
+                    return;
+
+                batch = _pending.Values.ToList();
+                _pending.Clear();
+            }
+
+            try
+            {
+                await _api.UpdateFdrBatchAsync(batch);
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't push FDR batch to OzServer: {ex.Message}", ex), "OzServer");
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            Errors.Add(new Exception($"Couldn't push FDR batch to OzServer: {ex.Message}"), "OzServer");
+            Interlocked.Exchange(ref _flushing, 0);
         }
     }
 
@@ -137,23 +204,56 @@ public class FdrSync
             Remarks = NullIfEmpty(fdr.Remarks),
         };
 
-        FillAuthority(dto, fdr);
+        FillAuthority(dto);
+        FillPredictedPosition(dto, fdr);
+        FillCurrentSector(dto, fdr);
 
         return dto;
     }
 
-    static void FillAuthority(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
+    // The geographic subsector fdr is physically inside of right now - a different question from
+    // who owns the tag (FillAuthority, above): resolved against the full SectorsVolumes.Sectors
+    // list, not tracker.ClaimedSectors the way TagOwnershipSync's own resolution is, so this reports
+    // real geography regardless of whether anyone has actually claimed that sector on OzServer.
+    // Left null (and, via CopyNonNull's ordinary skip-null merge, simply not overwritten) when the
+    // aircraft isn't inside any known sector volume at its current position/level.
+    static void FillCurrentSector(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
     {
-        if (fdr.IsTrackedByMe)
-        {
-            if (int.TryParse(Network.ControllerId, out var myCid))
-                dto.ControllingCid = myCid;
-            dto.ControllingCallsign = Network.Callsign;
-        }
-        else if (fdr.IsTracked)
-        {
-            dto.ControllingCallsign = fdr.ControllerTracking.Callsign;
-        }
+        dto.CurrentSector = SectorLocator.Resolve(fdr, SectorsVolumes.Sectors)?.Name;
+    }
+
+    // A flight never coupled to a radar track - still climbing out of coverage, procedural, a
+    // non-radar environment - would otherwise never get any position pushed at all: only
+    // OnRadarTrackUpdate's FillPosition sets Lat/Lon, and it only ever fires once there's a track to
+    // report. Falls back to fdr.GetLocation()'s own PredictedPosition.Location branch - the same
+    // position vatSys itself draws the tag at - so there's always something for OzServer to show
+    // even before (or without) a live track. Once a track exists, this backs off entirely and leaves
+    // Lat/Lon to FillPosition, which reports the coupled track's own live position - the more
+    // authoritative of the two.
+    static void FillPredictedPosition(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
+    {
+        if (fdr.CoupledTrack != null)
+            return;
+
+        var location = fdr.GetLocation();
+        if (location == null)
+            return;
+
+        dto.Lat = location.Latitude;
+        dto.Lon = location.Longitude;
+    }
+
+    // Called only once ShouldPush(fdr) has already passed for this push - i.e. fdr.IsTrackedByMe is
+    // true - so the datalink authority a push reports is always this session's own identity.
+    static void FillAuthority(OzServerFdrUpdateDto dto)
+    {
+        // Left null when there is no identity yet rather than defaulted, because null is meaningful
+        // on this field: it is what the backend reads as "no datalink authority".
+        var me = NetworkIdentity.Current;
+        if (me != null)
+            dto.ControllingCid = me.Value.Cid;
+
+        dto.ControllingCallsign = Network.Callsign;
     }
 
     // RDP.RadarTrack uses sentinel values rather than nulls for "not set" - -1/-1.0 for
@@ -187,9 +287,22 @@ public class FdrSync
     // without blanking out fields the newer update simply doesn't know about. Reflection-based
     // rather than a hand-written field list so a new OzServerFdrUpdateDto property is merged
     // correctly without this having to be updated to match.
+    //
+    // The two datalink-authority fields are copied as a unit, outside the shared skip-nulls loop
+    // below, rather than folded into MergeProperties: both producers (BuildFdrDto and the radar
+    // path) always run FillAuthority, which always sets them together to this session's own
+    // identity - see its own comment - so source's answer is always current and always meant to
+    // overwrite whatever target already had, never something to skip past because source "doesn't
+    // know" this round. ControllingCid is the one field of the two that can still land as null (see
+    // FillAuthority's int.TryParse), which is exactly why they're marked
+    // NullValueHandling.Include on OzServerFdrUpdateDto rather than trusted to the default
+    // skip-nulls serialization every other field gets.
     static void CopyNonNull(OzServerFdrUpdateDto source, OzServerFdrUpdateDto target)
     {
-        foreach (var prop in DtoProperties)
+        target.ControllingCid = source.ControllingCid;
+        target.ControllingCallsign = source.ControllingCallsign;
+
+        foreach (var prop in MergeProperties)
         {
             var value = prop.GetValue(source);
             if (value != null)

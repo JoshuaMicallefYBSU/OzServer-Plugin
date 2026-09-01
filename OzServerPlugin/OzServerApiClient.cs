@@ -53,12 +53,29 @@ public class OzServerSectorOwnershipRequestDto
     [JsonProperty("target_callsign")] public string TargetCallsign { get; set; } = "";
     // Only populated by GET /sector-requests, not by POST .../request's own response.
     [JsonProperty("sector")] public OzServerSectorDto? Sector { get; set; }
+    // Set once the owner has denied this request. A rejected request is kept server-side purely so
+    // the controller who asked can be told (SectorOwnershipController::reject) - nothing else would
+    // ever tell them, since the row otherwise just disappears from their list exactly as it does on
+    // an accept, a cancel or a stale prune. Null on every request still awaiting a decision, and
+    // only ever seen in `by_me`: `from_me` is filtered to pending server-side.
+    [JsonProperty("rejected_at")] public DateTimeOffset? RejectedAt { get; set; }
 }
 
 public class OzServerMyRequestsDto
 {
     [JsonProperty("by_me")] public List<OzServerSectorOwnershipRequestDto> ByMe { get; set; } = new();
     [JsonProperty("from_me")] public List<OzServerSectorOwnershipRequestDto> FromMe { get; set; } = new();
+}
+
+// Everything the Sectors window's poll needs, in one response - see SectorOwnershipController::sync.
+// The three members are exactly the payloads GET /sectors/mine, /sectors/controlled and
+// /sector-requests return individually, so they deserialise into the same DTOs and nothing
+// downstream has to care which route the data arrived by.
+public class OzServerSyncDto
+{
+    [JsonProperty("mine")] public List<OzServerSectorDto> Mine { get; set; } = new();
+    [JsonProperty("controlled")] public List<OzServerControlledSectorDto> Controlled { get; set; } = new();
+    [JsonProperty("requests")] public OzServerMyRequestsDto Requests { get; set; } = new();
 }
 
 public class OzServerAcceptBatchResultDto
@@ -72,6 +89,40 @@ public class OzServerAcceptBatchResultDto
 public class OzServerAcceptBatchResponseDto
 {
     [JsonProperty("results")] public List<OzServerAcceptBatchResultDto> Results { get; set; } = new();
+    // The state the accept produced, so the caller does not have to ask for it separately.
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
+}
+
+// What POST /sectors/commit reports back: which names actually moved, alongside the resulting state.
+// Mirrors SectorCommitResult so the window can report a partial outcome without re-deriving it.
+public class OzServerCommitResultDto
+{
+    [JsonProperty("claimed")] public List<string> Claimed { get; set; } = new();
+    [JsonProperty("released")] public List<string> Released { get; set; } = new();
+    [JsonProperty("requested")] public List<string> Requested { get; set; } = new();
+    [JsonProperty("skipped")] public List<string> Skipped { get; set; } = new();
+    [JsonProperty("failed")] public List<string> Failed { get; set; } = new();
+}
+
+// What POST /sectors/resume answers with: which sectors were actually recovered, plus the resulting
+// state. Anything not listed was taken by someone else while this controller was away.
+public class OzServerResumeResponseDto
+{
+    [JsonProperty("resumed")] public List<string> Resumed { get; set; } = new();
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
+}
+
+public class OzServerCommitResponseDto
+{
+    [JsonProperty("result")] public OzServerCommitResultDto Result { get; set; } = new();
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
+}
+
+// What every ownership-changing action answers with: the resulting state, in the same shape
+// GET /sectors/sync returns. Saves the follow-up GET each of these used to require.
+public class OzServerActionResultDto
+{
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
 }
 
 public class OzServerControlledSectorOwnerDto
@@ -98,13 +149,14 @@ class OzServerErrorDto
 }
 
 // Mirrors UpdateFlightDataRecordRequest's validation rules (app/Http/Requests on the backend) field
-// for field. controlling_cid/controlling_callsign are the flight's datalink authority - who
-// FDP2.FDR.ControllerTracking says currently owns it - and are deliberately separate from this
-// session's own identity (attached automatically by PostRawAsync, same as every other endpoint):
-// a controller merely observing a flight still pushes its data, attributing authority to whoever
-// actually has it (self, another controller's callsign, or neither when null/free). Every field
-// besides Callsign is nullable so a partial or position-only push doesn't have to fabricate values
-// for whatever FdrSync couldn't read off the FDR.
+// for field. controlling_cid/controlling_callsign are the flight's datalink authority, deliberately
+// separate from this session's own identity (attached automatically by PostRawAsync, same as every
+// other endpoint) even though, now, they're always this session's own cid/callsign: FdrSync only
+// ever pushes while fdr.IsTrackedByMe is true (see FdrSync.ShouldPush) - a flight merely observed,
+// handed off elsewhere, or not yet activated is never pushed for at all, so there's no "someone
+// else's callsign" or "free/null" authority left to report. Every field besides Callsign is
+// nullable so a partial or position-only push doesn't have to fabricate values for whatever FdrSync
+// couldn't read off the FDR.
 public class OzServerFdrUpdateDto
 {
     [JsonProperty("callsign")] public string Callsign { get; set; } = "";
@@ -152,19 +204,70 @@ public class OzServerFdrUpdateDto
     [JsonProperty("heading")] public int? Heading { get; set; }
     [JsonProperty("vertical_rate")] public int? VerticalRate { get; set; }
     [JsonProperty("on_ground")] public bool? OnGround { get; set; }
+
+    // The geographic subsector this aircraft is physically inside of right now (SectorLocator,
+    // resolved against the full SectorsVolumes.Sectors list - not tracker.ClaimedSectors), which is
+    // deliberately a different question from who owns the tag (controlling_cid/controlling_callsign,
+    // above). Null when the aircraft isn't inside any known sector volume at its current
+    // position/level, or when neither a live nor a predicted position is available yet.
+    [JsonProperty("current_sector")] public string? CurrentSector { get; set; }
 }
 
-// Talks to the OzServer backend's sector-ownership API (app/Http/Controllers/SectorOwnershipController.php),
-// authenticated as this plugin via a shared bearer token (Secrets.PluginToken, checked server-side
-// by app/Http/Middleware/VerifyPluginToken.php) rather than by cross-checking the caller against
-// the live VATSIM data feed. The feed lags real connects by up to ~15s, which used to surface as a
-// spurious "not connected to VATSIM under that callsign" right after logging on - the plugin is
-// the trusted party now, so every call just attaches this vatSys session's own CID/callsign (read
-// straight from vatSys's own live connection state, not the feed) and the server takes them at
-// face value once the token checks out. The token itself is never exposed through any vatSys UI or
-// settings file - see Secrets.cs (gitignored; Secrets.cs.example is the checked-in template).
+// One row from GET /fdr/sync (FlightDataRecordController::sync) - OzServer's own live copy of a
+// flight, for FdrActivationSync to compare against this client's local FDP2.FDR. Same field set as
+// OzServerFdrUpdateDto (same table) plus the three fields that DTO never needs to send back up:
+// State/Callsign (needed here just to identify and compare rows) and LastSeenAt (not currently
+// used - the endpoint itself only ever returns live rows, see its own comment - but kept so a
+// future caller doesn't have to touch the DTO to get at it).
+public class OzServerFdrRecordDto
+{
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    [JsonProperty("state")] public string? State { get; set; }
+    [JsonProperty("flight_rules")] public string? FlightRules { get; set; }
+    [JsonProperty("aircraft_type")] public string? AircraftType { get; set; }
+    [JsonProperty("aircraft_equip")] public string? AircraftEquip { get; set; }
+    [JsonProperty("aircraft_surv_equip")] public string? AircraftSurvEquip { get; set; }
+    [JsonProperty("aircraft_count")] public int? AircraftCount { get; set; }
+    [JsonProperty("dep_airport")] public string? DepAirport { get; set; }
+    [JsonProperty("des_airport")] public string? DesAirport { get; set; }
+    [JsonProperty("route")] public string? Route { get; set; }
+    [JsonProperty("rfl")] public int? Rfl { get; set; }
+    [JsonProperty("cfl_lower")] public int? CflLower { get; set; }
+    [JsonProperty("cfl_upper")] public int? CflUpper { get; set; }
+    [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
+    [JsonProperty("atd")] public DateTime? Atd { get; set; }
+    [JsonProperty("etd")] public DateTime? Etd { get; set; }
+    [JsonProperty("eet_minutes")] public int? EetMinutes { get; set; }
+    [JsonProperty("tas")] public int? Tas { get; set; }
+    [JsonProperty("label_op_data")] public string? LabelOpData { get; set; }
+    [JsonProperty("remarks")] public string? Remarks { get; set; }
+    [JsonProperty("last_seen_at")] public DateTimeOffset? LastSeenAt { get; set; }
+}
+
+// AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
+// vatsys.ATIS's own content/letter actually changes (there is deliberately no periodic heartbeat -
+// see AtisSync's own comment), so this always represents a real broadcast update, not a liveness
+// ping.
+public class OzServerAtisUpdateDto
+{
+    [JsonProperty("icao")] public string Icao { get; set; } = "";
+    [JsonProperty("atis_letter")] public string AtisLetter { get; set; } = "";
+    // Field name (WIND, VIS, QNH, ...) -> value, straight from vatsys.ATIS.Content.
+    [JsonProperty("content")] public Dictionary<string, string> Content { get; set; } = new();
+    [JsonProperty("frequency")] public int? Frequency { get; set; }
+}
+
+// Talks to the OzServer backend's sector-ownership API. Every call attaches this vatSys session's
+// CID and callsign, which the API uses as the controller identity without waiting for the lagging
+// VATSIM datafeed. No shared credential is compiled into or sent by the plugin.
 public class OzServerApiClient
 {
+    static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+
+    // Enough that the background traffic (FDR batch, two polls, ATIS) can never occupy every slot
+    // and leave a controller-initiated request waiting for one - see CreateClient.
+    const int TargetConnectionLimit = 8;
+
     static readonly HttpClient Http = CreateClient();
 
     // Null properties are left out of a POST body entirely by default (recursively, so this
@@ -187,19 +290,42 @@ public class OzServerApiClient
             // Best-effort - older Windows builds may not define Tls12 in this enum at all.
         }
 
-        var client = new HttpClient();
+        // .NET Framework caps outbound connections per host at 2 by default (the old RFC 2616
+        // recommendation), and every call in this plugin shares the one HttpClient below - so it
+        // shares one ServicePoint and that one cap. FdrSync flushes a batch every 5s, the ownership
+        // tracker polls every 10s, the Sectors window polls requests on its own 10s timer, and ATIS
+        // pushes on change: between them the two slots are routinely busy, and anything the
+        // controller actually *waits* on queues behind them. That is what made pressing Controlled
+        // take seconds - the GET wasn't slow, it hadn't started yet, stuck behind an FDR batch
+        // upload on a connection that wouldn't free up.
+        //
+        // Raised, never lowered: this property is process-wide, so it belongs to vatSys as much as
+        // to this plugin, and clamping down something the host (or another plugin) had deliberately
+        // raised would be the same bug in reverse.
+        try
+        {
+            if (ServicePointManager.DefaultConnectionLimit < TargetConnectionLimit)
+                ServicePointManager.DefaultConnectionLimit = TargetConnectionLimit;
+        }
+        catch
+        {
+            // Not worth failing construction over - the cap only costs latency, never correctness.
+        }
+
+        // HttpClient's own default is 100 seconds - long enough that a backend which accepts a
+        // connection and then stops answering leaves a controller staring at a dead Sectors window
+        // for over a minute with nothing in the error log. Not set anywhere near the 5s/10s timer
+        // intervals, though: those callers already refuse to stack up on their own (FdrSync's
+        // _flushing flag, the tracker's RefreshFromServerIfIdleAsync), so this only has to bound
+        // how long any single request can hang, and needs enough headroom for a genuinely large
+        // FDR batch on a slow connection.
+        var client = new HttpClient { Timeout = RequestTimeout };
         // Without this, Laravel's exception handler can't tell this apart from a browser
         // navigation and falls back to rendering its HTML error page instead of the
         // {"message": "..."} JSON body every error path here is written to expect - confirmed by
         // hitting the live API directly: identical request, text/html without this header,
         // application/json with it.
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        // See the class comment - this is what authenticates every call as this plugin, in place
-        // of the old live-datafeed cross-check. Left unset (rather than sent as an empty Bearer
-        // header) when Secrets.cs hasn't been filled in, so a from-source build fails with the
-        // server's own "Invalid or missing plugin token" instead of a confusing malformed header.
-        if (!string.IsNullOrEmpty(Secrets.PluginToken))
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", Secrets.PluginToken);
         return client;
     }
 
@@ -227,9 +353,35 @@ public class OzServerApiClient
     public Task<OzServerAcceptBatchResponseDto> AcceptRequestsBatchAsync(IEnumerable<int> requestIds) =>
         PostAsync<OzServerAcceptBatchResponseDto>("/sector-requests/accept-batch", new { request_ids = requestIds.ToArray() });
 
-    public Task RejectRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/reject");
+    public Task<OzServerActionResultDto> RejectRequestAsync(int requestId) =>
+        PostAsync<OzServerActionResultDto>($"/sector-requests/{requestId}/reject");
 
-    public Task CancelRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/cancel");
+    public Task<OzServerActionResultDto> CancelRequestAsync(int requestId) =>
+        PostAsync<OzServerActionResultDto>($"/sector-requests/{requestId}/cancel");
+
+    // Confirms this controller has been shown a rejection of their own request, which is what
+    // finally deletes it server-side - see SectorOwnershipController::acknowledgeRejection. Until
+    // this is called the rejection keeps coming back in every `by_me`, so it survives the plugin
+    // being closed before the controller ever saw it.
+    public Task AcknowledgeRejectionAsync(int requestId) =>
+        PostAsync($"/sector-requests/{requestId}/acknowledge-rejection");
+
+    // One round trip for owned + controlled + requests. The Sectors window polls every two seconds
+    // while open and used to make three separate GETs per tick, each paying the framework's own
+    // per-request cost for data that is always consumed together.
+    // One Apply in one call. Sending a POST per sector meant applying three staged sectors paid full
+    // latency four times over, with the lists frozen until the last one returned.
+    public Task<OzServerCommitResponseDto> CommitAsync(
+        IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request) =>
+        PostAsync<OzServerCommitResponseDto>("/sectors/commit", new
+        {
+            claim = claim.ToArray(),
+            release = release.ToArray(),
+            request = request.ToArray(),
+        });
+
+    public Task<OzServerSyncDto> GetSyncAsync() =>
+        GetAsync("/sectors/sync", () => new OzServerSyncDto());
 
     public Task<OzServerMyRequestsDto> GetMyRequestsAsync() =>
         GetAsync<OzServerMyRequestsDto>("/sector-requests", () => new OzServerMyRequestsDto());
@@ -241,6 +393,17 @@ public class OzServerApiClient
     // was never claimed through here, correctly never shows up).
     public Task<List<OzServerControlledSectorDto>> GetControlledSectorsAsync() =>
         GetAsync<List<OzServerControlledSectorDto>>("/sectors/controlled", () => new List<OzServerControlledSectorDto>());
+
+    // Gives up everything this controller owns in one call - see
+    // SectorOwnershipController::releaseAll. Only ever sent on a *graceful* disconnect: staying
+    // silent is what tells the backend a disconnect was ungraceful, and buys the 5-minute window to
+    // reconnect into the same sectors.
+    public Task ReleaseAllSectorsAsync() => PostAsync("/sectors/release-all");
+
+    // Asks the backend to put this session back on whatever it was holding when it last left this
+    // same position, if that was recent enough - see SectorOwnershipController::resume.
+    public Task<OzServerResumeResponseDto> ResumeAsync() =>
+        PostAsync<OzServerResumeResponseDto>("/sectors/resume");
 
     // The authoritative "what do I actually own" check (SectorOwnershipController::mine) - used to
     // refresh Owned from OzServer's own record every time the Sectors window opens, rather than
@@ -262,6 +425,14 @@ public class OzServerApiClient
     public Task UpdateFdrBatchAsync(IEnumerable<OzServerFdrUpdateDto> flights) =>
         PostAsync("/fdr/batch", new { flights = flights.ToArray() });
 
+    // FlightDataRecordController::sync - every FDR row OzServer currently holds, for
+    // FdrActivationSync's own comparison against local FDP2.FDR state.
+    public Task<List<OzServerFdrRecordDto>> GetFdrSyncAsync() =>
+        GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
+
+    // AtisController::update - upserts this ICAO's current ATIS state, keyed by icao.
+    public Task UpdateAtisAsync(OzServerAtisUpdateDto atis) => PostAsync("/atis", atis);
+
     async Task<T> GetAsync<T>(string path, Func<T> empty)
     {
         var (cid, callsign) = GetCredentials();
@@ -274,7 +445,9 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException($"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}");
+            var transportMessage = DescribeTransportFailure(ex);
+            ActionLog.LogAttempt("GET", path, false, transportMessage);
+            throw new OzServerApiException(transportMessage);
         }
 
         using (response)
@@ -283,9 +456,11 @@ public class OzServerApiClient
             if (!response.IsSuccessStatusCode)
             {
                 var (message, conflicts) = ParseError(body, (int)response.StatusCode);
+                ActionLog.LogAttempt("GET", path, false, message);
                 throw new OzServerApiException(message, (int)response.StatusCode, conflicts);
             }
 
+            ActionLog.LogAttempt("GET", path, true);
             return JsonConvert.DeserializeObject<T>(body) ?? empty();
         }
     }
@@ -326,7 +501,9 @@ public class OzServerApiClient
         }
         catch (Exception ex)
         {
-            throw new OzServerApiException($"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}");
+            var transportMessage = DescribeTransportFailure(ex);
+            ActionLog.LogAttempt("POST", path, false, transportMessage);
+            throw new OzServerApiException(transportMessage);
         }
 
         using (response)
@@ -335,12 +512,22 @@ public class OzServerApiClient
             if (!response.IsSuccessStatusCode)
             {
                 var (message, conflicts) = ParseError(responseBody, (int)response.StatusCode);
+                ActionLog.LogAttempt("POST", path, false, message);
                 throw new OzServerApiException(message, (int)response.StatusCode, conflicts);
             }
 
+            ActionLog.LogAttempt("POST", path, true);
             return responseBody;
         }
     }
+
+    // HttpClient reports its own Timeout as a bare TaskCanceledException whose Message is just
+    // "A task was canceled." - indistinguishable, to anyone reading the vatSys error log, from a
+    // cancellation this plugin asked for (it never does). Name the real cause instead.
+    static string DescribeTransportFailure(Exception ex) =>
+        ex is OperationCanceledException // TaskCanceledException, which is what a timeout raises, derives from this
+            ? $"OzServer at {OzServerSettings.BaseUrl} didn't respond within {RequestTimeout.TotalSeconds:0.#}s."
+            : $"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}";
 
     static (string Message, List<OzServerSectorConflictDto> Conflicts) ParseError(string body, int statusCode)
     {
@@ -362,12 +549,7 @@ public class OzServerApiClient
         return ($"OzServer request failed (HTTP {statusCode}): {snippet}", new List<OzServerSectorConflictDto>());
     }
 
-    static (int Cid, string Callsign) GetCredentials()
-    {
-        var callsign = Network.Callsign;
-        if (string.IsNullOrEmpty(callsign) || !int.TryParse(Network.ControllerId, out var cid))
-            throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
-
-        return (cid, callsign);
-    }
+    static (int Cid, string Callsign) GetCredentials() =>
+        NetworkIdentity.Current
+        ?? throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
 }

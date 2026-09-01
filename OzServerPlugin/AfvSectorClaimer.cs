@@ -29,9 +29,21 @@ public class AfvSectorClaimer
     // and only the former should re-baseline.
     string? _lastPrimaryCallsign;
 
+    // Network.Connected fires the moment the session comes up, which is NOT the same moment the
+    // data Init() depends on is usable: Network.Me can still be null, and DefaultSectorsFor matches
+    // Network.Me.Callsign against the profile's own SectorsVolumes.Sectors. A single attempt at
+    // that instant silently granted nothing whenever either side wasn't ready - Init() returned on
+    // the empty result, MMI.SectorsControlled was never written, and since nothing else touches it
+    // on connect there was no second chance. The symptom was logging in on a position and being
+    // handed none of its airspace, having to claim your own sector group by hand.
+    static readonly TimeSpan InitRetryInterval = TimeSpan.FromSeconds(1);
+    const int InitMaxAttempts = 20;
+    readonly System.Threading.Timer _initRetryTimer;
+    int _initAttemptsLeft;
+
     public AfvSectorClaimer()
     {
-        Network.Connected += (_, _) => Init();
+        Network.Connected += (_, _) => BeginInit();
         // VSCSFrequenciesChanged re-baselines via Init() (not CheckActive() - see Init()'s own
         // comment for why) only when the primary callsign has actually changed since Init() last
         // ran, i.e. only for a genuine position change. Init() unconditionally resets
@@ -45,12 +57,43 @@ public class AfvSectorClaimer
         {
             ResubscribeTransmitChanged();
 
-            if (Network.Me.Callsign != _lastPrimaryCallsign)
-                Init();
+            if (Network.Me?.Callsign != _lastPrimaryCallsign)
+                BeginInit();
 
             ControllerInfoUpdater.Update();
         };
+        _initRetryTimer = new System.Threading.Timer(
+            _ => RetryInit(), null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
         ResubscribeTransmitChanged();
+    }
+
+    void BeginInit()
+    {
+        _initAttemptsLeft = InitMaxAttempts;
+        RetryInit();
+    }
+
+    void StopInitRetries() =>
+        _initRetryTimer.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+
+    void RetryInit()
+    {
+        // Session went away while still waiting for it to become ready - nothing left to grant.
+        if (!Network.IsConnected)
+        {
+            StopInitRetries();
+            return;
+        }
+
+        if (Init() || --_initAttemptsLeft <= 0)
+        {
+            StopInitRetries();
+            return;
+        }
+
+        // One-shot reschedule rather than a repeating period, so a slow Init() can never overlap
+        // itself.
+        _initRetryTimer.Change(InitRetryInterval, System.Threading.Timeout.InfiniteTimeSpan);
     }
 
     // Audio.VSCSFrequencies is a fresh array snapshot on every call, and the VSCSFrequency
@@ -87,33 +130,34 @@ public class AfvSectorClaimer
     // VSCSFrequenciesChanged handler): the primary sector matching this session's own login
     // callsign, plus every one of its direct sub-sectors that nobody else is already real-ATC
     // online for. Based on VatpacPlugin's Sectors.Init().
-    void Init()
+    // True once the position's default sectors have actually been granted, which is what tells
+    // RetryInit to stop. False means "not ready yet", never "nothing to do" - see the retry fields.
+    bool Init()
     {
         // Network.Me (and everything else here - VSCS lines, sector callsigns) is only meaningful
         // once actually connected to the network; running this beforehand (e.g. a stray
         // VSCSFrequenciesChanged before login) would touch MMI.SectorsControlled with garbage.
         if (!Network.IsConnected)
-            return;
+            return false;
 
-        _lastPrimaryCallsign = Network.Me.Callsign;
+        var callsign = Network.Me?.Callsign;
+        if (string.IsNullOrEmpty(callsign))
+            return false;
 
-        var primarySector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == Network.Me.Callsign);
-        if (primarySector == null)
-            return;
+        // PrimaryPosition, not an open-coded copy of the same rule: PrimaryPositionWatcher applies
+        // it on the *other* controller's side to decide what to release to this session, and the
+        // two have to agree exactly or a sector is either released to nobody or never handed over.
+        var sectors = PrimaryPosition.DefaultSectorsFor(callsign);
+        if (sectors.Count == 0)
+            return false;
 
-        var sectors = new List<SectorsVolumes.Sector> { primarySector };
-
-        foreach (var subsector in primarySector.SubSectors.ToList())
-        {
-            var onlineAtc = (Network.GetOnlineATCs ?? new List<NetworkATC>())
-                .FirstOrDefault(a => a.Callsign == subsector.Callsign && a.IsRealATC);
-            if (onlineAtc != null)
-                continue;
-
-            sectors.Add(subsector);
-        }
+        // Only recorded once the grant actually happened. Setting it on the way in marked the
+        // position as handled even when nothing was granted, so the VSCSFrequenciesChanged
+        // re-baseline below then saw no callsign change and never gave it a second attempt.
+        _lastPrimaryCallsign = callsign;
 
         MMI.SetControlledSectors(sectors);
+        return true;
     }
 
     // Recomputes MMI.SectorsControlled from ONE VSCS line's current Transmit state - the specific
