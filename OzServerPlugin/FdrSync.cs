@@ -247,8 +247,12 @@ public class FdrSync
     // true - so the datalink authority a push reports is always this session's own identity.
     static void FillAuthority(OzServerFdrUpdateDto dto)
     {
-        if (int.TryParse(Network.ControllerId, out var myCid))
-            dto.ControllingCid = myCid;
+        // Left null when there is no identity yet rather than defaulted, because null is meaningful
+        // on this field: it is what the backend reads as "no datalink authority".
+        var me = NetworkIdentity.Current;
+        if (me != null)
+            dto.ControllingCid = me.Value.Cid;
+
         dto.ControllingCallsign = Network.Callsign;
     }
 

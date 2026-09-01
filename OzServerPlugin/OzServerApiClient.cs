@@ -104,6 +104,14 @@ public class OzServerCommitResultDto
     [JsonProperty("failed")] public List<string> Failed { get; set; } = new();
 }
 
+// What POST /sectors/resume answers with: which sectors were actually recovered, plus the resulting
+// state. Anything not listed was taken by someone else while this controller was away.
+public class OzServerResumeResponseDto
+{
+    [JsonProperty("resumed")] public List<string> Resumed { get; set; } = new();
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
+}
+
 public class OzServerCommitResponseDto
 {
     [JsonProperty("result")] public OzServerCommitResultDto Result { get; set; } = new();
@@ -404,6 +412,11 @@ public class OzServerApiClient
     // reconnect into the same sectors.
     public Task ReleaseAllSectorsAsync() => PostAsync("/sectors/release-all");
 
+    // Asks the backend to put this session back on whatever it was holding when it last left this
+    // same position, if that was recent enough - see SectorOwnershipController::resume.
+    public Task<OzServerResumeResponseDto> ResumeAsync() =>
+        PostAsync<OzServerResumeResponseDto>("/sectors/resume");
+
     // The authoritative "what do I actually own" check (SectorOwnershipController::mine) - used to
     // refresh Owned from OzServer's own record every time the Sectors window opens, rather than
     // trust locally-accumulated state that can drift (a claim from a previous vatSys session, an
@@ -548,12 +561,7 @@ public class OzServerApiClient
         return ($"OzServer request failed (HTTP {statusCode}): {snippet}", new List<OzServerSectorConflictDto>());
     }
 
-    static (int Cid, string Callsign) GetCredentials()
-    {
-        var callsign = Network.Callsign;
-        if (string.IsNullOrEmpty(callsign) || !int.TryParse(Network.ControllerId, out var cid))
-            throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
-
-        return (cid, callsign);
-    }
+    static (int Cid, string Callsign) GetCredentials() =>
+        NetworkIdentity.Current
+        ?? throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
 }

@@ -195,8 +195,13 @@ public class OzServerOwnershipTracker
     {
         if (IsMine(sector))
         {
-            int.TryParse(Network.ControllerId, out var myCid);
-            return new OzServerControlledSectorOwnerDto { Cid = myCid, Callsign = Network.Callsign };
+            // CidOrZero rather than a parse of its own: this only ever describes *this* session, so
+            // there is no case where a missing identity should be attributed to some other cid.
+            return new OzServerControlledSectorOwnerDto
+            {
+                Cid = NetworkIdentity.CidOrZero,
+                Callsign = Network.Callsign,
+            };
         }
 
         return _controlled.TryGetValue(sector.Name, out var owner) ? owner : null;
@@ -209,7 +214,7 @@ public class OzServerOwnershipTracker
         // first-connect refresh than waiting up to PollInterval for the timer below to notice.
         Network.Connected += (_, _) =>
         {
-            _ = RefreshFromServerIfIdleAsync();
+            _ = ResumePreviousSessionAsync();
         };
         // Nothing to take back once this session is over, and a stale entry would otherwise be
         // retried against whatever position it reconnects as.
@@ -384,6 +389,45 @@ public class OzServerOwnershipTracker
     // A failed sync leaves every one of the three exactly as it was rather than half-updating: the
     // previous values staying briefly stale is always better than one view moving while the others
     // do not, which is what made the lists disagree with each other during a blip.
+    // Asks the backend to put this session back on whatever it was holding when it last left this
+    // same position, then adopts whatever came back.
+    //
+    // Runs instead of the plain connect refresh, not alongside it: resume answers with the resulting
+    // state either way, so a session with nothing to recover costs exactly the same one round trip
+    // the refresh would have.
+    //
+    // Only ever recovers what is still free - see SectorOwnershipController::resume. A sector or a
+    // flight somebody picked up while this controller was away stays theirs, so this can never pull
+    // something out from under someone actively working it.
+    async Task ResumePreviousSessionAsync()
+    {
+        if (!Network.IsConnected)
+            return;
+
+        try
+        {
+            var response = await _api.ResumeAsync();
+
+            if (response.Sync != null)
+                ApplySync(response.Sync);
+            else
+                await RefreshFromServerAsync();
+
+            if (response.Resumed.Count > 0)
+            {
+                ActionLog.Log("Ownership",
+                    $"Resumed previous session: {string.Join(", ", response.Resumed)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            // A backend without /sectors/resume, or any transient failure - fall back to the plain
+            // connect refresh so a session still starts correctly, just without recovering anything.
+            Errors.Add(new Exception($"Couldn't resume the previous session: {ex.Message}", ex), "OzServer");
+            await RefreshFromServerIfIdleAsync();
+        }
+    }
+
     void SetPollCadence(bool fast)
     {
         if (fast == _pollingFast)
