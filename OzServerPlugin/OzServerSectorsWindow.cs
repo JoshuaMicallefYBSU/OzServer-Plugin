@@ -1812,11 +1812,19 @@ public class OzServerSectorsWindow : BaseForm
     {
         _onlineByCallsign.Clear();
 
-        foreach (var atc in Network.GetOnlineATCs ?? new List<NetworkATC>())
-        {
-            if (atc.ValidATC && !string.IsNullOrEmpty(atc.Callsign))
-                _onlineByCallsign[atc.Callsign] = atc;
-        }
+        // PrimaryPosition.OnlineRealAtcs, not a second predicate of its own.
+        //
+        // This used to filter on NetworkATC.ValidATC while the primary-inheritance side filtered on
+        // IsRealATC, and those are not the same question. ValidATC is a flag vatSys sets when the
+        // entry simply parses as a recognised ATC position; IsRealATC additionally requires a real
+        // frequency - specifically that frequencies[0] is not 99998, VATSIM's observer sentinel.
+        //
+        // So an observer sitting on a sector's callsign counted as "someone is on it" here and hid
+        // the sector from Available, while PrimaryPosition happily handed that same sector to a
+        // primary logging on. One sector, two answers. IsRealATC is the correct one - an observer is
+        // not controlling anything - and it is what AfvSectorClaimer has always used.
+        foreach (var atc in PrimaryPosition.OnlineRealAtcs())
+            _onlineByCallsign[atc.Callsign] = atc;
     }
 
     static string FormatSectorText(SectorsVolumes.Sector sector, NetworkATC? controller = null)
@@ -1919,7 +1927,13 @@ public class OzServerSectorsWindow : BaseForm
 
     static SectorCategory GetSectorCategory(SectorsVolumes.Sector sector)
     {
+        // Guarded because this runs for every node of every rebuild: the Australia profile gives all
+        // 306 sectors a Callsign, but nothing in the format requires one, and a single null here
+        // would throw inside a tree rebuild rather than anywhere obviously connected to the dataset.
         var callsign = sector.Callsign;
+        if (string.IsNullOrEmpty(callsign))
+            return SectorCategory.Other;
+
         if (callsign.EndsWith("_FMP", StringComparison.OrdinalIgnoreCase))
             return SectorCategory.Flow;
         if (callsign.EndsWith("_CTR", StringComparison.OrdinalIgnoreCase) || callsign.EndsWith("_FSS", StringComparison.OrdinalIgnoreCase))
