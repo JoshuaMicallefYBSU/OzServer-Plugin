@@ -258,8 +258,8 @@ public class OzServerAtisUpdateDto
 }
 
 // Talks to the OzServer backend's sector-ownership API. Every call attaches this vatSys session's
-// CID and callsign; the API accepts it only while that exact pair is in the live VATSIM controller
-// feed. No shared credential is compiled into or sent by the plugin.
+// CID and callsign, which the API uses as the controller identity without waiting for the lagging
+// VATSIM datafeed. No shared credential is compiled into or sent by the plugin.
 public class OzServerApiClient
 {
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);

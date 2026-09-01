@@ -210,11 +210,9 @@ load into the vatSys process at all.
 
 ## Security
 
-The API accepts plugin actions only when the CID and callsign reported by the current vatSys session
-match a controller currently present in the VATSIM datafeed. If that feed is unavailable, protected
-requests fail closed until verification is available again. This intentionally follows the project's
-operational trust model; it verifies an online network identity, not that the HTTP process itself is
-vatSys, because the public datafeed exposes the same CID and callsign to other clients.
+The API uses the CID and callsign reported by the current vatSys session as the controller identity.
+It deliberately does not delay requests for a VATSIM datafeed cross-check: the live feed can lag a
+new connection long enough to reject valid controller actions during login.
 
 **The updater executes what it downloads**, on the next vatSys start, so it is worth being explicit
 about what does and does not guard that:
