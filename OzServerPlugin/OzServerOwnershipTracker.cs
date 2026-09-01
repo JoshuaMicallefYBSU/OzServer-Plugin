@@ -94,6 +94,8 @@ public class OzServerOwnershipTracker
 
     readonly OzServerApiClient _api = new();
     readonly System.Threading.Timer _pollTimer;
+    // Push channel. The poll timer above stays exactly as it was - this only removes latency, it
+    // is never the only thing keeping Owned current. See OzServerEventStream.
     List<SectorsVolumes.Sector> _owned = new();
     // Everyone else's active ownership record, keyed by sector name - the same data
     // OzServerSectorsWindow's "Controlled" pane shows, but kept current unconditionally (like Owned)
@@ -230,12 +232,48 @@ public class OzServerOwnershipTracker
 
             _ = RefreshFromServerIfIdleAsync();
             _ = RetryPendingPrimaryClaimsAsync();
+            RunOnUiThread(RetryUnclaimedMmiSectors);
         }, null, PollInterval, PollInterval);
+
+        // A "sectors" signal covers ownership *and* requests: RefreshFromServerIfIdleAsync reads
+        // /sectors/sync, which returns owned, controlled and requests together, so one signal
+        // answers all three - including the incoming request that drives the popup. Previously
+        // that popup waited on a 10s poll tick (2s once a handoff was already in flight).
+        OzServerEventStream.Shared.EventReceived += name =>
+        {
+            if (name != "sectors" || !Network.IsConnected)
+                return;
+
+            _ = RefreshFromServerIfIdleAsync();
+        };
 
         if (Network.IsConnected)
         {
             _ = RefreshFromServerIfIdleAsync();
         }
+    }
+
+    // Self-heal for a connect-time claim that was dropped before it ever reached the network.
+    // ClaimMmiControlledSectorsAsync returns early when Network.Me has not reported IsRealATC yet,
+    // which is entirely possible at the instant AfvSectorClaimer grants a position its default
+    // sectors on connect - and because MMI.SectorsControlled does not change again afterwards,
+    // nothing re-fired the claim. The result was a controller logged in on their own position,
+    // holding its airspace in MMI, with no OzServer ownership record at all and no error anywhere
+    // to say so; they had to claim their own sector group by hand.
+    //
+    // Only re-enters the claim path when MMI and Owned genuinely disagree, so the ordinary in-sync
+    // case doesn't pay for an extra pass (and its RefreshFromServerAsync) on every tick. Sectors
+    // left contested are pulled back out of MMI by HandleConflictAsync, so a discrepancy here
+    // resolves rather than retrying forever.
+    void RetryUnclaimedMmiSectors()
+    {
+        if (!Network.IsConnected || !IsRealAtc || !_hasBaseline)
+            return;
+
+        if (!MMI.SectorsControlled.Any(s => !s.IsDummy && !_owned.Any(o => o.Equals(s))))
+            return;
+
+        OnMmiSectorsControlledChanged();
     }
 
     // Never lets more than one ClaimMmiControlledSectorsAsync run at a time. MMI.SectorsControlled

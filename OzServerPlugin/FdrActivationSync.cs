@@ -45,9 +45,57 @@ public class FdrActivationSync
     readonly object _knownLock = new();
     HashSet<string> _knownCallsigns = new(StringComparer.OrdinalIgnoreCase);
 
+    // Every FDR push by any controller publishes an "fdr" signal, and FdrSync pushes every 5s per
+    // controller - so across a busy sector group these arrive many times a second. Pulling the
+    // whole /fdr/sync set on each one would be quadratic in connected controllers, turning a
+    // latency fix into a load problem. Coalesce to at most one pull per interval, which still
+    // lands an order of magnitude inside the 10s poll it replaces.
+    static readonly TimeSpan MinPushInterval = TimeSpan.FromSeconds(1);
+
+    readonly object _pushLock = new();
+    DateTime _lastPollStartedUtc = DateTime.MinValue;
+    bool _pushScheduled;
+
     public FdrActivationSync()
     {
         _pollTimer = new System.Threading.Timer(_ => _ = PollAsync(), null, PollInterval, PollInterval);
+        // The poll timer above is kept as the fallback: if the stream is down, this class behaves
+        // exactly as it did before. See OzServerEventStream.
+        OzServerEventStream.Shared.EventReceived += OnServerEvent;
+    }
+
+    void OnServerEvent(string name)
+    {
+        if (name != "fdr" || !Network.IsConnected)
+            return;
+
+        TimeSpan delay;
+
+        lock (_pushLock)
+        {
+            // A pull is already queued for this burst - every further signal in it is answered by
+            // that same pull, since /fdr/sync always returns the whole current set anyway.
+            if (_pushScheduled)
+                return;
+
+            var since = DateTime.UtcNow - _lastPollStartedUtc;
+            if (since >= MinPushInterval)
+            {
+                _ = PollAsync();
+                return;
+            }
+
+            _pushScheduled = true;
+            delay = MinPushInterval - since;
+        }
+
+        _ = Task.Delay(delay).ContinueWith(_ =>
+        {
+            lock (_pushLock)
+                _pushScheduled = false;
+
+            _ = PollAsync();
+        });
     }
 
     public bool IsKnownToServer(string callsign)
@@ -63,6 +111,11 @@ public class FdrActivationSync
     {
         if (!Network.IsConnected)
             return;
+
+        // Recorded here rather than at each call site so the 10s timer and a push both feed the
+        // same coalescing window - a push moments after a timer tick is redundant either way.
+        lock (_pushLock)
+            _lastPollStartedUtc = DateTime.UtcNow;
 
         List<OzServerFdrRecordDto> records;
         try
