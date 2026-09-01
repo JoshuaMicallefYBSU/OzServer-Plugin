@@ -128,6 +128,23 @@ public class OzServerSectorsWindow : BaseForm
     // everything else rather than only when Controlled happens to be showing.
     // Online controllers by callsign, rebuilt once per populate - see RefreshOnlineControllerIndex.
     readonly Dictionary<string, NetworkATC> _onlineByCallsign = new(StringComparer.OrdinalIgnoreCase);
+    // Memoizes ShouldListAsAvailable/ResolveDisplayController for the lifetime of one
+    // PopulateAvailableList pass - see the Clear() calls there. Keyed by name, not the Sector
+    // instance, for the same reason every other Owned/Available comparison in this window is.
+    readonly Dictionary<string, bool> _availabilityCache = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, NetworkATC?> _displayControllerCache = new(StringComparer.OrdinalIgnoreCase);
+    // One canonical TreeNode built per sector per populate pass, cloned (TreeNode.Clone() is a
+    // plain managed deep copy - Text/Name/Tag/NodeFont/ToolTipText and every descendant node, no
+    // native calls) wherever else that same sector needs to appear: its own top-level row and again
+    // under every other primary that covers it (Available - see PopulateAvailableList), or under
+    // more than one owned primary at once (Owned, when two held primaries' groupings overlap).
+    // Rebuilding the whole recursive subtree from scratch for every placement - re-walking
+    // SectorGroupings, re-formatting text, re-running IsCoveredByOwned/FindController - was the
+    // actual cost behind a category with several such primaries feeling slow to redraw on expand.
+    // Cleared at the top of the matching Populate* method; see BuildOwnedSectorNode/
+    // BuildAvailableSectorNode.
+    readonly Dictionary<string, TreeNode> _ownedNodeCache = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, TreeNode?> _availableNodeCache = new(StringComparer.OrdinalIgnoreCase);
     // Names from _controlledSnapshot as a set, so the Available filter is a hash lookup per sector
     // rather than a linear scan of the whole response per sector.
     readonly HashSet<string> _controlledNames = new(StringComparer.OrdinalIgnoreCase);
@@ -275,7 +292,7 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView.BeforeSelect += TreeView_BeforeSelect;
         _requestedChangesView.NodeMouseClick += TreeView_NodeMouseClick;
         _requestedChangesView.MouseWheel += RequestedChangesView_MouseWheel;
-        _requestedChangesView.AfterSelect += (_, _) => UpdateRequestActionButtons();
+        _requestedChangesView.AfterSelect += RequestedChangesView_AfterSelect;
         _requestedChangesView.BeforeCollapse += TreeView_BeforeMouseExpandCollapse;
         _requestedChangesView.BeforeExpand += TreeView_BeforeMouseExpandCollapse;
         _requestedChangesView.AfterCollapse += RequestedChangesView_AfterExpandCollapse;
@@ -1385,6 +1402,16 @@ public class OzServerSectorsWindow : BaseForm
         _requestedChangesView.SetScrollPosVert((_requestedScrollBar.Value + _requestedChangesView.ItemHeight - 1) / _requestedChangesView.ItemHeight);
     }
 
+    // An observer may look at every list in this window but act on none of it: the backend
+    // refuses a claim from a session that is not real ATC, so any control offered here would
+    // only ever produce a refusal. Hidden rather than disabled, for the same reason the arrow
+    // is hidden on an incoming request - a greyed control reads as "not right now", and for an
+    // observer the answer is never.
+    //
+    // Tested as "Me exists and is not real ATC": Network.Me is briefly null after Connected,
+    // and treating that as an observer would blank a real controller's buttons on every login.
+    static bool IsObserver => Network.Me is { IsRealATC: false };
+
     void UpdateArrowButton()
     {
         var ownedSelected = _currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
@@ -1397,6 +1424,17 @@ public class OzServerSectorsWindow : BaseForm
         // lists", and Requested is neither of them.
         _arrowButton.Text = ownedSelected ? ArrowRight : availSelected ? ArrowLeft : ArrowIdle;
         _arrowButton.Enabled = !_applyRunning && (ownedSelected || availSelected);
+
+        // An incoming request is an Accept-or-Reject decision, not a list move. The arrow acts on
+        // whatever is selected over in Owned/Available, and that selection stays highlighted while a
+        // request is being read - so leaving the arrow available invited pressing it and staging a
+        // release of an entirely unrelated sector.
+        //
+        // Hidden rather than disabled: a greyed-out button still reads as "this is the control for
+        // what I am looking at, just not right now", which is the opposite of true here. Accept and
+        // Reject are the only actions an incoming request has.
+        _arrowButton.Visible = !IsObserver
+                               && CategoryNameOf(_requestedChangesView.SelectedNode) != RequestedFromMeName;
     }
 
     // Compares on exactly the footing ApplyButton_Click actually applies: non-dummy sectors, as a
@@ -1422,6 +1460,8 @@ public class OzServerSectorsWindow : BaseForm
         // Nothing to commit and nothing to discard while an Apply is still in flight.
         var pending = HasStagedEdits && !_applyRunning;
 
+        _applyButton.Visible = !IsObserver;
+        _cancelButton.Visible = !IsObserver;
         _applyButton.Enabled = pending;
         _cancelButton.Enabled = pending;
     }
@@ -1523,6 +1563,9 @@ public class OzServerSectorsWindow : BaseForm
     // dropdown or scroll the list back to the top out from under them.
     void PopulateOwnedList()
     {
+        // See _ownedNodeCache - cleared per pass, not per call site.
+        _ownedNodeCache.Clear();
+
         var sectorNodes = new List<TreeNode>();
         foreach (var key in _sectorsSelected)
         {
@@ -1582,11 +1625,26 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
+    // Cached and cloned per sector name for the lifetime of one PopulateOwnedList pass (see
+    // _ownedNodeCache) - two held primaries whose groupings overlap on a shared sub-sector would
+    // otherwise have that sub-sector's whole subtree rebuilt from scratch a second time. The
+    // recursive call below goes through this wrapper, not the Core method directly, so a deeply
+    // nested repeat benefits too.
+    TreeNode BuildOwnedSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    {
+        if (_ownedNodeCache.TryGetValue(sector.Name, out var cached))
+            return (TreeNode)cached.Clone();
+
+        var node = BuildOwnedSectorNodeCore(sector, depth);
+        _ownedNodeCache[sector.Name] = node;
+        return (TreeNode)node.Clone();
+    }
+
     // Recurses through a grouping sector's own sub-sectors (e.g. TBD > AAE > AAW/AAR) - always
     // shown regardless of whether those sub-sectors are also independent _sectorsSelected entries,
     // since a grouping sector owns them outright. Every level that ends up with children gets its
     // own >/v treatment (see ApplySectorNodeText), not just the outermost one.
-    TreeNode BuildOwnedSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    TreeNode BuildOwnedSectorNodeCore(SectorsVolumes.Sector sector, int depth)
     {
         var node = new TreeNode { Tag = sector, NodeFont = _currSectorsView.Font };
 
@@ -1656,6 +1714,12 @@ public class OzServerSectorsWindow : BaseForm
 
         // Once for the whole pass, not once per sector - see FindController.
         RefreshOnlineControllerIndex();
+
+        // See _availabilityCache/_displayControllerCache/_availableNodeCache - cleared per pass,
+        // not per call site.
+        _availabilityCache.Clear();
+        _displayControllerCache.Clear();
+        _availableNodeCache.Clear();
 
         var candidates = SectorsVolumes.Sectors.Where(s => s.CSECEligible && ShouldListAsAvailable(s)).ToList();
 
@@ -1744,6 +1808,19 @@ public class OzServerSectorsWindow : BaseForm
         {
             foreach (var child in children)
             {
+                // A sub-sector this controller owns is not "controlled by someone else", even when
+                // the group above it belongs to someone else. Exactly the same trap as
+                // BuildOwnedSectorNode: this tree is built from the local dataset's groupings, which
+                // know nothing about a sub-sector having been handed over individually. The symptom
+                // was taking a sub-sector off another controller and watching it sit in Controlled -
+                // correctly gone from their side, but never showing up as ours.
+                //
+                // Only our own are filtered. A sub-sector held by a third controller still belongs
+                // in this tree: every node here is labelled with its actual holder, so the nesting
+                // reads correctly rather than misleading.
+                if (!ReferenceEquals(child, sector) && _tracker.IsMine(child))
+                    continue;
+
                 node.Nodes.Add(ReferenceEquals(child, sector)
                     ? new TreeNode(LeafText(ControlledSectorText(child, owners))) { Tag = child, NodeFont = node.NodeFont, ToolTipText = LeafText(ControlledSectorText(child, owners)) }
                     : BuildControlledSectorNode(child, owners, depth + 1));
@@ -1860,9 +1937,22 @@ public class OzServerSectorsWindow : BaseForm
     // Owned/Available decision in this window uses (see StageSectorChange), and the two used to
     // disagree here - the list filtered by name while the node builder filtered by Sector.Equals,
     // which is callsign-based.
-    bool ShouldListAsAvailable(SectorsVolumes.Sector sector) =>
-        !_sectorsSelected.Any(owned => !owned.IsDummy && owned.Name == sector.Name)
-        && !IsCoveredByOwned(sector);
+    //
+    // Memoized per populate pass (see _availabilityCache) - called once for every sector in
+    // SectorsVolumes.Sectors by the top-level candidate filter, and again by
+    // BuildAvailableSectorNode's own entry check for that same sector. The answer never changes
+    // mid-pass (_sectorsSelected is fixed for the duration), so recomputing IsCoveredByOwned's scan
+    // on every one of those calls was pure waste.
+    bool ShouldListAsAvailable(SectorsVolumes.Sector sector)
+    {
+        if (_availabilityCache.TryGetValue(sector.Name, out var cached))
+            return cached;
+
+        var result = !_sectorsSelected.Any(owned => !owned.IsDummy && owned.Name == sector.Name)
+                     && !IsCoveredByOwned(sector);
+        _availabilityCache[sector.Name] = result;
+        return result;
+    }
 
     void ApplyAvailableSectorNodes(List<TreeNode> sectorNodes, string modePrefix)
     {
@@ -1924,12 +2014,30 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
+    // Cached and cloned per sector name for the lifetime of one PopulateAvailableList pass (see
+    // _availableNodeCache) - a sub-sector now deliberately gets built more than once per pass (its
+    // own top-level row, and again wherever a different primary nests it - see
+    // PopulateAvailableList), which used to mean re-walking that sector's own SectorGroupings and
+    // re-running ShouldListAsAvailable/ResolveDisplayController on every one of those repeats. The
+    // recursive call below goes through this wrapper, not the Core method directly, so a deeply
+    // nested repeat benefits too. null is cached like any other result - a sector that doesn't
+    // belong in Available at all is just as stable for the pass as one that does.
+    TreeNode? BuildAvailableSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    {
+        if (_availableNodeCache.TryGetValue(sector.Name, out var cached))
+            return (TreeNode?)cached?.Clone();
+
+        var node = BuildAvailableSectorNodeCore(sector, depth);
+        _availableNodeCache[sector.Name] = node;
+        return (TreeNode?)node?.Clone();
+    }
+
     // Recurses through a sector's own sub-sectors so a primary position nested at any depth (e.g.
     // AAE inside TBD, or AAW/AAR inside AAE) still gets its own dropdown treatment and its own
     // "who's on it" annotation. Returns null only if this sector doesn't belong in Available at all
     // - already this controller's own, in one form or another (see ShouldListAsAvailable); being
     // occupied or owned by someone else is no longer a reason to hide it, only to say so.
-    TreeNode? BuildAvailableSectorNode(SectorsVolumes.Sector sector, int depth = 0)
+    TreeNode? BuildAvailableSectorNodeCore(SectorsVolumes.Sector sector, int depth)
     {
         if (!ShouldListAsAvailable(sector))
             return null;
@@ -1968,10 +2076,18 @@ public class OzServerSectorsWindow : BaseForm
     // theirs, so seeing themselves here means the network hasn't caught up with a local unstage yet,
     // and displaying "(me)" on a row about to disappear on its own is more confusing than showing
     // nothing.
+    //
+    // Memoized per populate pass (see _displayControllerCache), same reasoning as
+    // ShouldListAsAvailable.
     NetworkATC? ResolveDisplayController(SectorsVolumes.Sector sector)
     {
+        if (_displayControllerCache.TryGetValue(sector.Name, out var cached))
+            return cached;
+
         var controller = FindController(sector);
-        return controller != null && controller.Callsign == Network.Callsign ? null : controller;
+        var result = controller != null && controller.Callsign == Network.Callsign ? null : controller;
+        _displayControllerCache[sector.Name] = result;
+        return result;
     }
 
     // Reads the per-populate snapshot, never Network.GetOnlineATCs directly.
@@ -2264,17 +2380,50 @@ public class OzServerSectorsWindow : BaseForm
         UpdateArrowButton();
     }
 
+    // Exactly one row in the window is selected at any time. Owned and Available already cleared
+    // each other; Requested is now part of the same exclusion. Without it a highlight left behind in
+    // Owned sat there while the controller worked in Requested, and the arrow - which reads the
+    // Owned/Available selection - appeared to be offering an action on the request being read while
+    // actually pointing at an unrelated sector.
+    //
+    // Every one of these is guarded on e.Node != null for the same reason: clearing a selection
+    // raises AfterSelect again with a null node, and acting on that would immediately undo the
+    // selection the controller just made.
     void AvailSectorsView_AfterSelect(object? sender, TreeViewEventArgs e)
     {
         if (e.Node != null)
+        {
             _currSectorsView.SelectedNode = null;
+            _requestedChangesView.SelectedNode = null;
+        }
+
         UpdateArrowButton();
+        UpdateRequestActionButtons();
     }
 
     void CurrSectorsView_AfterSelect(object? sender, TreeViewEventArgs e)
     {
         if (e.Node != null)
+        {
             _availSectorsView.SelectedNode = null;
+            _requestedChangesView.SelectedNode = null;
+        }
+
+        UpdateArrowButton();
+        UpdateRequestActionButtons();
+    }
+
+    void RequestedChangesView_AfterSelect(object? sender, TreeViewEventArgs e)
+    {
+        if (e.Node != null)
+        {
+            _currSectorsView.SelectedNode = null;
+            _availSectorsView.SelectedNode = null;
+        }
+
+        UpdateRequestActionButtons();
+        // The arrow hides while an incoming request is selected, so it has to re-evaluate on a
+        // selection change in this tree too, not only in Owned/Available.
         UpdateArrowButton();
     }
 
@@ -2725,6 +2874,8 @@ public class OzServerSectorsWindow : BaseForm
         var requestsActionable = !_requestActionRunning && Network.IsConnected;
         var category = CategoryNameOf(selected);
 
+        _acceptButton.Visible = !IsObserver;
+        _rejectButton.Visible = !IsObserver;
         _acceptButton.Enabled = requestsActionable && GetRequestsToAccept(selected).Count > 0;
         _rejectButton.Enabled = requestsActionable
                                  && FindOwningRequest(selected) != null

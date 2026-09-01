@@ -47,6 +47,10 @@ public class OzServerSectorOwnershipRequestDto
 {
     [JsonProperty("id")] public int Id { get; set; }
     [JsonProperty("sector_id")] public int SectorId { get; set; }
+    // Every sector requested by one Apply carries the same group id, so the receiving controller is
+    // asked once about the whole thing instead of once per sector. Requests made before the backend
+    // had groups each carry their own, which is correct - they really were independent.
+    [JsonProperty("group_id")] public string GroupId { get; set; } = "";
     [JsonProperty("requesting_cid")] public int RequestingCid { get; set; }
     [JsonProperty("requesting_callsign")] public string RequestingCallsign { get; set; } = "";
     [JsonProperty("target_cid")] public int TargetCid { get; set; }
@@ -86,6 +90,12 @@ public class OzServerAcceptBatchResultDto
     [JsonProperty("message")] public string Message { get; set; } = "";
 }
 
+public class OzServerRejectBatchResponseDto
+{
+    [JsonProperty("rejected")] public List<int> Rejected { get; set; } = new();
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
+}
+
 public class OzServerAcceptBatchResponseDto
 {
     [JsonProperty("results")] public List<OzServerAcceptBatchResultDto> Results { get; set; } = new();
@@ -109,6 +119,11 @@ public class OzServerCommitResultDto
 public class OzServerResumeResponseDto
 {
     [JsonProperty("resumed")] public List<string> Resumed { get; set; } = new();
+    // Tags the backend actually handed back - flights this controller was working before they
+    // dropped, minus any another controller picked up while they were away (the backend refuses to
+    // take those). These come straight back to the controller rather than flashing for acceptance;
+    // see TagOwnershipSync.OnTagsResumed.
+    [JsonProperty("flights")] public List<string> Flights { get; set; } = new();
     [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
 }
 
@@ -355,6 +370,11 @@ public class OzServerApiClient
 
     public Task<OzServerActionResultDto> RejectRequestAsync(int requestId) =>
         PostAsync<OzServerActionResultDto>($"/sector-requests/{requestId}/reject");
+
+    // Mirrors AcceptRequestsBatchAsync: declines a whole grouped request in one call rather than
+    // one per sector, so a group is accepted or refused as the single decision it is.
+    public Task<OzServerRejectBatchResponseDto> RejectRequestsBatchAsync(IEnumerable<int> requestIds) =>
+        PostAsync<OzServerRejectBatchResponseDto>("/sector-requests/reject-batch", new { request_ids = requestIds.ToArray() });
 
     public Task<OzServerActionResultDto> CancelRequestAsync(int requestId) =>
         PostAsync<OzServerActionResultDto>($"/sector-requests/{requestId}/cancel");

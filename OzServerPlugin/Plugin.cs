@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.Linq;
 using System.Windows.Forms;
@@ -43,12 +44,17 @@ public class Plugin : IPlugin
     // Also purely event-driven, and has to be alive from plugin load: the disconnect it reacts to
     // can happen long before the Sectors window is ever opened.
     readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
+    readonly ObserverPositionMirror _observerPositionMirror;
     // Timer-driven and entirely invisible - it never touches the running session, only what is on
     // disk for the next one. See its own class comment for why it can't just overwrite the DLL.
     readonly PluginUpdater _updater;
 
     // Incoming requests waiting on this controller, driving the Settings header's flash.
     int _pendingRequests;
+    // Request groups already put to the controller, so a group is prompted once rather than
+    // again on every refresh while it sits unanswered. Pruned to whatever is still pending, so
+    // a request that is withdrawn and made again does prompt a second time.
+    readonly HashSet<string> _promptedRequestGroups = new(StringComparer.OrdinalIgnoreCase);
     ToolStripMenuItem? _settingsMenuHeader;
     ToolStripItem? _ozServerSectorsItem;
 
@@ -72,6 +78,8 @@ public class Plugin : IPlugin
         // After the tracker, which it releases through.
         _primaryPositionWatcher = new PrimaryPositionWatcher(_ownershipTracker);
         _gracefulDisconnectReleaser = new GracefulDisconnectReleaser();
+        // After the tracker, whose ControlledByOthers it mirrors.
+        _observerPositionMirror = new ObserverPositionMirror(_ownershipTracker);
         // Last, and dependent on nothing: it only ever reads GitHub and writes files next to this
         // assembly, so it has no ordering relationship with anything above it.
         _updater = new PluginUpdater();
@@ -109,6 +117,8 @@ public class Plugin : IPlugin
 
                 if (_sectorsWindow is { IsDisposed: false } window)
                     window.FlashTitleBar = _pendingRequests > 0 && !window.ContainsFocus;
+
+                PromptForNewRequestGroups(requests);
             }
 
             // The poll this comes from runs on a background timer thread.
@@ -183,6 +193,62 @@ public class Plugin : IPlugin
 
     // Drives the two properties MenuRenderer itself actually keys its painting off - see the
     // IncomingRequestsChanged comment above for why ForeColor/BackColor never worked here.
+    // One window per request group, not per sector. Everything another controller asked for in a
+    // single Apply shares a group id, so a request covering three sectors is one decision and is put
+    // to the controller once, listing all three - which is the whole point of grouping them.
+    //
+    // Accept and Reject both act on every id in the group through the batch endpoints, so a grouped
+    // request can never end up half-answered.
+    void PromptForNewRequestGroups(IReadOnlyList<OzServerSectorOwnershipRequestDto> requests)
+    {
+        var groups = requests
+            .Where(request => request.RejectedAt == null)
+            .GroupBy(request => string.IsNullOrEmpty(request.GroupId) ? $"request-{request.Id}" : request.GroupId,
+                     StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        // Anything no longer pending is forgotten, so the same sectors requested again later are a
+        // new decision and prompt again.
+        _promptedRequestGroups.IntersectWith(groups.Select(group => group.Key));
+
+        foreach (var group in groups)
+        {
+            if (!_promptedRequestGroups.Add(group.Key))
+                continue;
+
+            var ids = group.Select(request => request.Id).ToList();
+            var who = group.First().RequestingCallsign;
+            var sectors = group
+                .Select(request => request.Sector?.Name ?? $"#{request.SectorId}")
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(name => name, StringComparer.Ordinal)
+                .ToList();
+
+            var lead = sectors.Count == 1
+                ? $"{who} has requested this sector from you:"
+                : $"{who} has requested these {sectors.Count} sectors from you:";
+
+            var message = lead
+                          + Environment.NewLine + Environment.NewLine
+                          + string.Join(Environment.NewLine, sectors);
+
+            var prompt = new SectorRequestPromptWindow(
+                message,
+                "Sector requested",
+                () => _ = _ownershipTracker.AcceptRequestsBatchAsync(ids),
+                () => _ = _ownershipTracker.RejectRequestsBatchAsync(ids));
+
+            // Non-modal, same as SectorNoticeWindow: a modal dialog would freeze vatSys until the
+            // controller noticed it, and they may well be mid-transmission.
+            if (Application.OpenForms["MainForm"] is Form mainForm)
+                prompt.Show(mainForm);
+            else
+                prompt.Show();
+
+            prompt.BringToFront();
+        }
+    }
+
     void RefreshRequestFlash()
     {
         var pending = _pendingRequests > 0;
