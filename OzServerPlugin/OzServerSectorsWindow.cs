@@ -91,6 +91,18 @@ public class OzServerSectorsWindow : BaseForm
     bool _suspendScrollSync;
     // See SetScrollBarValue - stops a code-assigned scrollbar value bouncing back into the tree.
     bool _syncingScrollBar;
+    // Which nodes are currently expanded, tracked in managed memory.
+    //
+    // TreeNode.IsExpanded is not a managed flag: WinForms answers it with a TVM_GETITEM round trip
+    // to the native control, per call. CountVisibleNodes and CaptureExpanded both walk the tree
+    // asking it of every node, and CountVisibleNodes runs on every single expand (via
+    // Configure*Scrollbar) - so opening a category with a hundred sectors under it fired a hundred
+    // SendMessages immediately after the expand. That was the pause between clicking and the list
+    // opening.
+    //
+    // Maintained from the AfterExpand/AfterCollapse handlers, which cost one such call each - once
+    // per event rather than once per node.
+    readonly HashSet<TreeNode> _expandedNodes = new();
     // Last content height each scrollbar was configured for - see the Configure*Scrollbar methods.
     int _currContentHeight = -1;
     int _availContentHeight = -1;
@@ -198,6 +210,7 @@ public class OzServerSectorsWindow : BaseForm
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText)
         };
         _availSectorsView.DrawNode += SectorsView_DrawNode;
+        _availSectorsView.BeforeSelect += TreeView_BeforeSelect;
         _availSectorsView.NodeMouseClick += TreeView_NodeMouseClick;
         _availSectorsView.MouseUp += TreeView_MouseUp;
         _availSectorsView.MouseWheel += AvailSectorsView_MouseWheel;
@@ -224,6 +237,7 @@ public class OzServerSectorsWindow : BaseForm
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText)
         };
         _currSectorsView.DrawNode += SectorsView_DrawNode;
+        _currSectorsView.BeforeSelect += TreeView_BeforeSelect;
         _currSectorsView.NodeMouseClick += TreeView_NodeMouseClick;
         _currSectorsView.MouseUp += TreeView_MouseUp;
         _currSectorsView.MouseWheel += CurrSectorsView_MouseWheel;
@@ -256,6 +270,7 @@ public class OzServerSectorsWindow : BaseForm
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText)
         };
         _requestedChangesView.DrawNode += SectorsView_DrawNode;
+        _requestedChangesView.BeforeSelect += TreeView_BeforeSelect;
         _requestedChangesView.NodeMouseClick += TreeView_NodeMouseClick;
         _requestedChangesView.MouseUp += TreeView_MouseUp;
         _requestedChangesView.MouseWheel += RequestedChangesView_MouseWheel;
@@ -699,6 +714,13 @@ public class OzServerSectorsWindow : BaseForm
 
     void CurrSectorsView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
     {
+        // One IsExpanded call per event keeps the managed set current, so the walks that run per
+        // node never have to ask the native control at all - see _expandedNodes.
+        if (e.Node.IsExpanded)
+            _expandedNodes.Add(e.Node);
+        else
+            _expandedNodes.Remove(e.Node);
+
         RefreshDropdownNodeText(e.Node);
 
         // _suspendScrollSync as well as _rebuildingTree: this fires from inside
@@ -714,6 +736,13 @@ public class OzServerSectorsWindow : BaseForm
 
     void AvailSectorsView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
     {
+        // One IsExpanded call per event keeps the managed set current, so the walks that run per
+        // node never have to ask the native control at all - see _expandedNodes.
+        if (e.Node.IsExpanded)
+            _expandedNodes.Add(e.Node);
+        else
+            _expandedNodes.Remove(e.Node);
+
         RefreshDropdownNodeText(e.Node);
 
         // _suspendScrollSync as well as _rebuildingTree: this fires from inside
@@ -745,6 +774,13 @@ public class OzServerSectorsWindow : BaseForm
 
     void RequestedChangesView_AfterExpandCollapse(object? sender, TreeViewEventArgs e)
     {
+        // One IsExpanded call per event keeps the managed set current, so the walks that run per
+        // node never have to ask the native control at all - see _expandedNodes.
+        if (e.Node.IsExpanded)
+            _expandedNodes.Add(e.Node);
+        else
+            _expandedNodes.Remove(e.Node);
+
         RefreshDropdownNodeText(e.Node);
 
         // _suspendScrollSync as well as _rebuildingTree: this fires from inside
@@ -778,6 +814,9 @@ public class OzServerSectorsWindow : BaseForm
             return;
 
         var treeView = (TreeViewEx)sender!;
+
+        // Non-selectable rows are filtered by TreeView_BeforeSelect; assigning here anyway would
+        // simply be cancelled, so it is only done for rows that can actually take it.
         treeView.SelectedNode = e.Node;
 
         // The category headers - the position types (Approach/Centre/Tower/...) in Owned and
@@ -794,6 +833,18 @@ public class OzServerSectorsWindow : BaseForm
     }
 
     static bool IsCategoryNode(TreeNode node) => ReferenceEquals(node.Tag, CategoryTag);
+
+    // Only rows that stand for something - a sector, or a request - can be highlighted. The group
+    // headings (Flow/Centre/Approach/..., Requested By/From Me) and the informational placeholder
+    // rows are labels, and highlighting a label suggests it can be acted on when it cannot.
+    //
+    // Cancelling here rather than only in the click handler covers every route into a selection:
+    // keyboard navigation, and the selection restore that runs after a rebuild.
+    static void TreeView_BeforeSelect(object? sender, TreeViewCancelEventArgs e)
+    {
+        if (e.Node?.Tag is not SectorsVolumes.Sector && e.Node?.Tag is not SectorChangeRequest)
+            e.Cancel = true;
+    }
 
     // The Requested From Me heading, on the lit half of its flash cycle, while requests are waiting.
     bool IsFlashingHeading(TreeNode node) =>
@@ -863,16 +914,16 @@ public class OzServerSectorsWindow : BaseForm
 
         var accept = new ToolStripMenuItem("Accept")
         {
-            Enabled = requestsActionable && GetRequestsToAccept().Count > 0
+            Enabled = requestsActionable && GetRequestsToAccept(node).Count > 0
         };
-        accept.Click += (_, _) => _ = AcceptSelectedRequestsAsync();
+        accept.Click += (_, _) => _ = AcceptSelectedRequestsAsync(node);
         menu.Items.Add(accept);
 
         var reject = new ToolStripMenuItem("Reject")
         {
             Enabled = requestsActionable && request != null && CategoryNameOf(node) == RequestedFromMeName
         };
-        reject.Click += (_, _) => _ = RejectSelectedRequestAsync();
+        reject.Click += (_, _) => _ = RejectSelectedRequestAsync(node);
         menu.Items.Add(reject);
         menu.Items.Add(new ToolStripSeparator());
 
@@ -910,7 +961,7 @@ public class OzServerSectorsWindow : BaseForm
     // Reporting this rather than silently doing nothing matters: the first version returned quietly
     // when it found no match, which left the sector showing in Available *and* Owned at once - so a
     // move looked like it had not happened.
-    static bool RemoveSectorRow(TreeViewEx view, string sectorName)
+    static bool RemoveSectorRow(TreeViewEx view, string sectorName, Action<TreeNode> forget)
     {
         foreach (TreeNode group in view.Nodes)
         {
@@ -926,10 +977,14 @@ public class OzServerSectorsWindow : BaseForm
                 if (candidate.Nodes.Count > 0)
                     return false;
 
+                forget(candidate);
                 group.Nodes.RemoveAt(i);
 
                 if (group.Nodes.Count == 0)
+                {
+                    forget(group);
                     group.Remove();
+                }
 
                 return true;
             }
@@ -997,10 +1052,18 @@ public class OzServerSectorsWindow : BaseForm
         _suspendScrollSync = true;
         try
         {
-            if (node.IsExpanded)
-                node.Collapse();
-            else
+            var expanding = !node.IsExpanded;
+
+            // Marker updated to its target state *before* the expand, not from inside the
+            // AfterExpand notification it raises. The control then paints the whole change once,
+            // with the final text already in place, instead of painting the new rows and then being
+            // dirtied again half way through - which is what the flicker was.
+            SetDropdownNodeText(node, expanding);
+
+            if (expanding)
                 node.Expand();
+            else
+                node.Collapse();
         }
         finally
         {
@@ -1030,37 +1093,50 @@ public class OzServerSectorsWindow : BaseForm
         return false;
     }
 
-    // Every node - group header or leaf - reads dark blue at rest and light blue when selected,
-    // with no other status-based colouring anywhere in the tree.
-    // Deliberately the same shape as vatsys.SectorsWindow.SectorsView_DrawNode: save the clip, clip
-    // to the row, clear it to the tree's own BackColor, draw the text, restore the clip. The colour
-    // is HighlightedText when selected and the tree's own ForeColor otherwise - vatSys reads
-    // ForeColor rather than naming an identity, so a tree keeps whatever colour it was given.
-    //
-    // The two additions are this window's own: a staged row (moved but not yet applied) and the
-    // Requested From Me heading while it is flashing both take WindowWarning, the profile's
-    // "needs attention" identity. Selection still wins over both.
+    // Same shape as vatsys.SectorsWindow.SectorsView_DrawNode - save the clip, clip, clear, draw the
+    // text, restore - and reads the tree's own ForeColor/BackColor rather than naming identities, so
+    // a tree keeps whatever colours it was given. What it draws for selection and for this window's
+    // own flagged rows is described inline below.
     void SectorsView_DrawNode(object? sender, DrawTreeNodeEventArgs e)
     {
         var treeView = (TreeViewEx)sender!;
         var selected = (e.State & TreeNodeStates.Selected) != 0;
+        var flagged = IsStagedNode(e.Node) || IsFlashingHeading(e.Node);
 
-        var color = selected
-            ? Colours.GetColour(Colours.Identities.HighlightedText)
-            : IsStagedNode(e.Node) || IsFlashingHeading(e.Node)
-                ? Colours.GetColour(Colours.Identities.WindowWarning)
+        // Selection is a filled bar, which is how vatSys marks a highlighted row everywhere else -
+        // WindowButtonSelected (DarkBlue in this profile) behind WindowBackground text, the same
+        // inversion its own menus use. It used to recolour the text to HighlightedText (CyanBlue)
+        // and leave the background alone, which read as a different kind of thing entirely.
+        //
+        // A staged row keeps its WindowWarning text even while selected: BrightYellow stays legible
+        // on that fill, and losing the staged marker just because the row is highlighted would hide
+        // the one thing the controller most needs to see.
+        var background = selected
+            ? Colours.GetColour(Colours.Identities.WindowButtonSelected)
+            : treeView.BackColor;
+
+        var foreground = flagged
+            ? Colours.GetColour(Colours.Identities.WindowWarning)
+            : selected
+                ? Colours.GetColour(Colours.Identities.WindowBackground)
                 : treeView.ForeColor;
 
+        // The bar spans the full width of the control, not just the label - e.Bounds under
+        // OwnerDrawText is only the text. Unselected rows still clip to e.Bounds, exactly as
+        // vatsys.SectorsWindow's own DrawNode does.
+        var fill = selected
+            ? new Rectangle(0, e.Bounds.Top, treeView.ClientSize.Width, e.Bounds.Height)
+            : e.Bounds;
+
         // Graphics.Clip's getter allocates a fresh Region rather than handing back a borrowed one,
-        // so the saved original needs disposing just as much as the replacement does. The setter
-        // copies what it is given, which is what makes disposing the replacement immediately safe.
+        // so the saved original needs disposing just as much as the replacement does.
         using var previousClip = e.Graphics.Clip;
 
-        using (var clip = new Region(e.Bounds))
+        using (var clip = new Region(fill))
             e.Graphics.Clip = clip;
 
-        e.Graphics.Clear(treeView.BackColor);
-        TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, color);
+        e.Graphics.Clear(background);
+        TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, foreground);
 
         e.Graphics.Clip = previousClip;
     }
@@ -1076,13 +1152,30 @@ public class OzServerSectorsWindow : BaseForm
         node.ToolTipText = node.Text;
     }
 
-    static void RefreshDropdownNodeText(TreeNode node)
+    static void RefreshDropdownNodeText(TreeNode node) => SetDropdownNodeText(node, node.IsExpanded);
+
+    // Writes the >/v prefix for a given expansion state, and only when it would actually change.
+    //
+    // Both assignments are TVM_SETITEM round trips that dirty the node, so doing them
+    // unconditionally repainted rows that already read correctly. That mattered most from inside
+    // AfterExpand: the control had just painted the newly revealed rows, and rewriting the node's
+    // text there dirtied it again mid-operation and forced a second paint pass over the list. That
+    // double draw is what the expand flicker was.
+    //
+    // vatsys.SectorsWindow has no such marker at all - ShowPlusMinus is false and nothing annotates
+    // the text - so none of this is inherited behaviour to preserve. It is ours, and it has to be
+    // cheap enough not to cost a repaint.
+    static void SetDropdownNodeText(TreeNode node, bool expanded)
     {
         if (string.IsNullOrEmpty(node.Name))
             return;
 
-        node.Text = (node.IsExpanded ? ExpandedPrefix : CollapsedPrefix) + node.Name;
-        node.ToolTipText = node.Text;
+        var text = (expanded ? ExpandedPrefix : CollapsedPrefix) + node.Name;
+        if (node.Text == text)
+            return;
+
+        node.Text = text;
+        node.ToolTipText = text;
     }
 
     static void RefreshDropdownNodeTextRecursive(TreeNode node)
@@ -1128,7 +1221,7 @@ public class OzServerSectorsWindow : BaseForm
         public int ScrollValue;
     }
 
-    static TreeViewState CaptureTreeState(TreeViewEx view, ScrollBar scrollBar)
+    TreeViewState CaptureTreeState(TreeViewEx view, ScrollBar scrollBar)
     {
         var state = new TreeViewState { ScrollValue = scrollBar.Value };
         var selected = view.SelectedNode;
@@ -1139,7 +1232,7 @@ public class OzServerSectorsWindow : BaseForm
     // Descends only into branches that are open. A collapsed branch cannot contain an expanded node
     // by definition, so walking it was pure waste - and it is where nearly all the nodes live.
     // The selected node's key is picked up on the way past rather than rebuilt from scratch.
-    static void CaptureExpanded(TreeNodeCollection nodes, string parentKey, TreeViewState state, TreeNode? selected)
+    void CaptureExpanded(TreeNodeCollection nodes, string parentKey, TreeViewState state, TreeNode? selected)
     {
         foreach (TreeNode node in nodes)
         {
@@ -1149,7 +1242,7 @@ public class OzServerSectorsWindow : BaseForm
             if (ReferenceEquals(node, selected))
                 state.SelectedKey = key;
 
-            if (!node.IsExpanded)
+            if (!_expandedNodes.Contains(node))
                 continue;
 
             state.ExpandedKeys.Add(key);
@@ -1272,20 +1365,32 @@ public class OzServerSectorsWindow : BaseForm
     //
     // Same answer, walked in managed code, and only descending into branches that are actually
     // open - a collapsed tree costs a handful of checks instead of hundreds of messages.
-    static int VisibleContentHeight(TreeViewEx view) =>
+    int VisibleContentHeight(TreeViewEx view) =>
         CountVisibleNodes(view.Nodes) * Math.Max(view.ItemHeight, 1);
 
-    static int CountVisibleNodes(TreeNodeCollection nodes)
+    int CountVisibleNodes(TreeNodeCollection nodes)
     {
         var count = 0;
         foreach (TreeNode node in nodes)
         {
             count++;
-            if (node.IsExpanded)
+            if (_expandedNodes.Contains(node))
                 count += CountVisibleNodes(node.Nodes);
         }
 
         return count;
+    }
+
+    // Drops a discarded subtree from the expansion set. Called before a rebuild clears the nodes,
+    // because the set holds references and those nodes are about to cease to exist. Purely managed -
+    // enumerating TreeNodeCollection touches no native state.
+    void ForgetNodes(TreeNodeCollection nodes)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            _expandedNodes.Remove(node);
+            ForgetNodes(node.Nodes);
+        }
     }
 
     // The tree's own Height is never touched. An earlier version sized each tree to its full content
@@ -1533,6 +1638,8 @@ public class OzServerSectorsWindow : BaseForm
             _currSectorsView.BeginUpdate();
             try
             {
+                // Drop the outgoing nodes from the expansion set before they are discarded.
+                ForgetNodes(_currSectorsView.Nodes);
                 _currSectorsView.Nodes.Clear();
                 AddNodesGroupedByCategory(_currSectorsView, sectorNodes);
 
@@ -1807,6 +1914,8 @@ public class OzServerSectorsWindow : BaseForm
             _availSectorsView.BeginUpdate();
             try
             {
+                // Drop the outgoing nodes from the expansion set before they are discarded.
+                ForgetNodes(_availSectorsView.Nodes);
                 _availSectorsView.Nodes.Clear();
                 build(_availSectorsView);
                 RestoreExpandedAndSelection(_availSectorsView, state);
@@ -2212,11 +2321,11 @@ public class OzServerSectorsWindow : BaseForm
 
     // Shared by the Accept button and the menu's Accept, so both act on the identical selection
     // rule (see GetRequestsToAccept) rather than drifting apart.
-    async Task AcceptSelectedRequestsAsync()
+    async Task AcceptSelectedRequestsAsync(TreeNode? node)
     {
         try
         {
-            var requests = GetRequestsToAccept();
+            var requests = GetRequestsToAccept(node);
             if (requests.Count > 0)
                 await AcceptRequestsAsync(requests);
         }
@@ -2227,14 +2336,14 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
-    async Task RejectSelectedRequestAsync()
+    async Task RejectSelectedRequestAsync(TreeNode? node)
     {
         try
         {
             // FindOwningRequest, not a direct Tag test - a request that bundles sub-sectors
             // renders them as rows underneath it, and clicking one of those means that request.
-            var request = FindOwningRequest(_requestedChangesView.SelectedNode);
-            if (request != null && CategoryNameOf(_requestedChangesView.SelectedNode) == RequestedFromMeName)
+            var request = FindOwningRequest(node);
+            if (request != null && CategoryNameOf(node) == RequestedFromMeName)
                 await RejectRequestAsync(request);
         }
         catch (Exception ex)
@@ -2331,7 +2440,7 @@ public class OzServerSectorsWindow : BaseForm
             //
             // The signature is dropped so the next refresh still does a full, authoritative rebuild:
             // this is a shortcut to the same picture, not a replacement for deriving it properly.
-            if (RemoveSectorRow(_availSectorsView, sector.Name))
+            if (RemoveSectorRow(_availSectorsView, sector.Name, n => _expandedNodes.Remove(n)))
             {
                 _availableTreeSignature = null;
                 ConfigureAvailScrollbar();
@@ -2351,7 +2460,15 @@ public class OzServerSectorsWindow : BaseForm
             PopulateAvailableList();
         }
 
+        // Nothing stays selected after a move. Removing a row makes the native tree promote the next
+        // one, so the controller ends up with a different sector highlighted than the one they acted
+        // on - and the arrow button then points at that one, ready to move it too. Clearing is the
+        // honest end state: the action is finished, and nothing is chosen.
+        _availSectorsView.SelectedNode = null;
+        _currSectorsView.SelectedNode = null;
+
         RefreshStagedHighlight();
+        UpdateArrowButton();
         UpdateApplyCancelButtons();
     }
 
@@ -2493,6 +2610,8 @@ public class OzServerSectorsWindow : BaseForm
             _requestedChangesView.BeginUpdate();
             try
             {
+                // Drop the outgoing nodes from the expansion set before they are discarded.
+                ForgetNodes(_requestedChangesView.Nodes);
                 _requestedChangesView.Nodes.Clear();
                 _requestedChangesView.Nodes.AddRange(rootNodes);
 
@@ -2612,9 +2731,11 @@ public class OzServerSectorsWindow : BaseForm
     //   - the "Requested From Me" header  -> every incoming request, accepted as one batch
     //   - a request row (or any of the informational sub-sector rows under it) -> just that one
     //   - anything else (an outgoing request, the empty placeholder) -> nothing, Accept greyed out
-    List<SectorChangeRequest> GetRequestsToAccept()
+    // Takes the node explicitly rather than reading the selection, because the headings this can
+    // act on are no longer selectable - right-clicking "Requested From Me" is now the only way to
+    // reach the accept-everything gesture, and a right click does not move the selection.
+    static List<SectorChangeRequest> GetRequestsToAccept(TreeNode? selected)
     {
-        var selected = _requestedChangesView.SelectedNode;
         if (selected == null)
             return new List<SectorChangeRequest>();
 
