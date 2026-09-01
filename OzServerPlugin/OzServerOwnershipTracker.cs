@@ -65,7 +65,14 @@ public class SectorOwnershipDiff
 // comment.
 public class OzServerOwnershipTracker
 {
+    // Idle cadence. Nothing is expected to change on its own, so this only has to be often enough
+    // that a sector claimed elsewhere shows up in reasonable time.
     static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(10);
+    // Cadence while a handoff is actually in flight - this controller is waiting on someone's
+    // decision, or owes one. That is exactly the window where reflection latency is felt, and it is
+    // short-lived, so it costs nothing the rest of the time. Without it, being told your request was
+    // accepted took up to ten seconds with the Sectors window closed.
+    static readonly TimeSpan PendingPollInterval = TimeSpan.FromSeconds(2);
 
     public event EventHandler? OwnedChanged;
     // Fires whenever the set of incoming ("Requested From Me") requests changes - polled here
@@ -105,6 +112,9 @@ public class OzServerOwnershipTracker
     // SyncOwnedFromTracker.
     public bool HasBaseline => _hasBaseline;
     string? _pendingRequestSignature;
+    // Which cadence the timer is currently on, so it is only reprogrammed when the answer changes
+    // rather than on every sync.
+    bool _pollingFast;
     // Coalesces MMI.SectorsControlledChanged - see OnMmiSectorsControlledChanged's own comment for
     // why running ClaimMmiControlledSectorsAsync re-entrantly (a second, overlapping call starting
     // before the first has finished) was a real bug, not just a theoretical one: it raced reads and
@@ -297,6 +307,10 @@ public class OzServerOwnershipTracker
         MyRequests = requests;
         RequestsChanged?.Invoke(this, requests);
 
+        // A request in either direction means a handoff is mid-flight: either this controller is
+        // waiting to hear back, or someone is waiting on them. Poll faster until it resolves.
+        SetPollCadence(requests.ByMe.Count > 0 || requests.FromMe.Count > 0);
+
         // Compared on request ids, not on the count: one request being accepted while another
         // arrives between polls leaves the count identical while the actual requests differ, and
         // that used to pass silently.
@@ -370,6 +384,24 @@ public class OzServerOwnershipTracker
     // A failed sync leaves every one of the three exactly as it was rather than half-updating: the
     // previous values staying briefly stale is always better than one view moving while the others
     // do not, which is what made the lists disagree with each other during a blip.
+    void SetPollCadence(bool fast)
+    {
+        if (fast == _pollingFast)
+            return;
+
+        _pollingFast = fast;
+        var interval = fast ? PendingPollInterval : PollInterval;
+
+        try
+        {
+            _pollTimer.Change(interval, interval);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Plugin shutting down - nothing left to reschedule.
+        }
+    }
+
     async Task RefreshFromServerCoreAsync()
     {
         OzServerSyncDto sync;
@@ -383,6 +415,16 @@ public class OzServerOwnershipTracker
             return;
         }
 
+        ApplySync(sync);
+    }
+
+    // Adopts a sync payload, wherever it came from: the poll's own GET, or the response of an action
+    // that just changed something. Actions used to POST and then immediately GET to find out the
+    // result, so accepting a request cost two sequential round trips - and the second could queue
+    // behind an in-flight poll before it even started. The server now returns the resulting state
+    // with the action, so the same code applies it either way and the UI moves on the first reply.
+    void ApplySync(OzServerSyncDto sync)
+    {
         _controlled = sync.Controlled
             .Where(c => c.Owner != null)
             .ToDictionary(c => c.Name, c => c.Owner!, StringComparer.OrdinalIgnoreCase);
@@ -505,11 +547,46 @@ public class OzServerOwnershipTracker
     // the intermediate states it published were never worth rendering anyway.
     public async Task<SectorCommitResult> CommitSectorChangesAsync(
         IReadOnlyList<SectorsVolumes.Sector> toClaim,
-        IReadOnlyList<SectorsVolumes.Sector> toRelease)
+        IReadOnlyList<SectorsVolumes.Sector> toRelease,
+        IReadOnlyList<SectorsVolumes.Sector>? toRequest = null)
     {
         var result = new SectorCommitResult();
         if (!Network.IsConnected)
             return result;
+
+        // One call for the whole Apply, answering with the resulting state - so committing several
+        // staged sectors costs one round trip rather than one per sector plus a refresh, and the
+        // lists move on the first reply. The per-sector path below is kept as a fallback for a
+        // backend that predates /sectors/commit.
+        try
+        {
+            var response = await _api.CommitAsync(
+                toClaim.Select(s => s.Name),
+                toRelease.Select(s => s.Name),
+                (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name));
+
+            result.Claimed.AddRange(response.Result.Claimed);
+            result.Released.AddRange(response.Result.Released);
+            result.Requested.AddRange(response.Result.Requested);
+            result.Skipped.AddRange(response.Result.Skipped);
+            result.Failed.AddRange(response.Result.Failed);
+
+            if (response.Sync != null)
+                ApplySync(response.Sync);
+            else
+                await RefreshFromServerAsync();
+
+            return result;
+        }
+        catch (OzServerApiException ex) when (ex.StatusCode == 404)
+        {
+            // Backend without the batched endpoint - fall through to the per-sector calls.
+            result.Claimed.Clear();
+            result.Released.Clear();
+            result.Requested.Clear();
+            result.Skipped.Clear();
+            result.Failed.Clear();
+        }
 
         // Releases first: a sector being handed back may be part of a group being claimed in the
         // same Apply, and releasing after the claim would undo it.
@@ -630,6 +707,17 @@ public class OzServerOwnershipTracker
     // accept calls back-to-back could leave a request row behind. Returns the raw per-request
     // results so the caller can report anything that didn't go through (already accepted/rejected
     // by someone else in the meantime, no longer the current owner, ...).
+    // Applies the state an action's own response carried, if it carried one. Public so the window's
+    // reject/cancel paths get the same one-round-trip treatment as accept without each of them
+    // reimplementing the fallback.
+    public async Task ApplyActionResultAsync(OzServerActionResultDto? result)
+    {
+        if (result?.Sync != null)
+            ApplySync(result.Sync);
+        else
+            await RefreshFromServerAsync();
+    }
+
     public async Task<List<OzServerAcceptBatchResultDto>> AcceptRequestsBatchAsync(IEnumerable<int> requestIds)
     {
         if (!Network.IsConnected)
@@ -638,7 +726,14 @@ public class OzServerOwnershipTracker
         var response = await _api.AcceptRequestsBatchAsync(requestIds);
         foreach (var result in response.Results)
             ActionLog.Log("Ownership", $"Accepted request #{result.RequestId} ({result.Sector}): {(result.Accepted ? "ok" : result.Message)}");
-        await RefreshFromServerAsync();
+
+        // The accept's own response carries the resulting state, so there is nothing left to ask
+        // for. Falls back to a refresh only if an older backend answered without it.
+        if (response.Sync != null)
+            ApplySync(response.Sync);
+        else
+            await RefreshFromServerAsync();
+
         return response.Results;
     }
 

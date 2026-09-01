@@ -89,6 +89,32 @@ public class OzServerAcceptBatchResultDto
 public class OzServerAcceptBatchResponseDto
 {
     [JsonProperty("results")] public List<OzServerAcceptBatchResultDto> Results { get; set; } = new();
+    // The state the accept produced, so the caller does not have to ask for it separately.
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
+}
+
+// What POST /sectors/commit reports back: which names actually moved, alongside the resulting state.
+// Mirrors SectorCommitResult so the window can report a partial outcome without re-deriving it.
+public class OzServerCommitResultDto
+{
+    [JsonProperty("claimed")] public List<string> Claimed { get; set; } = new();
+    [JsonProperty("released")] public List<string> Released { get; set; } = new();
+    [JsonProperty("requested")] public List<string> Requested { get; set; } = new();
+    [JsonProperty("skipped")] public List<string> Skipped { get; set; } = new();
+    [JsonProperty("failed")] public List<string> Failed { get; set; } = new();
+}
+
+public class OzServerCommitResponseDto
+{
+    [JsonProperty("result")] public OzServerCommitResultDto Result { get; set; } = new();
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
+}
+
+// What every ownership-changing action answers with: the resulting state, in the same shape
+// GET /sectors/sync returns. Saves the follow-up GET each of these used to require.
+public class OzServerActionResultDto
+{
+    [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
 }
 
 public class OzServerControlledSectorOwnerDto
@@ -331,9 +357,11 @@ public class OzServerApiClient
     public Task<OzServerAcceptBatchResponseDto> AcceptRequestsBatchAsync(IEnumerable<int> requestIds) =>
         PostAsync<OzServerAcceptBatchResponseDto>("/sector-requests/accept-batch", new { request_ids = requestIds.ToArray() });
 
-    public Task RejectRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/reject");
+    public Task<OzServerActionResultDto> RejectRequestAsync(int requestId) =>
+        PostAsync<OzServerActionResultDto>($"/sector-requests/{requestId}/reject");
 
-    public Task CancelRequestAsync(int requestId) => PostAsync($"/sector-requests/{requestId}/cancel");
+    public Task<OzServerActionResultDto> CancelRequestAsync(int requestId) =>
+        PostAsync<OzServerActionResultDto>($"/sector-requests/{requestId}/cancel");
 
     // Confirms this controller has been shown a rejection of their own request, which is what
     // finally deletes it server-side - see SectorOwnershipController::acknowledgeRejection. Until
@@ -345,6 +373,17 @@ public class OzServerApiClient
     // One round trip for owned + controlled + requests. The Sectors window polls every two seconds
     // while open and used to make three separate GETs per tick, each paying the framework's own
     // per-request cost for data that is always consumed together.
+    // One Apply in one call. Sending a POST per sector meant applying three staged sectors paid full
+    // latency four times over, with the lists frozen until the last one returned.
+    public Task<OzServerCommitResponseDto> CommitAsync(
+        IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request) =>
+        PostAsync<OzServerCommitResponseDto>("/sectors/commit", new
+        {
+            claim = claim.ToArray(),
+            release = release.ToArray(),
+            request = request.ToArray(),
+        });
+
     public Task<OzServerSyncDto> GetSyncAsync() =>
         GetAsync("/sectors/sync", () => new OzServerSyncDto());
 

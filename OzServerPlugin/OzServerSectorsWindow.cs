@@ -1994,24 +1994,11 @@ public class OzServerSectorsWindow : BaseForm
         UpdateApplyCancelButtons();
         try
         {
-            var result = await _tracker.CommitSectorChangesAsync(toClaim, toRelease);
-
-            // Staged requests are sent after the claims and releases: a sector freed by one of those
-            // releases might be exactly what somebody is being asked for, and asking first would
+            // Requests go in the same call as the claims and releases. The server still applies them
+            // in order - releases, then claims, then requests - because a sector freed by one of
+            // those releases may be exactly what somebody is being asked for, and asking first would
             // race it.
-            foreach (var sector in stagedRequests)
-            {
-                try
-                {
-                    await _tracker.RequestAsync(sector);
-                    result.Requested.Add(sector.Name);
-                }
-                catch (Exception ex)
-                {
-                    result.Failed.Add(sector.Name);
-                    Errors.Add(new Exception($"Couldn't request {sector.Name}: {ex.Message}", ex), "OzServer");
-                }
-            }
+            var result = await _tracker.CommitSectorChangesAsync(toClaim, toRelease, stagedRequests);
 
             if (IsDisposed || !IsHandleCreated)
                 return;
@@ -2595,8 +2582,10 @@ public class OzServerSectorsWindow : BaseForm
                 Errors.Add(new Exception($"Couldn't accept: {summary}"), "OzServer");
             }
 
-            await RefreshRequestedChangesAsync();
-            RefreshAllListsAsync();
+            // AcceptRequestsBatchAsync already applied the state its own response carried, so the
+            // lists are current by the time it returns - only the Controlled view needs re-deriving
+            // from it.
+            RefreshControlledSnapshot();
         }
         catch (Exception ex)
         {
@@ -2618,10 +2607,12 @@ public class OzServerSectorsWindow : BaseForm
         UpdateRequestActionButtons();
         try
         {
-            await _api.RejectRequestAsync(request.Id);
+            // The response carries the resulting state, so there is no follow-up GET: the list
+            // updates on the first reply rather than after a second round trip.
+            var result = await _api.RejectRequestAsync(request.Id);
             ActionLog.Log("Ownership", $"Rejected request #{request.Id} for {request.Sector.Name} from {request.Controller}");
-            await RefreshRequestedChangesAsync();
-            RefreshAllListsAsync();
+            await _tracker.ApplyActionResultAsync(result);
+            RefreshControlledSnapshot();
         }
         catch (Exception ex)
         {
@@ -2643,10 +2634,12 @@ public class OzServerSectorsWindow : BaseForm
         UpdateRequestActionButtons();
         try
         {
-            await _api.CancelRequestAsync(request.Id);
+            // The response carries the resulting state, so there is no follow-up GET: the list
+            // updates on the first reply rather than after a second round trip.
+            var result = await _api.CancelRequestAsync(request.Id);
             ActionLog.Log("Ownership", $"Cancelled request #{request.Id} for {request.Sector.Name}");
-            await RefreshRequestedChangesAsync();
-            RefreshAllListsAsync();
+            await _tracker.ApplyActionResultAsync(result);
+            RefreshControlledSnapshot();
         }
         catch (Exception ex)
         {
