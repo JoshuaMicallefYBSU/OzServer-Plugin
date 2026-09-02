@@ -952,6 +952,22 @@ public class OzServerSectorsWindow : BaseForm
     // vatSys gives plugins no way to draw on the ASD - IPlugin/ILabelPlugin/IStripPlugin cover
     // labels, strips and track colours, and nothing else - so a sector cannot be outlined on the map
     // itself. This is the closest thing to a visible highlight that is actually available.
+    // Whether this row, or anything nested under it, has a request waiting on it. Used to hold the
+    // arrow back until the request is answered - see UpdateArrowButton for why descendants count.
+    bool HasOutstandingRequest(TreeNode node)
+    {
+        if (IsRequestedFromMeNode(node))
+            return true;
+
+        foreach (TreeNode child in node.Nodes)
+        {
+            if (HasOutstandingRequest(child))
+                return true;
+        }
+
+        return false;
+    }
+
     bool IsRequestedFromMeNode(TreeNode node)
     {
         if (node.Tag is not SectorsVolumes.Sector sector || sector.IsDummy)
@@ -1044,9 +1060,6 @@ public class OzServerSectorsWindow : BaseForm
         var treeView = (TreeViewEx)sender!;
         var selected = (e.State & TreeNodeStates.Selected) != 0;
         var flagged = IsStagedNode(e.Node) || IsFlashingHeading(e.Node);
-        // Checked after staged, so a row the controller has staged an edit on keeps showing that -
-        // what they are about to do matters more than what someone else is asking for.
-        var requested = !flagged && IsRequestedFromMeNode(e.Node);
 
         // Selection is a filled bar, which is how vatSys marks a highlighted row everywhere else -
         // WindowButtonSelected (DarkBlue in this profile) behind WindowBackground text, the same
@@ -1060,15 +1073,17 @@ public class OzServerSectorsWindow : BaseForm
             ? Colours.GetColour(Colours.Identities.WindowButtonSelected)
             : treeView.BackColor;
 
-        // WindowEmergency rather than WindowWarning: staged rows already own the warning colour, and
-        // two different states rendered identically would be worse than not marking one at all.
+        // Owned sectors with an incoming request are drawn as ordinary rows. They used to take
+        // WindowEmergency, which is the red this profile uses for genuine emergencies - far too
+        // loud for "somebody would like this sector", and it made a normal working list look like
+        // something was wrong. The request is already surfaced where it belongs: the Requested From
+        // Me heading flashes, the Settings header flashes, and the arrow goes unavailable for that
+        // sector until it is answered (see UpdateArrowButton).
         var foreground = flagged
             ? Colours.GetColour(Colours.Identities.WindowWarning)
-            : requested
-                ? Colours.GetColour(Colours.Identities.WindowEmergency)
-                : selected
-                    ? Colours.GetColour(Colours.Identities.WindowBackground)
-                    : treeView.ForeColor;
+            : selected
+                ? Colours.GetColour(Colours.Identities.WindowBackground)
+                : treeView.ForeColor;
 
         // The bar spans the full width of the control, not just the label - e.Bounds under
         // OwnerDrawText is only the text. Unselected rows still clip to e.Bounds, exactly as
@@ -1446,8 +1461,18 @@ public class OzServerSectorsWindow : BaseForm
 
     void UpdateArrowButton()
     {
-        var ownedSelected = _currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
+        var ownedNode = _currSectorsView.SelectedNode;
+        var ownedSelected = ownedNode?.Tag is SectorsVolumes.Sector;
         var availSelected = _availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector;
+
+        // A sector somebody has an outstanding request on is an Accept-or-Reject decision before it
+        // is anything else, so it cannot be moved until that is answered. Releasing it out from
+        // under the request would answer it by side effect: the sector leaves, and whoever asked is
+        // left holding a request against airspace this controller no longer has.
+        //
+        // Descendants count. Releasing a group releases the sub-sectors it covers, so moving a
+        // parent would otherwise carry a requested child out with it and never answer the request.
+        var blockedByRequest = ownedSelected && ownedNode != null && HasOutstandingRequest(ownedNode);
 
         // Deliberately reads only the Owned and Available trees. A row in Requested is a request in
         // flight, not a sector sitting somewhere it can be moved out of - Accept, Reject, Add and
@@ -1455,7 +1480,11 @@ public class OzServerSectorsWindow : BaseForm
         // for. Letting the arrow act on it broke the flow: the button means "move between these two
         // lists", and Requested is neither of them.
         _arrowButton.Text = ownedSelected ? ArrowRight : availSelected ? ArrowLeft : ArrowIdle;
-        _arrowButton.Enabled = !_applyRunning && (ownedSelected || availSelected);
+
+        // Disabled rather than hidden for the request case, unlike the Requested-tree case below:
+        // there the arrow is the wrong control entirely, whereas here it is the right control and
+        // will work as soon as the request is answered - which is what a greyed-out button means.
+        _arrowButton.Enabled = !_applyRunning && (ownedSelected || availSelected) && !blockedByRequest;
 
         // An incoming request is an Accept-or-Reject decision, not a list move. The arrow acts on
         // whatever is selected over in Owned/Available, and that selection stays highlighted while a
@@ -2799,6 +2828,13 @@ public class OzServerSectorsWindow : BaseForm
         if (signature == _requestedTreeSignature)
         {
             UpdateRequestActionButtons();
+
+            // The arrow depends on the request list too, not just on what is selected - a request
+            // arriving for the sector already highlighted in Owned has to take the arrow away, and
+            // answering it has to give the arrow back, neither of which involves a selection
+            // change. Refreshed on this path as well as below: an unchanged signature still means
+            // this ran, and the arrow can be stale for reasons the signature does not cover.
+            UpdateArrowButton();
             return;
         }
 
@@ -2836,6 +2872,7 @@ public class OzServerSectorsWindow : BaseForm
         }
 
         UpdateRequestActionButtons();
+        UpdateArrowButton();
     }
 
     void AddRequestNodes(TreeNode parent, List<SectorChangeRequest> requests, string emptyText,
