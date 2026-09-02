@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -42,7 +43,15 @@ namespace OzServerPlugin;
 // recovering is renaming one file back.
 public class PluginUpdater
 {
-    const string ReleasesApi = "https://api.github.com/repos/JoshuaMicallefYBSU/OzServer-Plugin/releases/latest";
+    // The list endpoint, not /releases/latest.
+    //
+    // /latest excludes prereleases, and every release published so far is marked prerelease - so it
+    // answered 404 and this quietly concluded there was nothing to update to. Every session, since
+    // the updater was written. The list includes them, so a prerelease is found like any other.
+    //
+    // Drafts still have to be excluded by hand, since the list does include those and a draft is not
+    // something anyone should be handed.
+    const string ReleasesApi = "https://api.github.com/repos/JoshuaMicallefYBSU/OzServer-Plugin/releases";
     const string AssetName = "OzServerPlugin.dll";
     const string AssemblyIdentity = "OzServerPlugin";
 
@@ -78,13 +87,13 @@ public class PluginUpdater
             if (string.IsNullOrEmpty(installedPath) || !File.Exists(installedPath))
                 return;
 
-            var (version, downloadUrl) = await GetLatestReleaseAsync().ConfigureAwait(false);
+            var (version, downloadUrl, isZip) = await GetLatestReleaseAsync().ConfigureAwait(false);
 
             if (version == null || downloadUrl == null || version.CompareTo(current) <= 0)
                 return;
 
             var staged = installedPath + ".update";
-            await DownloadAsync(downloadUrl, staged).ConfigureAwait(false);
+            await DownloadAsync(downloadUrl, staged, isZip).ConfigureAwait(false);
 
             // Verified before it is allowed to take the live name. A truncated download, or an error
             // page saved under a .dll name, would otherwise be what vatSys tries to load next time -
@@ -137,43 +146,100 @@ public class PluginUpdater
         }
     }
 
-    static async Task<(Version? Version, string? DownloadUrl)> GetLatestReleaseAsync()
+    static async Task<(Version? Version, string? DownloadUrl, bool IsZip)> GetLatestReleaseAsync()
     {
         using var client = CreateClient();
-        // "latest" excludes drafts and prereleases, so a release only reaches anyone once it is
-        // actually published.
         using var response = await client.GetAsync(ReleasesApi).ConfigureAwait(false);
 
-        // A repository with no published releases answers 404 here, which is a perfectly ordinary
-        // state and not a failure worth logging every session - there is simply nothing to update to
-        // yet. Handled before EnsureSuccessStatusCode so it doesn't get reported as an error.
+        // A repository with no releases at all answers 404 here, which is a perfectly ordinary state
+        // and not a failure worth logging every session. Handled before EnsureSuccessStatusCode so
+        // it isn't reported as an error.
         if (response.StatusCode == HttpStatusCode.NotFound)
-            return (null, null);
+            return (null, null, false);
 
         response.EnsureSuccessStatusCode();
 
         var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-        var release = JObject.Parse(body);
 
-        // Tags are conventionally written "v0.1.2"; the leading v is not part of the version.
-        var tag = (string?)release["tag_name"];
-        if (tag == null || !Version.TryParse(tag.TrimStart('v', 'V'), out var version))
-            return (null, null);
+        Version? bestVersion = null;
+        string? bestUrl = null;
+        var bestIsZip = false;
 
-        var url = release["assets"]?
-            .FirstOrDefault(a => string.Equals((string?)a["name"], AssetName, StringComparison.OrdinalIgnoreCase))?
-            ["browser_download_url"];
+        foreach (var release in JArray.Parse(body))
+        {
+            if ((bool?)release["draft"] == true)
+                continue;
 
-        return (version, (string?)url);
+            // Tags are conventionally written "v0.1.2"; the leading v is not part of the version.
+            var tag = (string?)release["tag_name"];
+            if (tag == null || !Version.TryParse(tag.TrimStart('v', 'V'), out var version))
+                continue;
+
+            if (bestVersion != null && version.CompareTo(bestVersion) <= 0)
+                continue;
+
+            // The releases published so far attach the plugin as OzServerPlugin-v0.1.4.zip, not as a
+            // bare OzServerPlugin.dll - so matching only the exact DLL name found nothing even once
+            // the 404 above was dealt with. A raw DLL is still preferred where one exists; a zip is
+            // unpacked after download.
+            var assets = release["assets"];
+            if (assets == null)
+                continue;
+
+            var dll = assets.FirstOrDefault(a =>
+                string.Equals((string?)a["name"], AssetName, StringComparison.OrdinalIgnoreCase));
+
+            var zip = dll == null
+                ? assets.FirstOrDefault(a => ((string?)a["name"])?.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) == true)
+                : null;
+
+            var chosen = dll ?? zip;
+            if (chosen == null)
+                continue;
+
+            bestVersion = version;
+            bestUrl = (string?)chosen["browser_download_url"];
+            bestIsZip = dll == null;
+        }
+
+        return (bestVersion, bestUrl, bestIsZip);
     }
 
-    static async Task DownloadAsync(string url, string destination)
+    static async Task DownloadAsync(string url, string destination, bool isZip)
     {
         using var client = CreateClient();
         var bytes = await client.GetByteArrayAsync(url).ConfigureAwait(false);
 
         TryDelete(destination);
-        File.WriteAllBytes(destination, bytes);
+
+        if (!isZip)
+        {
+            File.WriteAllBytes(destination, bytes);
+            return;
+        }
+
+        // Unpacked to the same staged path a raw DLL would have been written to, so everything
+        // downstream - the assembly-identity check, the rename dance - is identical either way.
+        // Whatever comes out still has to pass IsValidUpgrade before it can take the live name, so a
+        // zip containing the wrong thing is caught exactly like a truncated download is.
+        var archivePath = destination + ".zip";
+        try
+        {
+            File.WriteAllBytes(archivePath, bytes);
+
+            using var archive = ZipFile.OpenRead(archivePath);
+            var entry = archive.Entries.FirstOrDefault(e =>
+                string.Equals(e.Name, AssetName, StringComparison.OrdinalIgnoreCase));
+
+            if (entry == null)
+                throw new InvalidOperationException($"The release archive does not contain {AssetName}.");
+
+            entry.ExtractToFile(destination, overwrite: true);
+        }
+        finally
+        {
+            TryDelete(archivePath);
+        }
     }
 
     // Confirms the download really is a newer build of *this* plugin before it is allowed to replace

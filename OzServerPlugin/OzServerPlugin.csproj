@@ -90,6 +90,9 @@
             <HintPath>$(VatSysPath)\bin\RossCarlson.Vatsim.Network.dll</HintPath>
             <Private>False</Private>
         </Reference>
+        <!-- ZipFile/ExtractToFile, for release assets published as a zip rather than a bare DLL. -->
+        <Reference Include="System.IO.Compression" />
+        <Reference Include="System.IO.Compression.FileSystem" />
         <Reference Include="System.ComponentModel.Composition" />
         <Reference Include="System.Drawing" />
         <Reference Include="System.Net.Http" />
