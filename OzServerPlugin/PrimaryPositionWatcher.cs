@@ -188,7 +188,14 @@ public class PrimaryPositionWatcher
     static void ShowNotice(NetworkATC atc, List<SectorsVolumes.Sector> relinquishing)
     {
         var who = string.IsNullOrEmpty(atc.RealName) ? atc.Callsign : $"{atc.Callsign} ({atc.RealName})";
-        var list = string.Join(Environment.NewLine, relinquishing.Select(s => $"    {s.Name} - {s.FullName}"));
+
+        // Full description, callsign included - the same way every other list in the plugin writes a
+        // sector (SectorDescription). "ARA" on its own does not tell a controller which airspace is
+        // leaving them.
+        //
+        // No leading indent: the message pane centres its text (see SectorMessageWindow), so spaces
+        // on the left do not indent the list, they shift it off centre.
+        var list = string.Join(Environment.NewLine, relinquishing.Select(s => SectorDescription.Describe(s)));
         var lead = relinquishing.Count == 1
             ? "This sector belongs to that position and is being relinquished to them:"
             : "These sectors belong to that position and are being relinquished to them:";

@@ -945,6 +945,30 @@ public class OzServerSectorsWindow : BaseForm
                && _stagedNames.Contains(sector.Name);
     }
 
+    // A sector of this controller's that somebody has asked for. Marked in its own colour so opening
+    // the window answers "which of mine do they want" at a glance, rather than leaving the controller
+    // to read the request pane and cross-reference it against Owned by hand.
+    //
+    // vatSys gives plugins no way to draw on the ASD - IPlugin/ILabelPlugin/IStripPlugin cover
+    // labels, strips and track colours, and nothing else - so a sector cannot be outlined on the map
+    // itself. This is the closest thing to a visible highlight that is actually available.
+    bool IsRequestedFromMeNode(TreeNode node)
+    {
+        if (node.Tag is not SectorsVolumes.Sector sector || sector.IsDummy)
+            return false;
+
+        lock (_requestsFromMe)
+        {
+            foreach (var request in _requestsFromMe)
+            {
+                if (request.Sector.Equals(sector))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
     void ToggleNodeExpansion(TreeViewEx treeView, TreeNode node)
     {
         if (node.Nodes.Count == 0)
@@ -1020,6 +1044,9 @@ public class OzServerSectorsWindow : BaseForm
         var treeView = (TreeViewEx)sender!;
         var selected = (e.State & TreeNodeStates.Selected) != 0;
         var flagged = IsStagedNode(e.Node) || IsFlashingHeading(e.Node);
+        // Checked after staged, so a row the controller has staged an edit on keeps showing that -
+        // what they are about to do matters more than what someone else is asking for.
+        var requested = !flagged && IsRequestedFromMeNode(e.Node);
 
         // Selection is a filled bar, which is how vatSys marks a highlighted row everywhere else -
         // WindowButtonSelected (DarkBlue in this profile) behind WindowBackground text, the same
@@ -1033,11 +1060,15 @@ public class OzServerSectorsWindow : BaseForm
             ? Colours.GetColour(Colours.Identities.WindowButtonSelected)
             : treeView.BackColor;
 
+        // WindowEmergency rather than WindowWarning: staged rows already own the warning colour, and
+        // two different states rendered identically would be worse than not marking one at all.
         var foreground = flagged
             ? Colours.GetColour(Colours.Identities.WindowWarning)
-            : selected
-                ? Colours.GetColour(Colours.Identities.WindowBackground)
-                : treeView.ForeColor;
+            : requested
+                ? Colours.GetColour(Colours.Identities.WindowEmergency)
+                : selected
+                    ? Colours.GetColour(Colours.Identities.WindowBackground)
+                    : treeView.ForeColor;
 
         // The bar spans the full width of the control, not just the label - e.Bounds under
         // OwnerDrawText is only the text. Unselected rows still clip to e.Bounds, exactly as
@@ -2329,12 +2360,18 @@ public class OzServerSectorsWindow : BaseForm
     {
         var parts = new List<string>();
 
+        // Lead / list, like every other popup, with each sector written out in full and the
+        // controller holding it named (SectorDescription). These used to run bare three-letter
+        // codes together inline - "STR, ARA" - which named airspace the controller then had to go
+        // and look up before they could act on it.
         if (result.Requested.Count > 0)
         {
-            var names = string.Join(", ", result.Requested.Distinct());
-            parts.Add(result.Requested.Count == 1
-                ? $"{names} is owned by another controller, so a request has been sent to them."
-                : $"These are owned by other controllers, so requests have been sent: {names}");
+            var described = result.Requested.Distinct().Select(DescribeWithCurrentOwner).ToList();
+            parts.Add((described.Count == 1
+                          ? "This sector is owned by another controller, so a request has been sent to them:"
+                          : "These sectors are owned by other controllers, so requests have been sent:")
+                      + Environment.NewLine + Environment.NewLine
+                      + string.Join(Environment.NewLine, described));
         }
 
         // Reported rather than silently dropped: these are sub-sectors of something that *was*
@@ -2343,10 +2380,12 @@ public class OzServerSectorsWindow : BaseForm
         // ask for them.
         if (result.Skipped.Count > 0)
         {
-            var names = string.Join(", ", result.Skipped.Distinct());
-            parts.Add(result.Skipped.Count == 1
-                ? $"{names} is already owned by another controller and was left with them. Move it across on its own to request it."
-                : $"These are already owned by other controllers and were left with them: {names}. Move one across on its own to request it.");
+            var described = result.Skipped.Distinct().Select(DescribeWithCurrentOwner).ToList();
+            parts.Add((described.Count == 1
+                          ? "This sector is already owned by another controller and was left with them. Move it across on its own to request it:"
+                          : "These sectors are already owned by other controllers and were left with them. Move one across on its own to request it:")
+                      + Environment.NewLine + Environment.NewLine
+                      + string.Join(Environment.NewLine, described));
         }
 
         if (parts.Count == 0)
@@ -2354,6 +2393,14 @@ public class OzServerSectorsWindow : BaseForm
 
         ShowNotice(string.Join(Environment.NewLine + Environment.NewLine, parts), "Sector changes applied");
     }
+
+    // "STR - Sturt (held by BN-TRT_CTR)" for a sector someone else has, "STR - Sturt" when nobody
+    // does. The tracker is the same snapshot the Controlled list is built from, so the holder named
+    // here is the one the window is already showing.
+    string DescribeWithCurrentOwner(string name) =>
+        SectorDescription.DescribeWithOwner(
+            name,
+            _tracker.ControlledByOthers.TryGetValue(name, out var owner) ? owner.Callsign : null);
 
     static void ShowNotice(string message, string caption)
     {
@@ -2692,9 +2739,19 @@ public class OzServerSectorsWindow : BaseForm
             if (!_reportedRejections.Add(dto.Id))
                 continue;
 
-            var sectorName = dto.Sector?.Name ?? "That sector";
             var by = string.IsNullOrEmpty(dto.TargetCallsign) ? "the controller" : dto.TargetCallsign;
-            ShowNotice($"{by} denied your request for {sectorName}.", "Request denied");
+
+            // The sector goes on its own line below the lead rather than inline after it. Written
+            // in full it carries its own position callsign, and next to the callsign of whoever
+            // denied the request that reads as two owners of one sector - on separate lines it
+            // reads as what it is, who said no and what they said no to.
+            var message = dto.Sector?.Name is { } name
+                ? $"{by} denied your request for:"
+                  + Environment.NewLine + Environment.NewLine
+                  + SectorDescription.Describe(name)
+                : $"{by} denied your request.";
+
+            ShowNotice(message, "Request denied");
 
             _ = AcknowledgeRejectionAsync(dto.Id);
         }

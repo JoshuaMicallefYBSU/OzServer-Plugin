@@ -1026,9 +1026,23 @@ public class OzServerOwnershipTracker
 
         QueuePrimaryClaimRetries(mineByRight);
 
-        var question = contestedByOthers.Count == 1
-            ? $"{contestedByOthers[0].Sector} is already owned by {contestedByOthers[0].Owner?.Callsign}. Request it from them?"
-            : $"These are already owned by someone else: {string.Join(", ", contestedByOthers.Select(c => $"{c.Sector} ({c.Owner?.Callsign})"))}. Request them?";
+        // Laid out lead / list / question, the same shape as every other popup in the plugin, with
+        // each sector written out in full (SectorDescription). This used to name sectors by bare
+        // code - "STR is already owned by BN-TRT_CTR" - and run several of them together inline,
+        // which asked a controller to answer for airspace it never actually identified.
+        var described = contestedByOthers
+            .Select(conflict => SectorDescription.DescribeWithOwner(conflict.Sector, conflict.Owner?.Callsign))
+            .ToList();
+
+        var question = (described.Count == 1
+                           ? "This sector is already owned by another controller:"
+                           : "These sectors are already owned by other controllers:")
+                       + Environment.NewLine + Environment.NewLine
+                       + string.Join(Environment.NewLine, described)
+                       + Environment.NewLine + Environment.NewLine
+                       + (described.Count == 1
+                           ? "Request it from them?"
+                           : "Request them from their current owners?");
 
         if (contestedByOthers.Count > 0 && AskYesNo(question, "Sector already owned"))
         {

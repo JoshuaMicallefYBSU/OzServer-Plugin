@@ -45,16 +45,20 @@ public class Plugin : IPlugin
     // can happen long before the Sectors window is ever opened.
     readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
     readonly ObserverPositionMirror _observerPositionMirror;
+    readonly RequestedSectorOverlay _requestedSectorOverlay;
     // Timer-driven and entirely invisible - it never touches the running session, only what is on
     // disk for the next one. See its own class comment for why it can't just overwrite the DLL.
     readonly PluginUpdater _updater;
 
     // Incoming requests waiting on this controller, driving the Settings header's flash.
     int _pendingRequests;
+
+    // Debug menu only - whether its highlight toggle is currently on.
+    bool _debugHighlightShown;
     // Request groups already put to the controller, so a group is prompted once rather than
     // again on every refresh while it sits unanswered. Pruned to whatever is still pending, so
     // a request that is withdrawn and made again does prompt a second time.
-    readonly HashSet<string> _promptedRequestGroups = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _announcedRequestGroups = new(StringComparer.OrdinalIgnoreCase);
     ToolStripMenuItem? _settingsMenuHeader;
     ToolStripItem? _ozServerSectorsItem;
 
@@ -80,6 +84,8 @@ public class Plugin : IPlugin
         _gracefulDisconnectReleaser = new GracefulDisconnectReleaser();
         // After the tracker, whose ControlledByOthers it mirrors.
         _observerPositionMirror = new ObserverPositionMirror(_ownershipTracker);
+        // After the tracker, whose incoming requests it outlines on the scope.
+        _requestedSectorOverlay = new RequestedSectorOverlay(_ownershipTracker);
         // Last, and dependent on nothing: it only ever reads GitHub and writes files next to this
         // assembly, so it has no ordering relationship with anything above it.
         _updater = new PluginUpdater();
@@ -118,7 +124,7 @@ public class Plugin : IPlugin
                 if (_sectorsWindow is { IsDisposed: false } window)
                     window.FlashTitleBar = _pendingRequests > 0 && !window.ContainsFocus;
 
-                PromptForNewRequestGroups(requests);
+                AnnounceNewRequestGroups(requests);
             }
 
             // The poll this comes from runs on a background timer thread.
@@ -127,6 +133,64 @@ public class Plugin : IPlugin
             else
                 Apply();
         };
+
+        // Opens each popup on demand, so their layout can be looked at in the real client without
+        // waiting for another controller to request a sector or for a position to be relinquished.
+        // These windows derive from vatSys's BaseForm, which closes itself immediately outside the
+        // vatSys process - so a standalone preview harness cannot render them and this is the only
+        // way to actually see one.
+        var debugMenu = new ToolStripMenuItem("OzServer Popups (Debug)");
+
+        // Simulates a request arriving and being looked at: the notification sound, and the
+        // highlight the sector management window would reveal. A toggle, because with the popup
+        // gone there is no Accept/Reject to clear it and nothing else here would.
+        debugMenu.DropDownItems.Add(new ToolStripMenuItem("Sector request (sound + highlight)", null,
+            (_, _) =>
+            {
+                _debugHighlightShown = !_debugHighlightShown;
+
+                if (!_debugHighlightShown)
+                {
+                    _requestedSectorOverlay.Clear();
+                    return;
+                }
+
+                NotificationSound.PlayRequestArrived();
+
+                // SetRevealed as well as SetRequested: nothing is drawn until the window opens, and
+                // this is standing in for that having happened.
+                var sectors = DebugHighlightSectors();
+                _requestedSectorOverlay.SetRequested(sectors);
+                _requestedSectorOverlay.SetRevealed(true);
+
+                ActionLog.Log("Debug", $"highlighting {string.Join(", ", sectors.Select(s => s.Name))}");
+            }));
+        // Both previews below are written to match what the real code actually sends, sector
+        // descriptions included - a preview that formats sectors more prettily than the live path
+        // is worse than no preview, because it is the thing the layout gets judged against.
+        debugMenu.DropDownItems.Add(new ToolStripMenuItem("Notice (OK)", null,
+            (_, _) => ShowDebugPopup(new SectorNoticeWindow(
+                // Mirrors PrimaryPositionWatcher.ShowNotice.
+                "BN-ISA_CTR has logged on." + Environment.NewLine + Environment.NewLine
+                + "These sectors belong to that position and are being relinquished to them:"
+                + Environment.NewLine + Environment.NewLine
+                + string.Join(Environment.NewLine,
+                    new[] { "ARA", "STR" }.Select(SectorDescription.Describe)),
+                "Position relinquished"))));
+        debugMenu.DropDownItems.Add(new ToolStripMenuItem("Conflict (Yes/No)", null,
+            (_, _) => ShowDebugPopup(new SectorConflictPromptWindow(
+                // Mirrors OzServerOwnershipTracker.HandleConflictAsync, which lists one sector per
+                // line with the controller currently holding it.
+                "This sector is already owned by another controller:"
+                + Environment.NewLine + Environment.NewLine
+                + SectorDescription.DescribeWithOwner("STR", "BN-TRT_CTR")
+                + Environment.NewLine + Environment.NewLine + "Request it from them?",
+                "Sector already owned"))));
+
+        MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
+            CustomToolStripMenuItemWindowType.Main,
+            CustomToolStripMenuItemCategory.Settings,
+            debugMenu));
 
         var settingsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
@@ -199,54 +263,78 @@ public class Plugin : IPlugin
     //
     // Accept and Reject both act on every id in the group through the batch endpoints, so a grouped
     // request can never end up half-answered.
-    void PromptForNewRequestGroups(IReadOnlyList<OzServerSectorOwnershipRequestDto> requests)
+    // Sounds the notification for requests that have not been announced yet.
+    //
+    // This used to open a SectorRequestPromptWindow per group. That popup is gone: a request is not
+    // urgent enough to put a window over a controller's scope while they are working traffic, and
+    // one that appears unbidden gets dismissed reflexively - which lost the request, since closing
+    // it deliberately meant "not now" rather than "no". Every request is answered in the sector
+    // management window instead, which is where the rest of the decision already lived, and where
+    // the airspace involved is shaded on the scope (RequestedSectorOverlay).
+    //
+    // Grouping is still what decides when to make a noise. Requests arrive by poll and by SSE, so
+    // the same pending request is seen many times over; only a group not announced before counts as
+    // an arrival. Once per group rather than once per request, so three sectors asked for in one
+    // Apply is one notification - the same reason the popup was grouped.
+    void AnnounceNewRequestGroups(IReadOnlyList<OzServerSectorOwnershipRequestDto> requests)
     {
         var groups = requests
             .Where(request => request.RejectedAt == null)
             .GroupBy(request => string.IsNullOrEmpty(request.GroupId) ? $"request-{request.Id}" : request.GroupId,
                      StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.Key)
             .ToList();
 
         // Anything no longer pending is forgotten, so the same sectors requested again later are a
-        // new decision and prompt again.
-        _promptedRequestGroups.IntersectWith(groups.Select(group => group.Key));
+        // new arrival and sound again.
+        _announcedRequestGroups.IntersectWith(groups);
 
-        foreach (var group in groups)
-        {
-            if (!_promptedRequestGroups.Add(group.Key))
-                continue;
+        var arrived = groups.Count(group => _announcedRequestGroups.Add(group));
+        if (arrived == 0)
+            return;
 
-            var ids = group.Select(request => request.Id).ToList();
-            var who = group.First().RequestingCallsign;
-            var sectors = group
-                .Select(request => request.Sector?.Name ?? $"#{request.SectorId}")
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(name => name, StringComparer.Ordinal)
-                .ToList();
+        // One sound however many groups landed together. Two arriving in the same poll is two
+        // entries in the window, not a reason to play the tone twice over itself.
+        NotificationSound.PlayRequestArrived();
 
-            var lead = sectors.Count == 1
-                ? $"{who} has requested this sector from you:"
-                : $"{who} has requested these {sectors.Count} sectors from you:";
+        ActionLog.Log("Requests", $"{arrived} new request group(s) announced");
+    }
 
-            var message = lead
-                          + Environment.NewLine + Environment.NewLine
-                          + string.Join(Environment.NewLine, sectors);
+    // Deliberately a couple of sectors rather than everything to hand. The point of the debug entry
+    // is to see which airspace a highlight covers and where the border between two sectors falls,
+    // and a whole position - seven sectors for ASP - shades most of the scope as one continuous
+    // blob that shows neither.
+    const int DebugHighlightCount = 2;
 
-            var prompt = new SectorRequestPromptWindow(
-                message,
-                "Sector requested",
-                () => _ = _ownershipTracker.AcceptRequestsBatchAsync(ids),
-                () => _ = _ownershipTracker.RejectRequestsBatchAsync(ids));
+    // What the debug entry highlights. Prefers whatever this controller actually has selected, so
+    // the highlight lands where they are already looking and on sectors that adjoin each other -
+    // which is what makes the border between them worth looking at. Falls back to sectors straight
+    // out of the dataset so the highlight can be tested while disconnected: MMI.SectorsControlled is
+    // empty until a position is taken, which made the debug entry silently highlight nothing, and
+    // that is indistinguishable from the overlay not working.
+    static List<SectorsVolumes.Sector> DebugHighlightSectors()
+    {
+        var mine = MMI.SectorsControlled.Where(sector => !sector.IsDummy).ToList();
+        if (mine.Count > 0)
+            return mine.Take(DebugHighlightCount).ToList();
 
-            // Non-modal, same as SectorNoticeWindow: a modal dialog would freeze vatSys until the
-            // controller noticed it, and they may well be mid-transmission.
-            if (Application.OpenForms["MainForm"] is Form mainForm)
-                prompt.Show(mainForm);
-            else
-                prompt.Show();
+        return SectorsVolumes.Sectors
+            .Where(sector => sector.Volumes != null
+                             && sector.Volumes.Any(volume => volume.Boundary != null && volume.Boundary.Count >= 3))
+            .Take(DebugHighlightCount)
+            .ToList();
+    }
 
-            prompt.BringToFront();
-        }
+    // Shown exactly the way the real ones are - non-modally, parented to the main form - so what the
+    // debug menu puts on screen is the same window in the same state, not an approximation of it.
+    static void ShowDebugPopup(Form popup)
+    {
+        if (Application.OpenForms["MainForm"] is Form mainForm)
+            popup.Show(mainForm);
+        else
+            popup.Show();
+
+        popup.BringToFront();
     }
 
     void RefreshRequestFlash()
@@ -277,7 +365,18 @@ public class Plugin : IPlugin
     {
         // OzServerSectorsWindow hides rather than closes, so once created the same
         // instance is reused (and its event subscriptions stay alive) for the plugin's lifetime.
-        _sectorsWindow ??= new OzServerSectorsWindow(_ownershipTracker);
+        if (_sectorsWindow == null)
+        {
+            _sectorsWindow = new OzServerSectorsWindow(_ownershipTracker);
+
+            // What puts the requested sectors on the scope, and takes them off again. Hooked here
+            // rather than inside the window so the window stays about managing sectors and knows
+            // nothing about the map - VisibleChanged covers both directions on its own, including
+            // the hide-on-close that never raises a Closed event.
+            _sectorsWindow.VisibleChanged += (_, _) =>
+                _requestedSectorOverlay.SetRevealed(_sectorsWindow is { IsDisposed: false, Visible: true });
+        }
+
         ShowWindow(_sectorsWindow);
     }
 
