@@ -1408,9 +1408,10 @@ public class OzServerSectorsWindow : BaseForm
     // is hidden on an incoming request - a greyed control reads as "not right now", and for an
     // observer the answer is never.
     //
-    // Tested as "Me exists and is not real ATC": Network.Me is briefly null after Connected,
-    // and treating that as an observer would blank a real controller's buttons on every login.
-    static bool IsObserver => Network.Me is { IsRealATC: false };
+    // Read from the connection's own Position/Rating - see NetworkIdentity.IsObserver. The previous
+    // test on Network.Me.IsRealATC would have blanked a real controller's buttons for the first
+    // seconds of every session, since that flag reads false until the network publishes the record.
+    static bool IsObserver => NetworkIdentity.IsObserver;
 
     void UpdateArrowButton()
     {

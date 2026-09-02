@@ -10,7 +10,7 @@
 
         <AssemblyName>OzServerPlugin</AssemblyName>
         <RootNamespace>OzServerPlugin</RootNamespace>
-        <Version>0.1.3</Version>
+        <Version>0.1.4</Version>
     </PropertyGroup>
 
     <PropertyGroup>
@@ -78,6 +78,21 @@
             <HintPath>$(VatSysPath)\bin\Newtonsoft.Json.dll</HintPath>
             <Private>False</Private>
         </Reference>
+        <!--
+          Network.Rating and Network.Facility are typed with this library's own enums
+          (NetworkRating/NetworkFacility) - the Rating and Position fields from vatSys's connection
+          window, and the only trustworthy way to tell an observer connection from a controller one
+          at connect time. Private=False for exactly the same reason as vatSys.exe and
+          Newtonsoft.Json above: a second copy shipped beside the plugin would be a different
+          assembly identity to the one already loaded in the vatSys process.
+        -->
+        <Reference Include="RossCarlson.Vatsim.Network">
+            <HintPath>$(VatSysPath)\bin\RossCarlson.Vatsim.Network.dll</HintPath>
+            <Private>False</Private>
+        </Reference>
+        <!-- ZipFile/ExtractToFile, for release assets published as a zip rather than a bare DLL. -->
+        <Reference Include="System.IO.Compression" />
+        <Reference Include="System.IO.Compression.FileSystem" />
         <Reference Include="System.ComponentModel.Composition" />
         <Reference Include="System.Drawing" />
         <Reference Include="System.Net.Http" />

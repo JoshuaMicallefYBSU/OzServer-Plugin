@@ -17,12 +17,100 @@ namespace OzServerPlugin;
 //     only ever had an answer for the second one.
 public static class SectorLocator
 {
-    // Sentinel "unknown" (-1) either way - RadarTrack.CorrectedAltitude when unset, and
-    // Sector.IsInSector's own "skip the altitude band check" level - so an aircraft with no live
-    // track yet is still resolved purely on lateral position.
+    // The aircraft's real position, whether or not vatSys has coupled its radar track to the flight
+    // plan yet.
+    //
+    // Coupling and activation depend on one another: a flight can be sitting plainly inside a sector
+    // with CoupledTrack still null, and keying containment on CoupledTrack alone left exactly that
+    // flight stuck at STATE_PREACTIVE forever - unable to activate because it had not coupled, and
+    // unable to couple because it had not activated. Matching the live radar picture by callsign
+    // breaks that loop.
+    //
+    // What this deliberately never does is fall back to fdr.GetLocation(): that returns
+    // PredictedPosition.Location when there is no track at all, which is the flight plan's guess at
+    // where the aircraft ought to be, and is what repeatedly resolved an aircraft laterally outside
+    // a sector into it. No radar return means no position - not a guessed one.
+    public static RDP.RadarTrack? LiveTrack(FDP2.FDR fdr)
+    {
+        if (fdr.CoupledTrack is { } coupled)
+            return coupled;
+
+        if (string.IsNullOrEmpty(fdr.Callsign))
+            return null;
+
+        try
+        {
+            // RDP.RadarTracks is the live list and is read here from timer threads, so a concurrent
+            // radar update can invalidate the enumeration mid-pass. Not finding a track this tick is
+            // harmless - the next FDR or radar update re-asks - whereas throwing would take out the
+            // whole sync loop.
+            foreach (var track in RDP.RadarTracks)
+            {
+                if (string.Equals(track?.ActualAircraft?.Callsign, fdr.Callsign, StringComparison.OrdinalIgnoreCase))
+                    return track;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+        }
+
+        return null;
+    }
+
+    // How close a flight has to be to a controlled sector to count as worth preparing for.
+    // Defined once here because two callers depend on it agreeing - TagOwnershipSync
+    // pre-activates inside it, FdrActivationSync restores inside it - and two separate constants
+    // would eventually disagree about which flights are "ours".
+    public const double NearBoundaryThresholdNm = 50.0;
+
+    // Inside one of candidates, or close enough to one's boundary to be arriving shortly.
+    //
+    // The point of this is what it excludes: a flight that is neither. Those are left exactly as
+    // vatSys leaves them - STATE_PREACTIVE, unactivated - rather than being pulled up to
+    // STATE_COORDINATED and rendered blue on a scope where they mean nothing to the controller.
+    public static bool IsWithinOrNear(FDP2.FDR fdr, IEnumerable<SectorsVolumes.Sector> candidates)
+    {
+        var list = candidates.ToList();
+        if (list.Count == 0)
+            return false;
+
+        if (Resolve(fdr, list) != null)
+            return true;
+
+        // Proximity needs a real position for the same reason containment does - a predicted one
+        // would put an aircraft "near" a boundary it is nowhere near.
+        if (LiveTrack(fdr) is not { } track)
+            return false;
+
+        var nearest = list
+            .Select(sector => DistanceToBoundaryNm(sector, track.LatLong))
+            .Where(distance => distance != null)
+            .Select(distance => distance!.Value)
+            .DefaultIfEmpty(double.MaxValue)
+            .Min();
+
+        return nearest <= NearBoundaryThresholdNm;
+    }
+
+    // A live radar/ADS-B return, never a prediction. fdr.GetLocation() falls back to
+    // PredictedPosition.Location whenever CoupledTrack is null (see FDP2.cs) - the flight plan's
+    // guess at where the aircraft ought to be - and "where do we think it should be" is not a basis
+    // for deciding which controller owns a tag. That fallback is what repeatedly resolved an
+    // aircraft laterally outside a sector into it: the prediction sat inside the boundary while the
+    // aircraft was nowhere near it, so the tag was activated and flashed in over and over.
+    //
+    // ActivateIfEligible was already tightened for exactly this reason (see its own comment); this
+    // is the same trap in the containment test, which was left behind.
+    //
+    // OnGround is deliberately not required here, unlike ActivateIfEligible: an aircraft sitting on
+    // the ground inside a sector is still inside it, which is precisely a tower sector's traffic.
+    // The point is only that the position has to be real.
     public static SectorsVolumes.Sector? Resolve(FDP2.FDR fdr, IEnumerable<SectorsVolumes.Sector> candidates)
     {
-        var location = fdr.GetLocation();
+        if (LiveTrack(fdr) is not { } track)
+            return null;
+
+        var location = track.LatLong;
         if (location == null)
             return null;
 
@@ -30,7 +118,7 @@ public static class SectorLocator
         if (candidateList.Count == 0)
             return null;
 
-        var level = fdr.CoupledTrack?.CorrectedAltitude ?? -1;
+        var level = track.CorrectedAltitude;
         var matches = candidateList.Where(s => s.IsInSector(location, level)).ToList();
         if (matches.Count == 0)
             return null;

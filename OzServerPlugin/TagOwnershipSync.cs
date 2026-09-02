@@ -43,7 +43,7 @@ public class TagOwnershipSync
 
     // How close (nm) an aircraft has to be to the boundary of a sector this controller currently has
     // selected before its FDR gets pre-activated ahead of arrival - see ActivateIfEligible.
-    const double NearSectorThresholdNm = 50.0;
+    const double NearSectorThresholdNm = SectorLocator.NearBoundaryThresholdNm;
 
     readonly OzServerOwnershipTracker _tracker;
     readonly FdrSync _fdrSync;
@@ -68,6 +68,13 @@ public class TagOwnershipSync
     // Entries are consumed as each tag becomes eligible, and dropped wholesale on disconnect so a
     // later session can never inherit them.
     readonly HashSet<string> _resumeAutoAccept = new(StringComparer.OrdinalIgnoreCase);
+    // A reclaim is only valid for the moments around the reconnect itself. The queue exists because
+    // a flight plan may not have arrived, or MMI.SectorsControlled may not be restored, at the
+    // instant the resume lands - not so a tag can be silently taken without acceptance minutes
+    // later. An aircraft that has flown out of this controller's airspace and drifts back in after
+    // this expires is an ordinary pickup, and flashes like one.
+    static readonly TimeSpan ResumeAutoAcceptWindow = TimeSpan.FromSeconds(60);
+    DateTime _resumeAutoAcceptUntil = DateTime.MinValue;
 
     public TagOwnershipSync(OzServerOwnershipTracker tracker, FdrSync fdrSync, FdrActivationSync fdrActivationSync)
     {
@@ -181,10 +188,13 @@ public class TagOwnershipSync
 
     static string? ActivationReason(FDP2.FDR fdr)
     {
-        // Live track required - see the class comment on ActivateIfEligible for why this can't fall
-        // back to fdr.GetLocation()'s predicted-position case the way SectorLocator.Resolve's own
-        // candidates elsewhere in this plugin are allowed to.
-        if (fdr.CoupledTrack is not { OnGround: false } track)
+        // A real radar return is required - see the class comment on ActivateIfEligible for why this
+        // can never fall back to fdr.GetLocation()'s predicted-position branch.
+        //
+        // Found through SectorLocator.LiveTrack rather than fdr.CoupledTrack directly: an aircraft
+        // can be present on radar and not yet coupled to its flight plan, and requiring the coupling
+        // here would refuse to pre-activate exactly the flights this exists to prepare.
+        if (SectorLocator.LiveTrack(fdr) is not { OnGround: false } track)
             return null;
 
         var nearest = MMI.SectorsControlled.Where(s => !s.IsDummy)
@@ -229,12 +239,35 @@ public class TagOwnershipSync
         if (mmiSector == null)
             return;
 
+        // Leave a tag someone else is working alone, even though it is sitting in this controller's
+        // airspace. fdr.IsTracked below only describes *this* client - vatSys has no cross-controller
+        // jurisdiction sync - so on a reconnect it reads false for everything, and every tag in the
+        // sector looked free, including ones another controller had taken over in the meantime.
+        //
+        // This never blocks the reconnect reclaim: those tags are ones OzServer still records against
+        // this very CID, so the "another controller" test does not match them.
+        if (_fdrActivationSync.IsHeldByAnotherController(fdr.Callsign))
+            return;
+
         // Cheap filter before ever touching the UI thread - re-checked for real inside
         // TryActivateAndFlashIn, since fdr.State can move between this read and the posted
         // callback actually running.
-        if (fdr.IsTracked
-            || fdr.State == FDP2.FDR.FDRStates.STATE_HANDOVER_FIRST
+        // A queued reconnect reclaim is resolved HERE, ahead of both returns below.
+        // Otherwise a tag that starts flashing after OnTagsResumed's own sweep - which is the normal
+        // case, since the flash follows the resume by a second or two - becomes unreachable: this
+        // returns early for as long as it flashes, and nothing else ever looks at the queue, so the
+        // reclaim silently expires and the controller is left accepting a tag that was already
+        // theirs.
+        if (fdr.State == FDP2.FDR.FDRStates.STATE_HANDOVER_FIRST
             || fdr.State == FDP2.FDR.FDRStates.STATE_HANDOVER)
+        {
+            if (TakeQueuedReclaim(fdr.Callsign))
+                RunOnUiThread(() => AcceptFlashingAfterReconnect(fdr));
+
+            return;
+        }
+
+        if (fdr.IsTracked)
             return;
 
         lock (_pickupStateLock)
@@ -314,14 +347,51 @@ public class TagOwnershipSync
         // Everything above still applies - it is still activated if it needed activating, still
         // checked against suppression, and still skipped entirely if anyone is tracking it - so this
         // only changes whether the controller has to accept something that was already theirs.
-        bool restoredOnReconnect;
-        lock (_pickupStateLock)
-            restoredOnReconnect = _resumeAutoAccept.Remove(fdr.Callsign);
+        // A tag coming back after a reconnect was already this controller's, so ideally they never
+        // see it offered at all. Jurisdiction can only be assigned by going through the handover -
+        // FDP2.AcceptJurisdiction(fdr, sector) on its own leaves the flight at STATE_COORDINATED -
+        // but going through it need not be *visible*: the flash is a repaint, and if the whole
+        // transition completes inside this one UI callback there is no repaint in between.
+        //
+        // If that does not land (the state is checked, never assumed), it falls through to the
+        // ordinary flash with the queue entry still intact, and the next evaluation completes it.
+        if (HasQueuedReclaim(fdr.Callsign) && TryTakeJurisdictionSilently(fdr, mmiSector))
+        {
+            TakeQueuedReclaim(fdr.Callsign);
+            return;
+        }
 
-        if (restoredOnReconnect)
-            ReclaimAfterReconnect(fdr, mmiSector);
-        else
-            OfferPickup(fdr, mmiSector);
+        OfferPickup(fdr, mmiSector);
+    }
+
+    // Consumes this callsign's queued reconnect reclaim, if it still has one. Expiry is enforced
+    // here rather than by a timer so there is exactly one place that decides whether a reclaim is
+    // still valid, and one place that removes it.
+    // Is this callsign queued, without consuming it - so a silent attempt can fall back to the
+    // flash path without having thrown the reclaim away.
+    bool HasQueuedReclaim(string callsign)
+    {
+        lock (_pickupStateLock)
+            return _resumeAutoAccept.Count > 0
+                   && DateTime.UtcNow <= _resumeAutoAcceptUntil
+                   && _resumeAutoAccept.Contains(callsign);
+    }
+
+    bool TakeQueuedReclaim(string callsign)
+    {
+        lock (_pickupStateLock)
+        {
+            if (_resumeAutoAccept.Count == 0)
+                return false;
+
+            if (DateTime.UtcNow > _resumeAutoAcceptUntil)
+            {
+                _resumeAutoAccept.Clear();
+                return false;
+            }
+
+            return _resumeAutoAccept.Remove(callsign);
+        }
     }
 
     void OnTagsResumed(IReadOnlyList<string> callsigns)
@@ -339,36 +409,101 @@ public class TagOwnershipSync
 
                 _resumeAutoAccept.Add(callsign);
             }
+
+            _resumeAutoAcceptUntil = DateTime.UtcNow + ResumeAutoAcceptWindow;
         }
 
-        // Re-evaluated immediately rather than left to the next sweep, so the tags are back by the
-        // time the controller has finished reconnecting. Each is still put through the full
-        // eligibility path - this only queues them.
+        // A tag that is ALREADY flashing cannot come back through EvaluatePickup - that returns
+        // early on STATE_HANDOVER_FIRST. And on a reconnect it always is: the FDR and radar updates
+        // that trigger the flash arrive within moments of connecting, while the resume is still
+        // waiting on its HTTP round trip. So by the time the backend answers, every tag this
+        // controller is getting back is mid-flash, and a queued reclaim would sit there unreachable
+        // until it expired. Accept those directly instead.
         foreach (var fdr in FDP2.GetFDRs)
+        {
+            if (string.IsNullOrEmpty(fdr.Callsign))
+                continue;
+
+            bool queued;
+            lock (_pickupStateLock)
+                queued = _resumeAutoAccept.Contains(fdr.Callsign);
+
+            if (!queued)
+                continue;
+
+            // EvaluatePickup owns both cases now - already flashing, or not yet - so this is just
+            // an immediate nudge rather than waiting for the next radar tick.
             EvaluatePickup(fdr);
+        }
     }
 
-    // Same as OfferPickup but accepted straight away, mirroring vatSys's own FDP2.FDRDeparted -
-    // which calls HandoffFirst and then immediately accepts. The handoff is what actually assigns
-    // jurisdiction, so it still has to happen; all that is skipped is the waiting.
-    static void ReclaimAfterReconnect(FDP2.FDR fdr, SectorsVolumes.Sector mmiSector)
+    // The tag is already flashing in from our own offer, so the handoff has happened and only the
+    // acceptance is outstanding - exactly what the controller would supply by clicking it. The
+    // backend has already confirmed this tag is still theirs and still inside their airspace, so
+    // making them click is asking them to re-answer a question they answered by reconnecting.
+    static void AcceptFlashingAfterReconnect(FDP2.FDR fdr)
     {
-        FDP2.HandoffFirst(fdr);
-        fdr.HandoffSector = mmiSector;
+        // Captured before the accept: HandoffSector is what OfferPickup resolved this tag under,
+        // and vatSys clears it as part of accepting.
+        var sector = fdr.HandoffSector;
+        if (sector == null)
+            return;
 
+        // MMI.AcceptJurisdiction, not FDP2.AcceptJurisdiction(fdr, sector): the FDP2 overload sets
+        // the controlling sector without resolving the pending handover, which left the tag at
+        // STATE_COORDINATED and flashing again a moment later. This is the call the controller's own
+        // Accept makes, and by now the flight really is in STATE_HANDOVER_FIRST - the state it has
+        // to be accepted from.
         MMI.AcceptJurisdiction(fdr);
 
-        // Reasserted after the accept for the same reason OfferPickup overwrites HandoffSector:
-        // vatSys resolves jurisdiction against its own default geometry, which knows nothing about
-        // OzServer subsectors and can land on a different sector of this controller's than the one
-        // the tag actually resolved under.
-        fdr.ControllingSector = mmiSector;
+        // Reasserted after the accept: vatSys resolves jurisdiction against its own default
+        // geometry, which knows nothing about OzServer subsectors.
+        fdr.ControllingSector = sector;
 
         var track = MMI.FindTrack(fdr);
         if (track != null)
             MMI.SetTrackState(track);
 
-        ActionLog.Log("Tag", $"Reclaimed {fdr.Callsign} into {mmiSector.Name} after reconnect");
+        ActionLog.Log("Tag", $"Accepted flashing {fdr.Callsign} into {sector.Name} after reconnect (now {fdr.State})");
+    }
+
+    // Same as OfferPickup but accepted straight away, mirroring vatSys's own FDP2.FDRDeparted -
+    // which calls HandoffFirst and then immediately accepts. The handoff is what actually assigns
+    // jurisdiction, so it still has to happen; all that is skipped is the waiting.
+    // Takes jurisdiction without the controller ever seeing the handover, by completing the whole
+    // transition inside one UI callback and only repainting at the end.
+    //
+    // The FDP2.Process call is the part that matters. HandoffFirst queues the state change, and
+    // accepting has nothing to resolve until that has been through a process pass - which is why
+    // calling the two back to back left the flight sitting in STATE_HANDOVER_FIRST, flashing.
+    // FdrActivationSync uses Process the same way, to land a batch of changes immediately.
+    //
+    // Returns whether it actually worked, checked against the resulting state rather than assumed:
+    // two other orderings were tried and each failed in its own way, so the caller needs a real
+    // answer, not an optimistic one.
+    static bool TryTakeJurisdictionSilently(FDP2.FDR fdr, SectorsVolumes.Sector sector)
+    {
+        FDP2.HandoffFirst(fdr);
+        fdr.HandoffSector = sector;
+
+        FDP2.Process(fdr, true);
+
+        MMI.AcceptJurisdiction(fdr);
+
+        if (fdr.State != FDP2.FDR.FDRStates.STATE_CONTROLLED)
+            return false;
+
+        // Reasserted after the accept: vatSys resolves jurisdiction against its own default
+        // geometry, which knows nothing about OzServer subsectors.
+        fdr.ControllingSector = sector;
+
+        // Only now is anything painted, so the intermediate handover state never reaches the screen.
+        var track = MMI.FindTrack(fdr);
+        if (track != null)
+            MMI.SetTrackState(track);
+
+        ActionLog.Log("Tag", $"Reclaimed {fdr.Callsign} into {sector.Name} after reconnect, no flash (now {fdr.State})");
+        return true;
     }
 
     // Flashes fdr in as an incoming handover rather than silently assuming jurisdiction - the
@@ -376,9 +511,12 @@ public class TagOwnershipSync
     // by another controller, instead of it just becoming theirs with nothing to see. Mirrors
     // vatSys's own FDP2.FDRDeparted, the one other place a flight plan becomes eligible in a
     // controller's own sector with nobody handing it over - it calls FDP2.HandoffFirst for exactly
-    // this reason, just followed immediately by an accept there. HandoffFirst's own 120s timeout
-    // (see FDP2.cs) reverts fdr to STATE_UNCONTROLLED if the controller never acts, and the next
-    // sweep/FDR tick re-offers it from scratch.
+    // this reason. HandoffFirst's own 120s timeout (see FDP2.cs) reverts fdr to STATE_UNCONTROLLED
+    // if the controller never acts, and the next sweep/FDR tick re-offers it from scratch.
+    //
+    // A reconnect reclaim goes through here too, and is completed by the next evaluation rather
+    // than accepted inline - see the call site in TryActivateAndFlashIn for why taking jurisdiction
+    // directly does not work.
     //
     // HandoffFirst sets HandoffSector to fdr.ControllingSector, which is not reliably the same
     // sector this controller owns on OzServer (see EvaluatePickup) - overwritten here with the one
@@ -464,12 +602,28 @@ public class TagOwnershipSync
 
         if (fdr.IsTrackedByMe)
         {
+            bool newlyMine;
             lock (_pickupStateLock)
             {
-                _trackedByMe.Add(fdr.Callsign);
+                newlyMine = _trackedByMe.Add(fdr.Callsign);
                 // Picked back up (by this controller) - a later drop deserves a fresh decision.
                 _pickupSuppressed.Remove(fdr.Callsign);
             }
+
+            // Report it the moment it becomes ours, instead of waiting for whatever radar or FDR
+            // update happens to come along next.
+            //
+            // FdrSync is driven entirely by those incidental updates (OnFdrUpdate/OnRadarTrackUpdate
+            // from Plugin), so taking a tag did not itself cause anything to be sent. A tag accepted
+            // shortly before an ungraceful disconnect was therefore never recorded at all - the
+            // backend had no row for it, so on reconnect there was nothing to hand back and the
+            // controller was offered their own aircraft as a fresh pickup. Five tags held, three
+            // returned, and the two missing ones were simply the two taken last.
+            //
+            // The mirror image of ClearControllingAuthority below, which pushes a drop immediately
+            // for exactly the same reason, and goes through the same batched flush.
+            if (newlyMine)
+                _fdrSync.PushImmediately(fdr);
 
             return;
         }

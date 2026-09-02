@@ -76,6 +76,25 @@ public class FdrSync
         Merge(BuildFdrDto(fdr));
     }
 
+    // Sends without waiting for the flush timer.
+    //
+    // For a position update, riding the next 5s batch is fine - a slightly stale lat/lon costs
+    // nothing. A change of *authority* is different: until it reaches the backend there is no record
+    // that this controller holds the tag, so an ungraceful disconnect in that window loses it
+    // entirely. On reconnect the backend has nothing to hand back and the controller is offered
+    // their own aircraft as a fresh pickup, which is exactly what happened to the last two tags of a
+    // five-tag session.
+    //
+    // Goes through the same _pending merge and the same FlushAsync as everything else, so it cannot
+    // race the timer, send a partial DTO, or overlap an in-flight batch. If a flush happens to be
+    // running, FlushAsync declines and the update simply stays queued for the next tick - no worse
+    // than the old behaviour, and the common case sends at once.
+    public void PushImmediately(FDP2.FDR fdr)
+    {
+        OnFdrUpdate(fdr);
+        _ = FlushAsync();
+    }
+
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
         var fdr = track.CoupledFDR;
@@ -117,6 +136,11 @@ public class FdrSync
             return;
 
         Merge(new OzServerFdrUpdateDto { Callsign = callsign, ControllingCid = null, ControllingCallsign = null });
+
+        // Flushed at once for the same reason PushImmediately exists: this is an authority change,
+        // and leaving it queued means the backend goes on telling every other controller that this
+        // one still holds a tag they have deliberately let go of.
+        _ = FlushAsync();
     }
 
     void Merge(OzServerFdrUpdateDto dto)

@@ -62,12 +62,20 @@ public class ObserverPositionMirror
 
     void Apply()
     {
-        // A real controller manages their own sectors through every other path in this plugin - this
-        // must never write over that.
-        if (!Network.IsConnected || Network.Me is not { IsRealATC: false })
+        // A real controller manages their own sectors through every other path in this plugin, so
+        // this must never run for one. Read from the connection's own Position/Rating
+        // (NetworkIdentity.IsObserver), never Network.Me.IsRealATC: that flag reads false for a
+        // genuine controller for seconds after Connected, and in that window this ran for a real
+        // ML-ASP_CTR session, resolved their own position, found nothing under "controlled by
+        // *others*" - their sectors are their own, not somebody else's - and wrote an empty set,
+        // taking their entire position off them.
+        if (!Network.IsConnected || !NetworkIdentity.IsObserver)
             return;
 
-        var position = ObservedPositionCallsign(Network.Me.Callsign);
+        // Network.Callsign, not Network.Me?.Callsign - the connection's own field, set the moment
+        // the session exists, rather than the published ATC record which lags it (the same reason
+        // NetworkIdentity.IsObserver reads Rating/Facility).
+        var position = ObservedPositionCallsign(Network.Callsign);
         if (position == null)
             return;
 
@@ -79,7 +87,10 @@ public class ObserverPositionMirror
         // Only written when it actually differs. Every MMI.SetControlledSectors re-fires
         // SectorsControlledChanged synchronously, so rewriting an unchanged set on every refresh
         // would spin the tracker's claim loop for nothing several times a minute.
-        if (SameSectors(mirrored, _mirrored))
+        // Never clear a scope. An empty result means the watched controller holds nothing we can
+        // see - which is indistinguishable from not knowing yet - and blanking MMI over that is the
+        // most destructive thing this class could do. Only ever writes an actual set of sectors.
+        if (mirrored.Count == 0 || SameSectors(mirrored, _mirrored))
             return;
 
         _mirrored = mirrored;
