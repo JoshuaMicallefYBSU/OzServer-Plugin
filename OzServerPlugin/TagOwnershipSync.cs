@@ -602,12 +602,28 @@ public class TagOwnershipSync
 
         if (fdr.IsTrackedByMe)
         {
+            bool newlyMine;
             lock (_pickupStateLock)
             {
-                _trackedByMe.Add(fdr.Callsign);
+                newlyMine = _trackedByMe.Add(fdr.Callsign);
                 // Picked back up (by this controller) - a later drop deserves a fresh decision.
                 _pickupSuppressed.Remove(fdr.Callsign);
             }
+
+            // Report it the moment it becomes ours, instead of waiting for whatever radar or FDR
+            // update happens to come along next.
+            //
+            // FdrSync is driven entirely by those incidental updates (OnFdrUpdate/OnRadarTrackUpdate
+            // from Plugin), so taking a tag did not itself cause anything to be sent. A tag accepted
+            // shortly before an ungraceful disconnect was therefore never recorded at all - the
+            // backend had no row for it, so on reconnect there was nothing to hand back and the
+            // controller was offered their own aircraft as a fresh pickup. Five tags held, three
+            // returned, and the two missing ones were simply the two taken last.
+            //
+            // The mirror image of ClearControllingAuthority below, which pushes a drop immediately
+            // for exactly the same reason, and goes through the same batched flush.
+            if (newlyMine)
+                _fdrSync.PushImmediately(fdr);
 
             return;
         }
