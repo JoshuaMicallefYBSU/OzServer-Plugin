@@ -88,6 +88,17 @@ public class FdrSync
     // race the timer, send a partial DTO, or overlap an in-flight batch. If a flush happens to be
     // running, FlushAsync declines and the update simply stays queued for the next tick - no worse
     // than the old behaviour, and the common case sends at once.
+    public void PushNow(FDP2.FDR fdr)
+    {
+        if (string.IsNullOrEmpty(fdr.Callsign))
+            return;
+
+        if (!ShouldPush(fdr))
+            return;
+
+        Merge(BuildFdrDto(fdr));
+        _ = FlushAsync();
+    }
 
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
@@ -98,7 +109,11 @@ public class FdrSync
         if (!ShouldPush(fdr!))
             return;
 
-        var dto = new OzServerFdrUpdateDto { Callsign = fdr!.Callsign };
+        var dto = new OzServerFdrUpdateDto
+        {
+            Callsign = fdr!.Callsign,
+            State = fdr.State.ToString()
+        };
         FillPosition(dto, track);
         FillAuthority(dto);
         FillCurrentSector(dto, fdr);

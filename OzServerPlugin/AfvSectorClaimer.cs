@@ -135,8 +135,8 @@ public class AfvSectorClaimer
 
     // Sets the initial controlled-sector set on connect (or on a genuine position change - see the
     // VSCSFrequenciesChanged handler): the primary sector matching this session's own login
-    // callsign, plus every one of its direct sub-sectors that nobody else is already real-ATC
-    // online for. Based on VatpacPlugin's Sectors.Init().
+    // callsign, plus the rest of its current-session group after removing top-down cover already
+    // staffed by another real controller. Based on VatpacPlugin's Sectors.Init().
     // True once the position's default sectors have actually been granted, which is what tells
     // RetryInit to stop. False means "not ready yet", never "nothing to do" - see the retry fields.
     bool Init()
@@ -154,9 +154,12 @@ public class AfvSectorClaimer
         // PrimaryPosition, not an open-coded copy of the same rule: PrimaryPositionWatcher applies
         // it on the *other* controller's side to decide what to release to this session, and the
         // two have to agree exactly or a sector is either released to nobody or never handed over.
-        var sectors = PrimaryPosition.DefaultSectorsFor(callsign);
+        var unfiltered = PrimaryPosition.DefaultSectorsFor(callsign);
+        var sectors = PrimaryPosition.WithoutStaffedTopDownCover(unfiltered, callsign);
         if (sectors.Count == 0)
             return false;
+
+        LogWithheldTopDownCover("Withheld top-down cover on login", unfiltered, sectors);
 
         // Only recorded once the grant actually happened. Setting it on the way in marked the
         // position as handled even when nothing was granted, so the VSCSFrequenciesChanged
@@ -175,14 +178,11 @@ public class AfvSectorClaimer
     //     "extend into SNO" that should also hand over WOL and WOL's other sub-sectors.
     //   - A primary's own line (e.g. WOL, or WON) activating adds it plus its *whole* group -
     //     matching real "extend" semantics (you're covering the area on your own scope/tags).
-    //     Whether each individual sub-sector is actually claimable on OzServer (some may already be
-    //     owned by someone else) is resolved downstream, once, by
-    //     OzServerOwnershipTracker.HandleConflictAsync - the same "ask, then claim what's left"
-    //     flow already used for a manual claim conflict - not filtered here by a live-ATC-presence
-    //     check, which only catches someone logged in directly under that exact callsign and misses
-    //     someone else who reached it by extending too (that was the actual bug: WON's own extend
-    //     silently absorbing HUO/LTA/HBA with no chance to ask, because that live-presence check
-    //     doesn't know about OzServer ownership at all).
+    //     OzServer ownership conflicts are still resolved downstream by
+    //     OzServerOwnershipTracker.HandleConflictAsync, but direct live-ATC presence is applied here
+    //     too for dataset top-down cover: if ML_APP is already online, pressing BLA Transmit must
+    //     not locally re-add MAE/MAV to vatSys's Sector Management Window before the backend gets a
+    //     chance to reject them.
     //
     // Deliberately scoped to just this one frequency rather than resweeping every VSCS line's
     // current state (an earlier version did that): every OTHER line's Transmit still reads exactly
@@ -223,13 +223,25 @@ public class AfvSectorClaimer
             if (!frequency.Transmit)
                 return;
 
-            currentSectors.Add(frequencySector);
+            var withheld = new HashSet<string>(
+                PrimaryPosition.StaffedCoveredSectors(frequencySector, Network.Me?.Callsign),
+                StringComparer.OrdinalIgnoreCase);
+
+            if (!withheld.Contains(frequencySector.Name))
+                currentSectors.Add(frequencySector);
 
             foreach (var subsector in frequencySector.SubSectors.ToList())
             {
+                if (withheld.Contains(subsector.Name))
+                    continue;
+
                 if (!currentSectors.Any(s => s.Equals(subsector)))
                     currentSectors.Add(subsector);
             }
+
+            if (withheld.Count > 0)
+                ActionLog.Log("Primary",
+                    $"Withheld top-down cover under {frequencySector.Name}: {string.Join(", ", withheld.OrderBy(s => s))}");
         }
         else
         {
@@ -246,5 +258,21 @@ public class AfvSectorClaimer
         }
 
         MMI.SetControlledSectors(currentSectors);
+    }
+
+    static void LogWithheldTopDownCover(
+        string lead,
+        List<SectorsVolumes.Sector> unfiltered,
+        List<SectorsVolumes.Sector> granted)
+    {
+        var withheld = unfiltered
+            .Where(sector => !granted.Any(g => g.Equals(sector)))
+            .Select(sector => sector.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name)
+            .ToList();
+
+        if (withheld.Count > 0)
+            ActionLog.Log("Primary", $"{lead}: {string.Join(", ", withheld)}");
     }
 }

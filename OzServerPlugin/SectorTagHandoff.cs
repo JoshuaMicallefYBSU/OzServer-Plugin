@@ -78,6 +78,7 @@ public class SectorTagHandoff
     static readonly TimeSpan TransferWindow = TimeSpan.FromSeconds(60);
 
     readonly OzServerOwnershipTracker _tracker;
+    readonly FdrSync _fdrSync;
     readonly object _lock = new();
 
     // Sectors just taken from someone, and who from.
@@ -112,9 +113,10 @@ public class SectorTagHandoff
         public void RefreshUntil() => Until = DateTime.UtcNow + TransferWindow;
     }
 
-    public SectorTagHandoff(OzServerOwnershipTracker tracker)
+    public SectorTagHandoff(OzServerOwnershipTracker tracker, FdrSync fdrSync)
     {
         _tracker = tracker;
+        _fdrSync = fdrSync;
         _tracker.OwnershipChanged += (_, diff) => RunOnUiThread(() => OnOwnershipChanged(diff));
         Network.Disconnected += (_, _) =>
         {
@@ -384,6 +386,8 @@ public class SectorTagHandoff
         var track = MMI.FindTrack(fdr);
         if (track != null)
             MMI.SetTrackState(track);
+
+        _fdrSync.PushNow(fdr);
 
         ActionLog.Log("Tag", $"Accepted {fdr.Callsign} with {match.Sector.Name} from {from}, no flash");
     }

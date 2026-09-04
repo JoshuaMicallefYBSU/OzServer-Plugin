@@ -89,7 +89,7 @@ public class Plugin : IPlugin
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
         // After the tracker, whose OwnershipChanged tells it a sector moved.
-        _sectorTagHandoff = new SectorTagHandoff(_ownershipTracker);
+        _sectorTagHandoff = new SectorTagHandoff(_ownershipTracker, _fdrSync);
         // After the tracker, whose own open requests it reads alongside the window's staged set.
         _pendingSectorGhosts = new PendingSectorGhosts(_ownershipTracker);
         _atisSync = new AtisSync();
@@ -484,10 +484,12 @@ public class Plugin : IPlugin
         // OzServer can see - a tag silently never accepted, ghosts silently never reasserted, and
         // nothing in the log to say which. These are three unrelated jobs that happen to share a
         // callback; one failing is not a reason to skip the others.
-        Isolate("FdrSync", () => _fdrSync.OnFdrUpdate(updated));
         // Watches for the handoffs an OzServer sector transfer produces, so one is accepted the
         // moment it lands rather than on a poll of its own.
         Isolate("TagHandoff", () => _sectorTagHandoff.OnFdrUpdate(updated));
+        // Run after TagHandoff so an accepted incoming strip is published as this controller's
+        // jurisdiction, not as the handover state vatSys delivered at the start of the callback.
+        Isolate("FdrSync", () => _fdrSync.OnFdrUpdate(updated));
         // vatSys has just recomputed this track's state, so any ghost of ours needs reasserting.
         Isolate("Ghost", () => _pendingSectorGhosts.Reassert());
     }

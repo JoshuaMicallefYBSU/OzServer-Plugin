@@ -113,17 +113,24 @@ public class PrimaryPositionWatcher
 
         if (!_hasBaseline)
         {
+            var alreadyOnline = UnhandledOnlineRealAtcs();
+            MarkHandled(alreadyOnline);
+            EnforceAlreadyOnline(alreadyOnline);
+
             _onlineCallsigns = present;
             _hasBaseline = true;
             _settleUntil = DateTime.UtcNow + SettleWindow;
             return;
         }
 
-        // Still settling: record who is there, act on nobody.
+        // Still settling: record who is there as already-online, but still enforce the sector
+        // boundary locally. Otherwise an enroute controller who connects after ML_APP can keep MAE
+        // in vatSys's own MMI window until some later ownership event happens to touch it.
         if (DateTime.UtcNow < _settleUntil)
         {
-            foreach (var atc in PrimaryPosition.OnlineRealAtcs())
-                _handled.Add(atc.Callsign);
+            var alreadyOnline = UnhandledOnlineRealAtcs();
+            MarkHandled(alreadyOnline);
+            EnforceAlreadyOnline(alreadyOnline);
 
             _onlineCallsigns = present;
             return;
@@ -147,8 +154,7 @@ public class PrimaryPositionWatcher
             .Where(a => !_handled.Contains(a.Callsign) && !_onlineCallsigns.Contains(a.Callsign))
             .ToList();
 
-        foreach (var atc in arrived)
-            _handled.Add(atc.Callsign);
+        MarkHandled(arrived);
 
         _onlineCallsigns = present;
 
@@ -248,7 +254,7 @@ public class PrimaryPositionWatcher
         }
     }
 
-    async Task HandleArrivalAsync(NetworkATC atc)
+    async Task HandleArrivalAsync(NetworkATC atc, bool notify = true)
     {
         if (!Network.IsConnected)
             return;
@@ -257,15 +263,14 @@ public class PrimaryPositionWatcher
         // actually collides with, and it is the thing that has to stop saying "mine". Releasing it
         // pulls the sector out of MMI and drops its VSCS line back to Idle on its own, through
         // OzServerOwnershipTracker.ReconcileMmiWithOwned.
-        // This session's own position is never given away, whatever the arriving controller's
-        // grouping says. DefaultSectorsFor already skips a sub-sector somebody is logged in on, but
-        // that test reads Network.GetOnlineATCs, and this controller's own callsign is not reliably
-        // in that list at the moment it matters - so a primary whose group happens to contain this
-        // position could otherwise take it straight off the person actually logged in on it.
-        var mine = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
+        // This session's own active position is never given away, but top-down cover that somebody
+        // else is logged on for is not active ownership. For BLA while ML_APP is online, MAE is in
+        // BLA's normal dataset group but must still be removed from BLA's current session.
+        var mine = PrimaryPosition.DefaultSectorsForCurrentSession(Network.Me?.Callsign);
 
         var owned = _tracker.Owned;
         var theirs = PrimaryPosition.DefaultSectorsFor(atc.Callsign);
+        var locallyRemoved = RemoveLocalCover(theirs, mine, atc.Callsign);
         var relinquishing = theirs
             .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name))
             .Where(s => !mine.Any(m => m.Name == s.Name))
@@ -275,9 +280,10 @@ public class PrimaryPositionWatcher
         // identical from the outside, and they have completely different causes.
         if (relinquishing.Count == 0)
         {
-            ActionLog.Log("Primary",
-                $"{atc.Callsign} arrived - nothing of theirs is owned here "
-                + $"(their group: {(theirs.Count == 0 ? "none resolved" : string.Join(", ", theirs.Select(s => s.Name)))})");
+            if (notify || locallyRemoved.Count > 0)
+                ActionLog.Log("Primary",
+                    $"{atc.Callsign} {(notify ? "arrived" : "already online")} - nothing of theirs is owned here "
+                    + $"(their group: {(theirs.Count == 0 ? "none resolved" : string.Join(", ", theirs.Select(s => s.Name)))})");
             return;
         }
 
@@ -288,7 +294,8 @@ public class PrimaryPositionWatcher
         // should see why their sectors are about to disappear as it happens rather than several
         // seconds later. A release that then fails is reported by ReleaseAsync into the same error
         // log everything else here uses.
-        ShowNotice(atc, relinquishing);
+        if (notify)
+            ShowNotice(atc, relinquishing);
 
         // Re-checked before each call because the backend cascades: releaseGroup releases the named
         // sector *and* everything it covers, so releasing MAE also releases MDN, MDS, MAV and MAW.
@@ -302,6 +309,70 @@ public class PrimaryPositionWatcher
 
             await _tracker.ReleaseAsync(sector);
         }
+    }
+
+    List<NetworkATC> UnhandledOnlineRealAtcs() =>
+        PrimaryPosition.OnlineRealAtcs()
+            .Where(atc => !string.Equals(atc.Callsign, Network.Me?.Callsign, StringComparison.OrdinalIgnoreCase))
+            .Where(atc => !_handled.Contains(atc.Callsign))
+            .ToList();
+
+    void MarkHandled(IEnumerable<NetworkATC> atcs)
+    {
+        foreach (var atc in atcs)
+            _handled.Add(atc.Callsign);
+    }
+
+    void EnforceAlreadyOnline(List<NetworkATC> atcs)
+    {
+        if (atcs.Count == 0)
+            return;
+
+        foreach (var atc in atcs)
+            _ = HandleArrivalAsync(atc, notify: false);
+    }
+
+    static List<SectorsVolumes.Sector> RemoveLocalCover(
+        List<SectorsVolumes.Sector> theirs,
+        List<SectorsVolumes.Sector> mine,
+        string callsign)
+    {
+        if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
+            return (List<SectorsVolumes.Sector>)mainForm.Invoke(
+                new Func<List<SectorsVolumes.Sector>>(() => RemoveLocalCover(theirs, mine, callsign)));
+
+        var removable = theirs
+            .Where(s => !mine.Any(m => m.Name == s.Name))
+            .ToList();
+        if (removable.Count == 0)
+            return new List<SectorsVolumes.Sector>();
+
+        var current = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
+        var removed = current
+            .Where(s => removable.Any(r => r.Name == s.Name))
+            .ToList();
+        if (removed.Count == 0)
+            return removed;
+
+        var remaining = current
+            .Where(s => !removed.Any(r => r.Name == s.Name))
+            .ToList();
+
+        MMI.SetControlledSectors(remaining);
+
+        foreach (var removedSector in removed)
+        {
+            foreach (var frequency in Audio.VSCSFrequencies.Where(f =>
+                string.Equals(f.Name, removedSector.Callsign, StringComparison.OrdinalIgnoreCase)))
+            {
+                frequency.Transmit = false;
+            }
+        }
+
+        ActionLog.Log("Primary",
+            $"Removed local top-down cover for {callsign}: {string.Join(", ", removed.Select(s => s.Name).OrderBy(s => s))}");
+
+        return removed;
     }
 
     static void ShowNotice(NetworkATC atc, List<SectorsVolumes.Sector> relinquishing)

@@ -94,6 +94,28 @@ public static class PrimaryPosition
             .ToList();
     }
 
+    // The sectors this session should actually hold right now. DefaultSectorsFor answers "what
+    // this position normally owns"; this removes top-down cover where somebody else is already
+    // logged on to the covered TCU/member position. Benalla still normally covers MAE, but not
+    // while ML_APP is online.
+    public static List<SectorsVolumes.Sector> DefaultSectorsForCurrentSession(string? callsign) =>
+        WithoutStaffedTopDownCover(DefaultSectorsFor(callsign), callsign);
+
+    public static List<SectorsVolumes.Sector> WithoutStaffedTopDownCover(
+        IEnumerable<SectorsVolumes.Sector> sectors,
+        string? ownCallsign)
+    {
+        var list = sectors.Where(s => s != null).ToList();
+        if (list.Count == 0)
+            return list;
+
+        var staffed = new HashSet<string>(
+            list.SelectMany(sector => StaffedCoveredSectors(sector, ownCallsign)),
+            StringComparer.OrdinalIgnoreCase);
+
+        return list.Where(sector => !staffed.Contains(sector.Name)).ToList();
+    }
+
     // The position this sector is the primary of, or null if it is only a member of one (or of
     // none). See the header for how the primary is derived and why it is not simply stated.
     static List<SectorsVolumes.Sector>? GroupOwnedBy(SectorsVolumes.Sector sector)
