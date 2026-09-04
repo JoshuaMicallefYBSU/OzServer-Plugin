@@ -15,10 +15,11 @@ namespace OzServerPlugin;
 // transmit press show up in both the built-in vatSys Sectors window (which just displays
 // MMI.SectorsControlled - nothing else needed for that one) and the OzServer window, and (as a
 // consequence of MMI.SectorsControlled being correct) is also what makes vatSys's own map display
-// an extension normally - no separate API call needed for that. Every trigger here also calls
-// ControllerInfoUpdater.Update() (ported from the same reference plugin's Extending.cs), which
-// keeps the "Extending ..." Controller Info line in sync with the same Transmit state,
-// independently of MMI/OzServer.
+// an extension normally - no separate API call needed for that.
+//
+// Controller Info is deliberately not touched here. This used to publish an "Extending ..."
+// line from the same Transmit state; that is another plugin's job now, and two plugins editing
+// the same free-text field would fight over it.
 public class AfvSectorClaimer
 {
     readonly HashSet<VSCSFrequency> _subscribed = new();
@@ -59,8 +60,6 @@ public class AfvSectorClaimer
 
             if (Network.Me?.Callsign != _lastPrimaryCallsign)
                 BeginInit();
-
-            ControllerInfoUpdater.Update();
         };
         _initRetryTimer = new System.Threading.Timer(
             _ => RetryInit(), null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
@@ -132,8 +131,6 @@ public class AfvSectorClaimer
     {
         if (sender is VSCSFrequency frequency)
             CheckActive(frequency);
-
-        ControllerInfoUpdater.Update();
     }
 
     // Sets the initial controlled-sector set on connect (or on a genuine position change - see the
