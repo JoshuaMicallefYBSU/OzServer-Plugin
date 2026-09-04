@@ -43,6 +43,32 @@ public class OzServerSectorDto
     [JsonProperty("full_name")] public string FullName { get; set; } = "";
 }
 
+// A shared mark on the radar picture - a freehand stroke, or (later) a note. Geometry is lat/lon
+// because every controller is looking at a different zoom, centre and screen size.
+public class OzServerAnnotationPointDto
+{
+    [JsonProperty("lat")] public double Lat { get; set; }
+    [JsonProperty("lon")] public double Lon { get; set; }
+}
+
+public class OzServerAnnotationDto
+{
+    // A uuid, unlike the integer ids everywhere else here - annotations are created far more freely
+    // than sectors or requests, and the server hands them out rather than a sequence.
+    [JsonProperty("id")] public string Id { get; set; } = "";
+    [JsonProperty("kind")] public string Kind { get; set; } = "";
+    [JsonProperty("author")] public OzServerAnnotationAuthorDto? Author { get; set; }
+    [JsonProperty("body")] public string? Body { get; set; }
+    [JsonProperty("points")] public List<OzServerAnnotationPointDto> Points { get; set; } = new();
+    [JsonProperty("colour")] public string? Colour { get; set; }
+}
+
+public class OzServerAnnotationAuthorDto
+{
+    [JsonProperty("cid")] public int Cid { get; set; }
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+}
+
 public class OzServerSectorOwnershipRequestDto
 {
     [JsonProperty("id")] public int Id { get; set; }
@@ -453,6 +479,41 @@ public class OzServerApiClient
 
     // FlightDataRecordController::sync - every FDR row OzServer currently holds, for
     // FdrActivationSync's own comparison against local FDP2.FDR state.
+    // Shared markup (issue #9). Every controller reads the whole set: it is a few dozen small
+    // shapes, all of it is needed to draw anything, and an area filter would have to be recomputed
+    // on every pan and zoom.
+    public Task<List<OzServerAnnotationDto>> GetAnnotationsAsync() =>
+        GetAsync<List<OzServerAnnotationDto>>("/annotations", () => new List<OzServerAnnotationDto>());
+
+    public Task<OzServerAnnotationDto> CreateStrokeAsync(IEnumerable<Coordinate> points) =>
+        PostAsync<OzServerAnnotationDto>("/annotations", new
+        {
+            kind = "stroke",
+            points = points.Select(point => new { lat = point.Latitude, lon = point.Longitude }).ToList()
+        });
+
+    public Task<OzServerAnnotationDto> CreateNoteAsync(string body, Coordinate position) =>
+        PostAsync<OzServerAnnotationDto>("/annotations", new
+        {
+            kind = "note",
+            body,
+            // A note is anchored at one point; the server requires exactly one for this kind.
+            points = new[] { new { lat = position.Latitude, lon = position.Longitude } }
+        });
+
+    public Task<OzServerAnnotationDto> UpdateNoteAsync(string id, string body, Coordinate position) =>
+        PostAsync<OzServerAnnotationDto>($"/annotations/{id}/update", new
+        {
+            body,
+            points = new[] { new { lat = position.Latitude, lon = position.Longitude } }
+        });
+
+    public Task DeleteAnnotationAsync(string id) =>
+        PostAsync($"/annotations/{id}/delete");
+
+    public Task ClearMyAnnotationsAsync() =>
+        PostAsync("/annotations/clear-mine");
+
     public Task<List<OzServerFdrRecordDto>> GetFdrSyncAsync() =>
         GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
 

@@ -46,6 +46,14 @@ public class Plugin : IPlugin
     readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
     readonly ObserverPositionMirror _observerPositionMirror;
     readonly RequestedSectorOverlay _requestedSectorOverlay;
+    // Freehand markup on the scope, and the bare D that toggles it. Both are alive from plugin load
+    // so the key works before any OzServer window has been opened - though the tool itself hooks
+    // nothing until it is switched on.
+    readonly MapDrawing _mapDrawing;
+    readonly DrawModeHotkey _drawModeHotkey;
+    // Shares vatSys's own text areas. Nothing to switch on - a note written the normal way is
+    // published, and everyone else's arrive as ordinary text areas.
+    readonly SharedNotes _sharedNotes;
     // Timer-driven and entirely invisible - it never touches the running session, only what is on
     // disk for the next one. See its own class comment for why it can't just overwrite the DLL.
     readonly PluginUpdater _updater;
@@ -90,12 +98,18 @@ public class Plugin : IPlugin
         // assembly, so it has no ordering relationship with anything above it.
         _updater = new PluginUpdater();
 
+        _mapDrawing = new MapDrawing();
+        _drawModeHotkey = new DrawModeHotkey(_mapDrawing);
+        _sharedNotes = new SharedNotes();
+
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
             CustomToolStripMenuItemCategory.Settings,
             new ToolStripMenuItem("OzServer Sectors"));
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
+
+        AddDrawingMenu();
 
         // An incoming request is surfaced the same way vatSys's own "Messages" menu surfaces an
         // unread one: the Settings header flashes (a solid colour flip, on vatSys's own menu-bar
@@ -359,6 +373,52 @@ public class Plugin : IPlugin
         // own flash on Click without waiting for every unread entry to be read.
         if (_settingsMenuHeader != null)
             _settingsMenuHeader.Checked = pending;
+    }
+
+    // Drawing goes on the menu bar itself rather than under Settings, because it is a tool that gets
+    // switched on and off mid-session rather than something configured once.
+    //
+    // Category.Custom with a CustomCategoryName is what puts it there: MainForm.LoadPluginMenuItem
+    // takes that name, finds or creates a top-level "<name>MenuItem" on the main MenuStrip, and adds
+    // the item beneath it - so this string is the header text. A bare clickable header is not on
+    // offer, since every plugin entry lands inside a dropdown.
+    //
+    // Named for the tool rather than for the plugin: on a menu bar sitting beside Maps, Tools and
+    // Windows, what a controller is looking for is the drawing, not who wrote it.
+    const string DrawingMenuName = "Drawing";
+
+    void AddDrawingMenu()
+    {
+        // CheckOnClick is deliberately off. If the item toggled its own check, pressing D would
+        // leave the menu showing the opposite of the truth - the check has to follow the tool, not
+        // the click, because the tool has two ways in.
+        var drawItem = new ToolStripMenuItem("Draw on Map")
+        {
+            CheckOnClick = false,
+            // Seeded from the tool rather than assumed false, so the item is right from the first
+            // time the menu is opened however the tool got into that state.
+            Checked = _mapDrawing.Enabled
+        };
+
+        // The one place the check is set. MenuRenderer.OnRenderItemText reads CheckState to pick the
+        // item's colour, so this is what actually highlights it - and it is driven by the tool's own
+        // state change, which both the D key and this item's Click go through.
+        _mapDrawing.EnabledChanged += (_, _) => drawItem.Checked = _mapDrawing.Enabled;
+        drawItem.Click += (_, _) => _mapDrawing.Toggle();
+
+        var undoItem = new ToolStripMenuItem("Undo Last Stroke");
+        undoItem.Click += (_, _) => _mapDrawing.UndoLast();
+
+        // No clear-everything entries for either drawing or notes: middle click removes one at a
+        // time, and that is the whole vocabulary. Yours goes for everyone, somebody else's is hidden
+        // for you - see MapDrawing.RemoveAt and SharedNotes.
+        foreach (var item in new[] { drawItem, undoItem })
+        {
+            MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
+                CustomToolStripMenuItemWindowType.Main,
+                CustomToolStripMenuItemCategory.Custom,
+                item) { CustomCategoryName = DrawingMenuName });
+        }
     }
 
     void OpenSectorsWindow()
