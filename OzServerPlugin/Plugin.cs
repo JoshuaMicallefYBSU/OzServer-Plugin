@@ -64,6 +64,8 @@ public class Plugin : IPlugin
     // Timer-driven and entirely invisible - it never touches the running session, only what is on
     // disk for the next one. See its own class comment for why it can't just overwrite the DLL.
     readonly PluginUpdater _updater;
+    // Copies this session's decisions to OzServer so every controller's log can be read together.
+    readonly ClientLogForwarder _clientLogForwarder;
 
     // Incoming requests waiting on this controller, driving the Settings header's flash.
     int _pendingRequests;
@@ -79,6 +81,8 @@ public class Plugin : IPlugin
 
     public Plugin()
     {
+        // First, so every decision logged below is forwarded from the outset.
+        _clientLogForwarder = new ClientLogForwarder();
         _ownershipTracker = new OzServerOwnershipTracker();
         _afvSectorClaimer = new AfvSectorClaimer();
         _fdrSync = new FdrSync();

@@ -52,6 +52,10 @@ public class SectorTagHandoff
     // Sectors just taken from someone, and who from.
     readonly List<PendingTransfer> _incoming = new();
 
+    // Flashing tags already reported as unmatched, so the diagnostic below fires once per handoff
+    // rather than on every FDR update for the whole time it flashes.
+    readonly HashSet<string> _reportedUnmatched = new(StringComparer.OrdinalIgnoreCase);
+
     sealed class PendingTransfer
     {
         public PendingTransfer(SectorsVolumes.Sector sector, string fromCallsign)
@@ -70,7 +74,7 @@ public class SectorTagHandoff
     {
         _tracker = tracker;
         _tracker.OwnershipChanged += (_, diff) => RunOnUiThread(() => OnOwnershipChanged(diff));
-        Network.Disconnected += (_, _) => { lock (_lock) _incoming.Clear(); };
+        Network.Disconnected += (_, _) => { lock (_lock) _incoming.Clear(); _reportedUnmatched.Clear(); };
     }
 
     // Called for every FDR update, so an incoming transfer is accepted as soon as it lands rather
@@ -89,6 +93,8 @@ public class SectorTagHandoff
 
             lock (_lock)
                 _incoming.Add(new PendingTransfer(transfer.Sector, from));
+
+            ActionLog.Log("Tag", $"Gained {transfer.Sector.Name} from {from} - expecting its tags");
 
             // Anything already flashing arrived before this client noticed the ownership change,
             // which is the common ordering - the giving client acts on its own poll tick and there
@@ -145,9 +151,10 @@ public class SectorTagHandoff
         if (string.IsNullOrEmpty(fdr.Callsign) || fdr.State != FDP2.FDR.FDRStates.STATE_HANDOVER_FIRST)
             return;
 
+        // Deliberately not an early return when this is missing. A handoff with no HandoffController
+        // and a handoff from the wrong controller both end up flashing, and telling them apart
+        // afterwards is the whole point of the diagnostic below.
         var from = fdr.HandoffController?.Callsign;
-        if (string.IsNullOrEmpty(from))
-            return;
 
         PendingTransfer? match = null;
 
@@ -155,15 +162,40 @@ public class SectorTagHandoff
         {
             _incoming.RemoveAll(pending => pending.Until < DateTime.UtcNow);
 
-            match = _incoming.FirstOrDefault(pending =>
-                string.Equals(pending.FromCallsign, from, StringComparison.OrdinalIgnoreCase)
-                && SectorLocator.Resolve(fdr, new[] { pending.Sector }) != null);
+            match = string.IsNullOrEmpty(from)
+                ? null
+                : _incoming.FirstOrDefault(pending =>
+                    string.Equals(pending.FromCallsign, from, StringComparison.OrdinalIgnoreCase)
+                    && SectorLocator.Resolve(fdr, new[] { pending.Sector }) != null);
         }
 
         // Not part of a transfer - somebody handed this over deliberately, so it stays flashing for
         // the controller to accept themselves.
+        //
+        // Reported once, with both sides of the comparison, because "it flashed instead of being
+        // accepted" is otherwise indistinguishable between the three things that cause it: no
+        // transfer registered, the handing controller's callsign not matching the one OzServer named
+        // as the previous owner, or the aircraft not resolving inside the sector that moved.
         if (match == null)
+        {
+            if (_reportedUnmatched.Add(fdr.Callsign))
+            {
+                string expecting;
+                lock (_lock)
+                    expecting = _incoming.Count == 0
+                        ? "none"
+                        : string.Join(", ", _incoming.Select(p => $"{p.Sector.Name} from {p.FromCallsign}"));
+
+                var inside = SectorLocator.Resolve(fdr, MMI.SectorsControlled.Where(s => !s.IsDummy))?.Name ?? "nowhere of ours";
+                ActionLog.Log("Tag",
+                    $"{fdr.Callsign} flashing from {from ?? "(no HandoffController)"}, left to accept by hand "
+                    + $"(resolves to {inside}; expecting transfers: {expecting})");
+            }
+
             return;
+        }
+
+        _reportedUnmatched.Remove(fdr.Callsign);
 
         // Resolved against what this session actually holds now, rather than assuming the
         // transferred sector: the aircraft may sit in a sub-sector of it.

@@ -80,7 +80,13 @@ public class PendingSectorGhosts
             var pending = PendingSectors();
             var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var fdr in FDP2.GetFDRs.ToList())
+            // One snapshot for the whole pass. FDP2.GetFDRs is vatSys's live collection and it is
+            // mutated from vatSys's own threads, so every enumeration of it needs its own copy -
+            // the release loop below used to walk it again and threw "Collection was modified" on
+            // most passes, which aborted the whole apply and left ghosts stuck on.
+            var fdrs = FDP2.GetFDRs.ToList();
+
+            foreach (var fdr in fdrs)
             {
                 if (string.IsNullOrEmpty(fdr.Callsign) || !WouldTransfer(fdr, pending))
                     continue;
@@ -96,7 +102,7 @@ public class PendingSectorGhosts
             var released = _painted.Where(callsign => !wanted.Contains(callsign)).ToList();
             foreach (var callsign in released)
             {
-                var fdr = FDP2.GetFDRs.FirstOrDefault(f =>
+                var fdr = fdrs.FirstOrDefault(f =>
                     string.Equals(f.Callsign, callsign, StringComparison.OrdinalIgnoreCase));
 
                 if (fdr != null && MMI.FindTrack(fdr) is { } track)

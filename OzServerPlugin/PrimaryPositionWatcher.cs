@@ -27,9 +27,20 @@ public class PrimaryPositionWatcher
 {
     readonly OzServerOwnershipTracker _tracker;
 
-    // Callsigns seen online on the previous OnlineATCChanged, to pick out genuinely new arrivals.
-    // Compared case-insensitively - a callsign is an identity here, not a string to round-trip.
+    // Every callsign online at all - observers included, and regardless of IsRealATC. Presence, not
+    // eligibility: this is what decides whether somebody is *new*.
     HashSet<string> _onlineCallsigns = new(StringComparer.OrdinalIgnoreCase);
+    // Controllers already treated as arrived, so one logon produces one handover however many times
+    // the online list is republished. Cleared per callsign when they actually leave, so a genuine
+    // reconnect is a fresh arrival.
+    readonly HashSet<string> _handled = new(StringComparer.OrdinalIgnoreCase);
+    // Everyone visible during this window counts as already-online rather than newly arrived.
+    //
+    // One snapshot at connect is not enough on its own: the online list arrives progressively, and
+    // IsRealATC settles later still, so a controller who was on the network long before this session
+    // can first become visible several seconds in. That is exactly what announced ML_APP as having
+    // "logged on" to a controller who connected after them.
+    DateTime _settleUntil = DateTime.MinValue;
     // Whoever is already online at the moment this session joins is not a "logon" - they were there
     // first, and anything of theirs this controller somehow holds is a pre-existing situation
     // rather than something this event just caused. The first update after connecting is therefore
@@ -49,6 +60,10 @@ public class PrimaryPositionWatcher
     // silently dropped - the position never handed back at all.
     readonly object _pendingGate = new();
 
+    // Long enough for the network's ATC list and its IsRealATC flags to settle after connecting,
+    // short enough that a genuine logon moments later is still caught.
+    static readonly TimeSpan SettleWindow = TimeSpan.FromSeconds(20);
+
     public PrimaryPositionWatcher(OzServerOwnershipTracker tracker)
     {
         _tracker = tracker;
@@ -62,7 +77,9 @@ public class PrimaryPositionWatcher
     void ResetBaseline()
     {
         _onlineCallsigns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _handled.Clear();
         _hasBaseline = false;
+        _settleUntil = DateTime.MinValue;
 
         lock (_pendingGate)
             _pending.Clear();
@@ -76,18 +93,53 @@ public class PrimaryPositionWatcher
             return;
         }
 
-        var online = PrimaryPosition.OnlineRealAtcs();
-        var current = new HashSet<string>(online.Select(a => a.Callsign), StringComparer.OrdinalIgnoreCase);
+        // Presence is read from the raw list, eligibility from IsRealATC - and the two must not be
+        // conflated, which is the bug this replaced.
+        //
+        // IsRealATC reads false for a genuine controller for some seconds after they connect, and
+        // can drop out again later. Deriving "who is online" from the filtered list therefore had
+        // controllers repeatedly vanishing and reappearing, and every reappearance looked like a
+        // fresh logon: SY_TWR was announced twice ten minutes apart, and ML_APP was announced as
+        // having "logged on" to a controller who connected *after* them. Each false arrival tried to
+        // relinquish sectors that were never theirs to give, which is where the "Only the current
+        // owner may release this sector" errors came from.
+        var raw = Network.GetOnlineATCs ?? new List<NetworkATC>();
+        var present = new HashSet<string>(
+            raw.Where(a => !string.IsNullOrEmpty(a.Callsign)).Select(a => a.Callsign),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Gone entirely - not merely filtered out - so a later reconnect counts as a new arrival.
+        _handled.RemoveWhere(callsign => !present.Contains(callsign));
 
         if (!_hasBaseline)
         {
-            _onlineCallsigns = current;
+            _onlineCallsigns = present;
             _hasBaseline = true;
+            _settleUntil = DateTime.UtcNow + SettleWindow;
             return;
         }
 
-        var arrived = online.Where(a => !_onlineCallsigns.Contains(a.Callsign)).ToList();
-        _onlineCallsigns = current;
+        // Still settling: record who is there, act on nobody.
+        if (DateTime.UtcNow < _settleUntil)
+        {
+            foreach (var atc in PrimaryPosition.OnlineRealAtcs())
+                _handled.Add(atc.Callsign);
+
+            _onlineCallsigns = present;
+            return;
+        }
+
+        // Arrived means: a real controller, not already handled, and not present under any guise
+        // when we last looked. The last clause is what a flag flicker cannot fake - they were
+        // already there.
+        var arrived = PrimaryPosition.OnlineRealAtcs()
+            .Where(a => !_handled.Contains(a.Callsign) && !_onlineCallsigns.Contains(a.Callsign))
+            .ToList();
+
+        foreach (var atc in arrived)
+            _handled.Add(atc.Callsign);
+
+        _onlineCallsigns = present;
 
         // Logged because this whole path used to be invisible: when a primary logged on and their
         // group was not handed back, nothing anywhere said whether this client had even noticed
@@ -200,8 +252,18 @@ public class PrimaryPositionWatcher
         // log everything else here uses.
         ShowNotice(atc, relinquishing);
 
+        // Re-checked before each call because the backend cascades: releaseGroup releases the named
+        // sector *and* everything it covers, so releasing MAE also releases MDN, MDS, MAV and MAW.
+        // Walking the list blindly then asked to release four sectors this controller had already
+        // given up, and each answered "Only the current owner may release this sector" - four
+        // alarming errors for an operation that had in fact completely succeeded.
         foreach (var sector in relinquishing)
+        {
+            if (!_tracker.Owned.Any(o => o.Name == sector.Name))
+                continue;
+
             await _tracker.ReleaseAsync(sector);
+        }
     }
 
     static void ShowNotice(NetworkATC atc, List<SectorsVolumes.Sector> relinquishing)

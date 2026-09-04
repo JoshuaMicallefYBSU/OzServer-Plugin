@@ -22,6 +22,11 @@ public static class ActionLog
 {
     static readonly object Lock = new();
 
+    // Raised for every line, after it has been written. Lets ClientLogForwarder copy the decisions
+    // to OzServer without this class knowing anything about the network - the file remains the
+    // complete record whether or not anything is listening.
+    public static event Action<string, string>? LineWritten;
+
     public static void Log(string category, string message) => Write(category, message);
 
     public static void LogAttempt(string method, string path, bool success, string? detail = null) =>
@@ -31,6 +36,8 @@ public static class ActionLog
 
     static void Write(string category, string message)
     {
+        Notify(category, message);
+
         try
         {
             lock (Lock)
@@ -47,6 +54,19 @@ public static class ActionLog
         catch
         {
             // Logging must never be the reason a real action fails - see the class comment.
+        }
+    }
+
+    // Outside the file lock and swallowing everything: a subscriber must not be able to hold up the
+    // audit trail, nor break the operation whose log line this is.
+    static void Notify(string category, string message)
+    {
+        try
+        {
+            LineWritten?.Invoke(category, message);
+        }
+        catch
+        {
         }
     }
 }

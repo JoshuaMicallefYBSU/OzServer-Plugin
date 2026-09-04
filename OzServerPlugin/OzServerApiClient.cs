@@ -63,6 +63,14 @@ public class OzServerAnnotationDto
     [JsonProperty("colour")] public string? Colour { get; set; }
 }
 
+// One forwarded plugin log line - see ClientLogForwarder.
+public class OzServerClientLogLineDto
+{
+    [JsonProperty("at")] public DateTimeOffset At { get; set; }
+    [JsonProperty("category")] public string Category { get; set; } = "";
+    [JsonProperty("message")] public string Message { get; set; } = "";
+}
+
 public class OzServerAnnotationAuthorDto
 {
     [JsonProperty("cid")] public int Cid { get; set; }
@@ -453,6 +461,11 @@ public class OzServerApiClient
             body,
             points = new[] { new { lat = position.Latitude, lon = position.Longitude } }
         });
+
+    // Fire and forget from the caller's point of view - see ClientLogForwarder for why a failure
+    // here is swallowed rather than reported.
+    public Task SendClientLogsAsync(IEnumerable<OzServerClientLogLineDto> lines) =>
+        PostAsync("/client-logs", new { lines = lines.ToList() });
 
     public Task DeleteAnnotationAsync(string id) =>
         PostAsync($"/annotations/{id}/delete");
