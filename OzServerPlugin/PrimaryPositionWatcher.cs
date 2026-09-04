@@ -215,7 +215,13 @@ public class PrimaryPositionWatcher
             return;
 
         ActionLog.Log("Primary",
-            $"ATC left: {string.Join(", ", departed)} - taking back top-down cover of {string.Join(", ", freed)}");
+            $"ATC left: {string.Join(", ", departed)} - taking back top-down cover of {string.Join(", ", freed)}",
+            new
+            {
+                action = "take_back_top_down_cover",
+                departed = departed.ToArray(),
+                sectors = freed.ToArray()
+            });
 
         _ = _tracker.ReclaimTopDownCoverAsync(freed);
     }
@@ -283,12 +289,27 @@ public class PrimaryPositionWatcher
             if (notify || locallyRemoved.Count > 0)
                 ActionLog.Log("Primary",
                     $"{atc.Callsign} {(notify ? "arrived" : "already online")} - nothing of theirs is owned here "
-                    + $"(their group: {(theirs.Count == 0 ? "none resolved" : string.Join(", ", theirs.Select(s => s.Name)))})");
+                    + $"(their group: {(theirs.Count == 0 ? "none resolved" : string.Join(", ", theirs.Select(s => s.Name)))})",
+                    new
+                    {
+                        action = notify ? "arrival_no_owned_sectors" : "already_online_no_owned_sectors",
+                        controller_callsign = atc.Callsign,
+                        their_group = theirs.Select(s => s.Name).ToArray(),
+                        locally_removed = locallyRemoved.Select(s => s.Name).ToArray()
+                    });
             return;
         }
 
         ActionLog.Log("Primary",
-            $"Relinquishing to {atc.Callsign}: {string.Join(", ", relinquishing.Select(s => s.Name))}");
+            $"Relinquishing to {atc.Callsign}: {string.Join(", ", relinquishing.Select(s => s.Name))}",
+            new
+            {
+                action = notify ? "relinquish_to_arrival" : "relinquish_to_already_online",
+                controller_callsign = atc.Callsign,
+                sectors = relinquishing.Select(s => s.Name).ToArray(),
+                their_group = theirs.Select(s => s.Name).ToArray(),
+                locally_removed = locallyRemoved.Select(s => s.Name).ToArray()
+            });
 
         // Shown before the releases rather than after: each one is a round trip, and the controller
         // should see why their sectors are about to disappear as it happens rather than several
@@ -370,7 +391,14 @@ public class PrimaryPositionWatcher
         }
 
         ActionLog.Log("Primary",
-            $"Removed local top-down cover for {callsign}: {string.Join(", ", removed.Select(s => s.Name).OrderBy(s => s))}");
+            $"Removed local top-down cover for {callsign}: {string.Join(", ", removed.Select(s => s.Name).OrderBy(s => s))}",
+            new
+            {
+                action = "remove_local_top_down_cover",
+                controller_callsign = callsign,
+                sectors = removed.Select(s => s.Name).OrderBy(s => s).ToArray(),
+                remaining = remaining.Select(s => s.Name).OrderBy(s => s).ToArray()
+            });
 
         return removed;
     }

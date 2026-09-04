@@ -97,6 +97,16 @@ public class FdrSync
             return;
 
         Merge(BuildFdrDto(fdr));
+        ActionLog.Log("FDR", $"Queued immediate FDR authority push for {fdr.Callsign}", new
+        {
+            action = "fdr_push_now",
+            fdr_callsign = fdr.Callsign,
+            state = fdr.State.ToString(),
+            is_tracked_by_me = fdr.IsTrackedByMe,
+            current_sector = SectorLocator.Resolve(fdr, SectorsVolumes.Sectors)?.Name,
+            controlling_sector = fdr.ControllingSector?.Name,
+            controlling_callsign = Network.Callsign
+        });
         _ = FlushAsync();
     }
 

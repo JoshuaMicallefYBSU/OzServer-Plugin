@@ -146,7 +146,13 @@ public class SectorTagHandoff
             lock (_lock)
                 AddOrRefreshIncoming(transfer.Sector, from);
 
-            ActionLog.Log("Tag", $"Gained {transfer.Sector.Name} from {from} - expecting its tags");
+            ActionLog.Log("Tag", $"Gained {transfer.Sector.Name} from {from} - expecting its tags", new
+            {
+                action = "sector_gained_expect_tags",
+                sector = transfer.Sector.Name,
+                from_callsign = from,
+                pending_transfers = PendingTransferContext()
+            });
 
             // Anything already flashing arrived before this client noticed the ownership change,
             // which is the common ordering - the giving client acts on its own poll tick and there
@@ -194,7 +200,14 @@ public class SectorTagHandoff
 
         ActionLog.Log("Tag", moved.Count > 0
             ? $"{transfer.Sector.Name} went to {toCallsign} - handed over {string.Join(", ", moved)}"
-            : $"{transfer.Sector.Name} went to {toCallsign} - no tags of ours inside it");
+            : $"{transfer.Sector.Name} went to {toCallsign} - no tags of ours inside it",
+            new
+            {
+                action = "sector_lost_handoff_tags",
+                sector = transfer.Sector.Name,
+                to_callsign = toCallsign,
+                fdr_callsigns = moved.ToArray()
+            });
     }
 
     // The taking half. Accepts an incoming handoff silently when it belongs to a transfer.
@@ -282,7 +295,19 @@ public class SectorTagHandoff
                 var inside = SectorLocator.Resolve(fdr, MMI.SectorsControlled.Where(s => !s.IsDummy))?.Name ?? "nowhere of ours";
                 ActionLog.Log("Tag",
                     $"{fdr.Callsign} flashing from {from ?? "(nobody tracking it)"}, left to accept by hand "
-                    + $"(resolves to {inside}; expecting transfers: {expecting})");
+                    + $"(resolves to {inside}; expecting transfers: {expecting})",
+                    new
+                    {
+                        action = "handoff_left_to_manual",
+                        fdr_callsign = fdr.Callsign,
+                        from_callsign = from,
+                        resolved_sector = inside,
+                        state = fdr.State.ToString(),
+                        is_tracked_by_me = fdr.IsTrackedByMe,
+                        controller_tracking = fdr.ControllerTracking?.Callsign,
+                        controlling_sector = fdr.ControllingSector?.Name,
+                        pending_transfers = PendingTransferContext()
+                    });
             }
 
             return;
@@ -371,11 +396,36 @@ public class SectorTagHandoff
         var mine = SectorLocator.Resolve(fdr, MMI.SectorsControlled.Where(s => !s.IsDummy))
                    ?? match.Sector;
 
+        var beforeState = fdr.State.ToString();
+        var beforeTrackedByMe = fdr.IsTrackedByMe;
+        var beforeControllerTracking = fdr.ControllerTracking?.Callsign;
+        var beforeControllingSector = fdr.ControllingSector?.Name;
+
         MMI.AcceptJurisdiction(fdr);
 
         if (fdr.State != FDP2.FDR.FDRStates.STATE_CONTROLLED)
         {
-            ActionLog.Log("Tag", $"Could not accept transferred {fdr.Callsign} (state {fdr.State})");
+            ActionLog.Log("Tag", $"Could not accept transferred {fdr.Callsign} (state {fdr.State})", new
+            {
+                action = "handoff_accept_failed",
+                fdr_callsign = fdr.Callsign,
+                sector = match.Sector.Name,
+                from_callsign = from,
+                before = new
+                {
+                    state = beforeState,
+                    is_tracked_by_me = beforeTrackedByMe,
+                    controller_tracking = beforeControllerTracking,
+                    controlling_sector = beforeControllingSector
+                },
+                after = new
+                {
+                    state = fdr.State.ToString(),
+                    is_tracked_by_me = fdr.IsTrackedByMe,
+                    controller_tracking = fdr.ControllerTracking?.Callsign,
+                    controlling_sector = fdr.ControllingSector?.Name
+                }
+            });
             return;
         }
 
@@ -389,7 +439,42 @@ public class SectorTagHandoff
 
         _fdrSync.PushNow(fdr);
 
-        ActionLog.Log("Tag", $"Accepted {fdr.Callsign} with {match.Sector.Name} from {from}, no flash");
+        ActionLog.Log("Tag", $"Accepted {fdr.Callsign} with {match.Sector.Name} from {from}, no flash", new
+        {
+            action = "handoff_accept",
+            fdr_callsign = fdr.Callsign,
+            sector = match.Sector.Name,
+            resolved_sector = mine.Name,
+            from_callsign = from,
+            before = new
+            {
+                state = beforeState,
+                is_tracked_by_me = beforeTrackedByMe,
+                controller_tracking = beforeControllerTracking,
+                controlling_sector = beforeControllingSector
+            },
+            after = new
+            {
+                state = fdr.State.ToString(),
+                is_tracked_by_me = fdr.IsTrackedByMe,
+                controller_tracking = fdr.ControllerTracking?.Callsign,
+                controlling_sector = fdr.ControllingSector?.Name
+            }
+        });
+    }
+
+    object[] PendingTransferContext()
+    {
+        lock (_lock)
+            return _incoming
+                .Select(pending => new
+                {
+                    sector = pending.Sector.Name,
+                    from_callsign = pending.FromCallsign,
+                    until = pending.Until
+                })
+                .Cast<object>()
+                .ToArray();
     }
 
     static void RunOnUiThread(Action action)

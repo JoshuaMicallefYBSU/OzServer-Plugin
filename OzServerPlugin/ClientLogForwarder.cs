@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using vatsys;
 
@@ -39,19 +40,23 @@ public class ClientLogForwarder
     // Never forwarded - see the class comment.
     const string ApiCategory = "API";
 
+    static readonly string SessionId = Guid.NewGuid().ToString("N");
+    static readonly string? PluginVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString();
+
     readonly OzServerApiClient _api = new();
     readonly System.Threading.Timer _timer;
     readonly object _lock = new();
     readonly List<OzServerClientLogLineDto> _queued = new();
+    long _sequence;
     bool _sending;
 
     public ClientLogForwarder()
     {
-        ActionLog.LineWritten += OnLine;
+        ActionLog.StructuredLineWritten += OnLine;
         _timer = new System.Threading.Timer(_ => _ = FlushAsync(), null, FlushInterval, FlushInterval);
     }
 
-    void OnLine(string category, string message)
+    void OnLine(string category, string message, object? context)
     {
         if (category == ApiCategory || !Network.IsConnected)
             return;
@@ -62,7 +67,11 @@ public class ClientLogForwarder
             {
                 At = DateTimeOffset.UtcNow,
                 Category = category,
-                Message = message
+                Message = message,
+                PluginVersion = PluginVersion,
+                SessionId = SessionId,
+                Sequence = ++_sequence,
+                Context = context
             });
 
             if (_queued.Count > MaxQueued)

@@ -241,7 +241,14 @@ public class AfvSectorClaimer
 
             if (withheld.Count > 0)
                 ActionLog.Log("Primary",
-                    $"Withheld top-down cover under {frequencySector.Name}: {string.Join(", ", withheld.OrderBy(s => s))}");
+                    $"Withheld top-down cover under {frequencySector.Name}: {string.Join(", ", withheld.OrderBy(s => s))}",
+                    new
+                    {
+                        action = "withhold_top_down_cover_transmit",
+                        sector = frequencySector.Name,
+                        sectors = withheld.OrderBy(s => s).ToArray(),
+                        own_callsign = Network.Me?.Callsign
+                    });
         }
         else
         {
@@ -273,6 +280,13 @@ public class AfvSectorClaimer
             .ToList();
 
         if (withheld.Count > 0)
-            ActionLog.Log("Primary", $"{lead}: {string.Join(", ", withheld)}");
+            ActionLog.Log("Primary", $"{lead}: {string.Join(", ", withheld)}", new
+            {
+                action = "withhold_top_down_cover_login",
+                sectors = withheld.ToArray(),
+                unfiltered = unfiltered.Select(s => s.Name).ToArray(),
+                granted = granted.Select(s => s.Name).ToArray(),
+                own_callsign = Network.Me?.Callsign
+            });
     }
 }

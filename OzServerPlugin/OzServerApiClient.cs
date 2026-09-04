@@ -69,6 +69,10 @@ public class OzServerClientLogLineDto
     [JsonProperty("at")] public DateTimeOffset At { get; set; }
     [JsonProperty("category")] public string Category { get; set; } = "";
     [JsonProperty("message")] public string Message { get; set; } = "";
+    [JsonProperty("plugin_version")] public string? PluginVersion { get; set; }
+    [JsonProperty("session_id")] public string? SessionId { get; set; }
+    [JsonProperty("sequence")] public long? Sequence { get; set; }
+    [JsonProperty("context")] public object? Context { get; set; }
 }
 
 public class OzServerAnnotationAuthorDto

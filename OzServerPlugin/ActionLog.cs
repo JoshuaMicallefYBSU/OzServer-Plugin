@@ -26,17 +26,18 @@ public static class ActionLog
     // to OzServer without this class knowing anything about the network - the file remains the
     // complete record whether or not anything is listening.
     public static event Action<string, string>? LineWritten;
+    public static event Action<string, string, object?>? StructuredLineWritten;
 
-    public static void Log(string category, string message) => Write(category, message);
+    public static void Log(string category, string message, object? context = null) => Write(category, message, context);
 
     public static void LogAttempt(string method, string path, bool success, string? detail = null) =>
         Write("API", success
             ? $"{method} {path} -> ok{(detail != null ? $" ({detail})" : "")}"
             : $"{method} {path} -> failed: {detail}");
 
-    static void Write(string category, string message)
+    static void Write(string category, string message, object? context = null)
     {
-        Notify(category, message);
+        Notify(category, message, context);
 
         try
         {
@@ -59,11 +60,12 @@ public static class ActionLog
 
     // Outside the file lock and swallowing everything: a subscriber must not be able to hold up the
     // audit trail, nor break the operation whose log line this is.
-    static void Notify(string category, string message)
+    static void Notify(string category, string message, object? context)
     {
         try
         {
             LineWritten?.Invoke(category, message);
+            StructuredLineWritten?.Invoke(category, message, context);
         }
         catch
         {
