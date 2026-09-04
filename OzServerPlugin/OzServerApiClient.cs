@@ -435,9 +435,6 @@ public class OzServerApiClient
     public Task<OzServerSyncDto> GetSyncAsync() =>
         GetAsync("/sectors/sync", () => new OzServerSyncDto());
 
-    public Task<OzServerMyRequestsDto> GetMyRequestsAsync() =>
-        GetAsync<OzServerMyRequestsDto>("/sector-requests", () => new OzServerMyRequestsDto());
-
     // Sectors someone *else* currently owns on OzServer (the backend excludes my own CID) - this
     // is "Controlled" mode's actual data source, not live VATSIM presence (see
     // SectorOwnershipController::controlled - it's scoped to sector_ownerships rows, so a sector
@@ -457,18 +454,6 @@ public class OzServerApiClient
     public Task<OzServerResumeResponseDto> ResumeAsync() =>
         PostAsync<OzServerResumeResponseDto>("/sectors/resume");
 
-    // The authoritative "what do I actually own" check (SectorOwnershipController::mine) - used to
-    // refresh Owned from OzServer's own record every time the Sectors window opens, rather than
-    // trust locally-accumulated state that can drift (a claim from a previous vatSys session, an
-    // ownership released some other way, a claim call that silently failed, ...).
-    public Task<List<OzServerSectorDto>> GetMySectorsAsync() =>
-        GetAsync<List<OzServerSectorDto>>("/sectors/mine", () => new List<OzServerSectorDto>());
-
-    // FlightDataRecordController::update - upserts one flight, keyed by callsign. Handles both a
-    // full FDR push and a lighter, position-only ping (FdrSync decides which fields to fill in on
-    // the DTO), same endpoint either way.
-    public Task UpdateFdrAsync(OzServerFdrUpdateDto fdr) => PostAsync("/fdr", fdr);
-
     // FlightDataRecordController::batchUpdate - every flight FdrSync has pending in one request,
     // rather than one HTTP call per aircraft. Each flight succeeds or is blocked independently
     // server-side (its own datalink authority being online with sectors doesn't stop any other
@@ -477,8 +462,6 @@ public class OzServerApiClient
     public Task UpdateFdrBatchAsync(IEnumerable<OzServerFdrUpdateDto> flights) =>
         PostAsync("/fdr/batch", new { flights = flights.ToArray() });
 
-    // FlightDataRecordController::sync - every FDR row OzServer currently holds, for
-    // FdrActivationSync's own comparison against local FDP2.FDR state.
     // Shared markup (issue #9). Every controller reads the whole set: it is a few dozen small
     // shapes, all of it is needed to draw anything, and an area filter would have to be recomputed
     // on every pan and zoom.
@@ -511,9 +494,8 @@ public class OzServerApiClient
     public Task DeleteAnnotationAsync(string id) =>
         PostAsync($"/annotations/{id}/delete");
 
-    public Task ClearMyAnnotationsAsync() =>
-        PostAsync("/annotations/clear-mine");
-
+    // FlightDataRecordController::sync - every FDR row OzServer currently holds, for
+    // FdrActivationSync's own comparison against local FDP2.FDR state.
     public Task<List<OzServerFdrRecordDto>> GetFdrSyncAsync() =>
         GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
 

@@ -841,16 +841,6 @@ public class OzServerOwnershipTracker
         await RefreshFromServerAsync();
     }
 
-    public async Task<OzServerSectorOwnershipRequestDto?> RequestAsync(SectorsVolumes.Sector sector)
-    {
-        if (!Network.IsConnected)
-            return null;
-
-        var request = await _api.RequestSectorAsync(sector.Name);
-        ActionLog.Log("Request", $"Requested {sector.Name} from {request.TargetCallsign}");
-        return request;
-    }
-
     public async Task AcceptRequestAsync(int requestId)
     {
         if (!Network.IsConnected)
