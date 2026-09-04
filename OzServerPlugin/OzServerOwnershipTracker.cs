@@ -415,7 +415,7 @@ public class OzServerOwnershipTracker
         }
         finally
         {
-            _refreshGate.Release();
+            ReleaseRefreshGate();
         }
     }
 
@@ -448,26 +448,40 @@ public class OzServerOwnershipTracker
 
         try
         {
-            while (true)
-            {
-                await RefreshFromServerCoreAsync();
-
-                // Test-and-clear as one step, the same shape as _claimGate: cleared separately, a
-                // signal arriving between the test and the clear would be dropped by a pass that had
-                // already decided to stop.
-                lock (_refreshQueueGate)
-                {
-                    if (!_refreshQueued)
-                        break;
-
-                    _refreshQueued = false;
-                }
-            }
+            await RefreshFromServerCoreAsync();
         }
         finally
         {
-            _refreshGate.Release();
+            ReleaseRefreshGate();
         }
+    }
+
+    // Releases the refresh gate and answers anything that arrived while it was held.
+    //
+    // Every path that takes the gate releases through here, which is the whole point: draining the
+    // flag inside RefreshFromServerIfIdleAsync alone only covered a signal that collided with
+    // another poll. One arriving during a claim, release or accept - which hold the gate through
+    // RefreshFromServerAsync and ApplySyncGatedAsync - was still dropped, and those are exactly the
+    // moments ownership is changing and a push signal matters most.
+    //
+    // Test-and-clear as one step, the same shape as _claimGate: cleared separately, a signal
+    // arriving between the test and the clear would be lost by a pass that had already decided
+    // nothing was waiting.
+    void ReleaseRefreshGate()
+    {
+        _refreshGate.Release();
+
+        bool queued;
+        lock (_refreshQueueGate)
+        {
+            queued = _refreshQueued;
+            _refreshQueued = false;
+        }
+
+        // After the release, so this re-entry finds the gate free rather than queueing behind the
+        // pass that is handing it over. Fire-and-forget: it is the same work the caller just did.
+        if (queued)
+            _ = RefreshFromServerIfIdleAsync();
     }
 
     // Claims a sector, carving out whatever covered sub-sectors somebody is currently logged on as.
@@ -581,7 +595,7 @@ public class OzServerOwnershipTracker
         }
         finally
         {
-            _refreshGate.Release();
+            ReleaseRefreshGate();
         }
     }
 
