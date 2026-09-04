@@ -107,7 +107,9 @@ public class SectorTagHandoff
 
         public SectorsVolumes.Sector Sector { get; }
         public string FromCallsign { get; }
-        public DateTime Until { get; }
+        public DateTime Until { get; private set; }
+
+        public void RefreshUntil() => Until = DateTime.UtcNow + TransferWindow;
     }
 
     public SectorTagHandoff(OzServerOwnershipTracker tracker)
@@ -140,7 +142,7 @@ public class SectorTagHandoff
                 continue;
 
             lock (_lock)
-                _incoming.Add(new PendingTransfer(transfer.Sector, from));
+                AddOrRefreshIncoming(transfer.Sector, from);
 
             ActionLog.Log("Tag", $"Gained {transfer.Sector.Name} from {from} - expecting its tags");
 
@@ -216,10 +218,10 @@ public class SectorTagHandoff
         if (fdr.IsTrackedByMe)
             return;
 
-        // The controller who handed it to us. Deliberately not an early return when this is missing:
-        // a handoff with no ControllerTracking and a handoff from the wrong controller both end up
-        // flashing, and telling them apart afterwards is the whole point of the diagnostic below.
-        var from = fdr.ControllerTracking?.Callsign;
+        // The controller who handed it to us. vatSys does not always populate ControllerTracking on
+        // repeated or crossed handoffs, so fall back to the sector still attached to the offered
+        // FDR, then finally to a unique pending sector match below.
+        var from = HandoffFrom(fdr);
 
         PendingTransfer? match = null;
 
@@ -227,11 +229,17 @@ public class SectorTagHandoff
         {
             _incoming.RemoveAll(pending => pending.Until < DateTime.UtcNow);
 
+            var geometryMatches = _incoming
+                .Where(pending => SectorLocator.Resolve(fdr, new[] { pending.Sector }) != null)
+                .ToList();
+
             match = string.IsNullOrEmpty(from)
-                ? null
-                : _incoming.FirstOrDefault(pending =>
-                    string.Equals(pending.FromCallsign, from, StringComparison.OrdinalIgnoreCase)
-                    && SectorLocator.Resolve(fdr, new[] { pending.Sector }) != null);
+                ? geometryMatches.Count == 1 ? geometryMatches[0] : null
+                : geometryMatches.FirstOrDefault(pending =>
+                    string.Equals(pending.FromCallsign, from, StringComparison.OrdinalIgnoreCase));
+
+            if (match != null && string.IsNullOrEmpty(from))
+                from = match.FromCallsign;
         }
 
         // Not part of a transfer - somebody handed this over deliberately, so it stays flashing for
@@ -298,6 +306,41 @@ public class SectorTagHandoff
             lock (_lock)
                 _accepting.Remove(fdr.Callsign);
         }
+    }
+
+    void AddOrRefreshIncoming(SectorsVolumes.Sector sector, string fromCallsign)
+    {
+        _incoming.RemoveAll(pending => pending.Until < DateTime.UtcNow);
+
+        var existing = _incoming.FirstOrDefault(pending =>
+            pending.Sector.Equals(sector)
+            && string.Equals(pending.FromCallsign, fromCallsign, StringComparison.OrdinalIgnoreCase));
+
+        if (existing != null)
+        {
+            existing.RefreshUntil();
+            return;
+        }
+
+        _incoming.Add(new PendingTransfer(sector, fromCallsign));
+    }
+
+    static string? HandoffFrom(FDP2.FDR fdr)
+    {
+        var from = CallsignOrNull(fdr.ControllerTracking?.Callsign);
+        if (from != null)
+            return from;
+
+        var sector = fdr.ControllingSector;
+        return sector == null ? null : CallsignOrNull(sector.Callsign);
+    }
+
+    static string? CallsignOrNull(string? callsign)
+    {
+        if (string.IsNullOrWhiteSpace(callsign))
+            return null;
+
+        return callsign!.Trim();
     }
 
     // At most one catch-up refresh per interval, however many unmatched handoffs are in view. See

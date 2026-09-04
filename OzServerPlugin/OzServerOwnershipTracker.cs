@@ -377,10 +377,6 @@ public class OzServerOwnershipTracker
         MyRequests = requests;
         RequestsChanged?.Invoke(this, requests);
 
-        // A request in either direction means a handoff is mid-flight: either this controller is
-        // waiting to hear back, or someone is waiting on them. Poll faster until it resolves.
-        Refreshed?.Invoke(this, EventArgs.Empty);
-
         SetPollCadence(requests.ByMe.Count > 0 || requests.FromMe.Count > 0);
 
         // Compared on request ids, not on the count: one request being accepted while another
@@ -752,6 +748,11 @@ public class OzServerOwnershipTracker
             _hasBaseline = true;
 
         OwnedChanged?.Invoke(this, EventArgs.Empty);
+
+        // Raised after controlled, requests and owned have all been adopted. Consumers that read
+        // more than just requests, especially the Sector Management window's controlled snapshot,
+        // must not observe a half-applied sync.
+        Refreshed?.Invoke(this, EventArgs.Empty);
     }
 
     // Pushes an Owned change onto MMI.SectorsControlled and the matching VSCS line - see the class

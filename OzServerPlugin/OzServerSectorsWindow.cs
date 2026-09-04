@@ -601,6 +601,10 @@ public class OzServerSectorsWindow : BaseForm
         // Requests now arrive with the same sync that carries ownership, so this window no longer
         // polls for them separately - see RefreshRequestedChangesAsync.
         _tracker.RequestsChanged += (_, requests) => RunOnUiThread(() => ApplyRequests(requests));
+        // ControlledByOthers changes whenever anyone else's ownership moves, including APP
+        // sectors being taken out from under an ENR grouping. Rebuild from completed syncs only;
+        // reading immediately after starting an async refresh just reuses the previous snapshot.
+        _tracker.Refreshed += (_, _) => RunOnUiThread(RefreshControlledSnapshot);
         Network.OnlineATCChanged += (_, _) => RefreshAvailableList();
 
         // Requested Changes has no local signal for an incoming request another controller just
@@ -624,9 +628,6 @@ public class OzServerSectorsWindow : BaseForm
             // controlled and requests together, so asking separately for any of them here would be
             // the same round trip twice.
             _ = _tracker.RefreshFromServerIfIdleAsync();
-            // Regardless of mode: Available filters against this too, so it has to stay current
-            // even while Controlled isn't the list being shown.
-            RefreshControlledSnapshot();
         };
 
         _flashTimer.Tick += (_, _) =>
@@ -1549,8 +1550,20 @@ public class OzServerSectorsWindow : BaseForm
         // A single sync covers all three views - see OzServerOwnershipTracker.RefreshFromServerCoreAsync.
         // Queueing rather than dropping: this runs straight after an action of this controller's, so
         // it has to reflect what that action just did rather than give up because a poll was mid-flight.
-        _ = _tracker.RefreshFromServerAsync();
-        RefreshControlledSnapshot();
+        _ = RefreshAllListsAfterSyncAsync();
+    }
+
+    async Task RefreshAllListsAfterSyncAsync()
+    {
+        try
+        {
+            await _tracker.RefreshFromServerAsync();
+            RunOnUiThread(RefreshControlledSnapshot);
+        }
+        catch (Exception ex)
+        {
+            Errors.Add(new Exception($"Couldn't refresh sector lists from OzServer: {ex.Message}", ex), "OzServer");
+        }
     }
 
     void RefreshStagedHighlight()
