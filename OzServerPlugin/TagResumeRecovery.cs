@@ -65,11 +65,17 @@ public class TagResumeRecovery
                 failed.Add($"{fdr.Callsign} ({fdr.State})");
         }
 
-        // Both halves reported. A tag that did not come back is the thing worth knowing about, and
-        // silence used to be the only signal that anything had gone wrong.
-        ActionLog.Log("Tag", restored.Count > 0
+        // Both halves reported, including why each failure failed - "none were restored" on its own
+        // said nothing about whether the aircraft was outside this controller's sectors, or in a
+        // state that could not be taken, which is the whole question when a resume comes back empty.
+        var summary = restored.Count > 0
             ? $"Restored after reconnect: {string.Join(", ", restored)}"
-            : "Resume returned tags but none were restored");
+            : "Resume returned tags but none were restored";
+
+        if (failed.Count > 0)
+            summary += $" (not restored: {string.Join(", ", failed)})";
+
+        ActionLog.Log("Tag", summary);
 
         if (failed.Count > 0)
             ActionLog.Log("Tag", $"Could not restore: {string.Join(", ", failed)}");

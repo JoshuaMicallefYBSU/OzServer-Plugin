@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -49,12 +49,6 @@ public class PrimaryPositionWatcher
     // Releases are awaited one after another and can outlast the event that started them, so a
     // second burst of arrivals must not start a parallel pass over the same Owned list.
     bool _handling;
-    // The same, for the standing reconciliation in ReleaseCoverOfOnlinePositions - which is driven
-    // by the ownership refresh and so fires far more often than an arrival does.
-    bool _givingBack;
-    // What that reconciliation last reported, so a release that keeps failing does not repeat its
-    // line on every refresh for the rest of the session.
-    string? _lastGaveBack;
     readonly Queue<NetworkATC> _pending = new();
     // Guards the two above. They are written from the UI thread (OnOnlineAtcChanged) and read and
     // written again from wherever RunHandoverLoopAsync's continuations resume - which is not the UI
@@ -75,13 +69,6 @@ public class PrimaryPositionWatcher
         _tracker = tracker;
 
         Network.OnlineATCChanged += (_, _) => RunOnUiThread(OnOnlineAtcChanged);
-        // Standing reconciliation, not just an event. Everything else here reacts to a controller
-        // arriving or leaving, which cannot cover the case that actually went wrong: a controller
-        // logging on while somebody else's position was ALREADY online. There is no arrival to
-        // react to - they were both simply there - and the connect-time claim can race the online
-        // ATC list before it has populated, so the claim-time exclusion misses them too. Checked
-        // after every refresh instead, which makes it self-correcting whatever produced the state.
-        _tracker.Refreshed += (_, _) => RunOnUiThread(ReleaseCoverOfOnlinePositions);
         // A new session gets a new baseline: the online list this controller comes back to has
         // nothing to do with the one they left, and every position on it was there before them.
         Network.Disconnected += (_, _) => RunOnUiThread(ResetBaseline);
@@ -93,7 +80,6 @@ public class PrimaryPositionWatcher
         _handled.Clear();
         _hasBaseline = false;
         _settleUntil = DateTime.MinValue;
-        _lastGaveBack = null;
 
         lock (_pendingGate)
             _pending.Clear();
@@ -199,103 +185,6 @@ public class PrimaryPositionWatcher
 
         if (start)
             _ = RunHandoverLoopAsync();
-    }
-
-    // Hands back any sector this session holds that belongs to a position somebody else is online
-    // on, whenever they came online.
-    //
-    // The arrival path below only ever fires for a controller who logs on *after* this session, and
-    // deliberately so - everyone already there when this client connected is recorded as
-    // pre-existing, or a flickering IsRealATC flag reads as a stream of false logons. But
-    // "pre-existing" was being taken to mean "nothing to do", which is how a controller logging onto
-    // Benalla while Melbourne Approach was already online kept Melbourne Approach's sectors, with no
-    // error and nothing to hand them back.
-    //
-    // Runs off the ownership refresh rather than an event of its own, so it corrects the state
-    // however it arose: a connect-time claim that beat the ATC list, a claim that raced a logon, or
-    // anything else that leaves this controller holding somebody else's position.
-    void ReleaseCoverOfOnlinePositions()
-    {
-        // Runs on every refresh, so it must not start a second pass over a list the first is still
-        // working through, and must not repeat its log line once a tick while a release keeps
-        // failing - these reach the backend now, and a wedged release would flood it.
-        if (!Network.IsConnected || !_tracker.HasBaseline || _handling || _givingBack)
-            return;
-
-        var own = Network.Me?.Callsign;
-
-        // Everything belonging to a position someone else is currently online on. DefaultSectorsFor
-        // is the same definition used to decide what they take and what this session may claim, so
-        // the three cannot drift apart.
-        var theirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var atc in PrimaryPosition.OnlineRealAtcs())
-        {
-            if (string.Equals(atc.Callsign, own, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            foreach (var sector in PrimaryPosition.DefaultSectorsFor(atc.Callsign))
-                theirs.Add(sector.Name);
-        }
-
-        if (theirs.Count == 0)
-            return;
-
-        // Never this session's own position, whatever anyone else's grouping says - the same
-        // protection DefaultSectorsFor gives on the claiming side.
-        var mine = new HashSet<string>(
-            PrimaryPosition.DefaultSectorsFor(own).Select(s => s.Name), StringComparer.OrdinalIgnoreCase);
-
-        var giveBack = _tracker.Owned
-            .Where(sector => theirs.Contains(sector.Name) && !mine.Contains(sector.Name))
-            .ToList();
-
-        if (giveBack.Count == 0)
-            return;
-
-        var names = string.Join(", ", giveBack.Select(s => s.Name));
-
-        // Only when the answer changes. A release that keeps failing would otherwise say the same
-        // thing every ten seconds for as long as the session lasts.
-        if (!string.Equals(names, _lastGaveBack, StringComparison.Ordinal))
-        {
-            _lastGaveBack = names;
-            ActionLog.Log("Primary", $"Holding sectors belonging to positions already online - handing back {names}");
-        }
-
-        _givingBack = true;
-        _ = ReleaseAllAsync(giveBack);
-    }
-
-    async Task ReleaseAllAsync(List<SectorsVolumes.Sector> sectors)
-    {
-        try
-        {
-            await ReleaseEachAsync(sectors);
-        }
-        finally
-        {
-            _givingBack = false;
-        }
-    }
-
-    async Task ReleaseEachAsync(List<SectorsVolumes.Sector> sectors)
-    {
-        foreach (var sector in sectors)
-        {
-            // Still ours by the time we get here? The releases are awaited one at a time and the
-            // backend cascades a group release, so an earlier one may already have covered this.
-            if (!_tracker.Owned.Any(o => o.Name == sector.Name))
-                continue;
-
-            try
-            {
-                await _tracker.ReleaseAsync(sector);
-            }
-            catch (Exception ex)
-            {
-                Errors.Add(new Exception($"Couldn't hand back {sector.Name}: {ex.Message}", ex), "OzServer");
-            }
-        }
     }
 
     // The mirror of a primary logging on. While an approach controller is online their sectors are
