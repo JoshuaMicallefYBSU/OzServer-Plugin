@@ -33,9 +33,13 @@ public class Plugin : IPlugin
     // - see both classes' own comments.
     readonly AfvSectorClaimer _afvSectorClaimer;
     readonly OzServerOwnershipTracker _ownershipTracker;
+    // Keeps OzServer's flight_data_records current. Retained through the tag-handling removal
+    // because disconnect recovery is built entirely on the controlling_cid and current_sector this
+    // pushes - without it a resume has nothing to give back.
     readonly FdrSync _fdrSync;
-    readonly FdrActivationSync _fdrActivationSync;
-    readonly TagOwnershipSync _tagOwnershipSync;
+    // All that is left of tag handling: restores tags the backend confirms were this controller's
+    // moments ago. Nothing decides tag ownership any more.
+    readonly TagResumeRecovery _tagResumeRecovery;
     readonly AtisSync _atisSync;
     readonly BadVectorsAtisSync _badVectorsAtisSync;
     // Held for the same reason as the two above: it lives entirely off Network's own events, and a
@@ -75,16 +79,8 @@ public class Plugin : IPlugin
         _ownershipTracker = new OzServerOwnershipTracker();
         _afvSectorClaimer = new AfvSectorClaimer();
         _fdrSync = new FdrSync();
-        // Purely timer/poll-driven, same as _ownershipTracker - constructed unconditionally so a
-        // flight stuck at STATE_PREACTIVE gets corrected whether or not any plugin window is ever
-        // opened. See its own class comment for why this is a separate concern from FdrSync/
-        // TagOwnershipSync rather than folded into either.
-        _fdrActivationSync = new FdrActivationSync();
-        // After the tracker, which it reads live subsector ownership through; after FdrSync, which
-        // it calls into to clear OzServer's own record of who holds a tag the moment this controller
-        // drops it to none (see TagOwnershipSync.OnFdrsChanged); and after FdrActivationSync, whose
-        // IsKnownToServer it reads to gate its own airborne/near-boundary pre-activation trigger.
-        _tagOwnershipSync = new TagOwnershipSync(_ownershipTracker, _fdrSync, _fdrActivationSync);
+        // After the tracker, whose TagsResumed it listens to.
+        _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
         _atisSync = new AtisSync();
         _badVectorsAtisSync = new BadVectorsAtisSync();
         // After the tracker, which it releases through.
@@ -470,15 +466,9 @@ public class Plugin : IPlugin
         window.BringToFront();
     }
 
-    public void OnFDRUpdate(FDP2.FDR updated)
-    {
-        _fdrSync.OnFdrUpdate(updated);
-        _tagOwnershipSync.OnFdrUpdate(updated);
-    }
+    // Only the state push remains on these. Nothing reacts to a flight moving any more - no pickup
+    // offers, no handoffs, no activation - which is the whole point of the removal.
+    public void OnFDRUpdate(FDP2.FDR updated) => _fdrSync.OnFdrUpdate(updated);
 
-    public void OnRadarTrackUpdate(RDP.RadarTrack updated)
-    {
-        _fdrSync.OnRadarTrackUpdate(updated);
-        _tagOwnershipSync.OnRadarTrackUpdate(updated);
-    }
+    public void OnRadarTrackUpdate(RDP.RadarTrack updated) => _fdrSync.OnRadarTrackUpdate(updated);
 }

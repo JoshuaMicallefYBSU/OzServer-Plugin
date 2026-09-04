@@ -148,7 +148,7 @@ public class OzServerResumeResponseDto
     // Tags the backend actually handed back - flights this controller was working before they
     // dropped, minus any another controller picked up while they were away (the backend refuses to
     // take those). These come straight back to the controller rather than flashing for acceptance;
-    // see TagOwnershipSync.OnTagsResumed.
+    // see TagResumeRecovery.
     [JsonProperty("flights")] public List<string> Flights { get; set; } = new();
     [JsonProperty("sync")] public OzServerSyncDto? Sync { get; set; }
 }
@@ -247,48 +247,11 @@ public class OzServerFdrUpdateDto
     [JsonProperty("on_ground")] public bool? OnGround { get; set; }
 
     // The geographic subsector this aircraft is physically inside of right now (SectorLocator,
-    // resolved against the full SectorsVolumes.Sectors list - not tracker.ClaimedSectors), which is
+    // resolved against the full SectorsVolumes.Sectors list, not only claimed sectors), which is
     // deliberately a different question from who owns the tag (controlling_cid/controlling_callsign,
     // above). Null when the aircraft isn't inside any known sector volume at its current
     // position/level, or when neither a live nor a predicted position is available yet.
     [JsonProperty("current_sector")] public string? CurrentSector { get; set; }
-}
-
-// One row from GET /fdr/sync (FlightDataRecordController::sync) - OzServer's own live copy of a
-// flight, for FdrActivationSync to compare against this client's local FDP2.FDR. Same field set as
-// OzServerFdrUpdateDto (same table) plus the three fields that DTO never needs to send back up:
-// State/Callsign (needed here just to identify and compare rows) and LastSeenAt (not currently
-// used - the endpoint itself only ever returns live rows, see its own comment - but kept so a
-// future caller doesn't have to touch the DTO to get at it).
-public class OzServerFdrRecordDto
-{
-    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
-    // Who OzServer says is working this flight. GET /fdr/sync has always returned these; nothing
-    // mapped them, so the plugin had no way to tell a tag another controller holds from a free one.
-    // vatSys keeps jurisdiction per client with no cross-controller sync - the whole reason this
-    // backend exists - so fdr.IsTracked only ever describes this session.
-    [JsonProperty("controlling_cid")] public int? ControllingCid { get; set; }
-    [JsonProperty("controlling_callsign")] public string? ControllingCallsign { get; set; }
-    [JsonProperty("state")] public string? State { get; set; }
-    [JsonProperty("flight_rules")] public string? FlightRules { get; set; }
-    [JsonProperty("aircraft_type")] public string? AircraftType { get; set; }
-    [JsonProperty("aircraft_equip")] public string? AircraftEquip { get; set; }
-    [JsonProperty("aircraft_surv_equip")] public string? AircraftSurvEquip { get; set; }
-    [JsonProperty("aircraft_count")] public int? AircraftCount { get; set; }
-    [JsonProperty("dep_airport")] public string? DepAirport { get; set; }
-    [JsonProperty("des_airport")] public string? DesAirport { get; set; }
-    [JsonProperty("route")] public string? Route { get; set; }
-    [JsonProperty("rfl")] public int? Rfl { get; set; }
-    [JsonProperty("cfl_lower")] public int? CflLower { get; set; }
-    [JsonProperty("cfl_upper")] public int? CflUpper { get; set; }
-    [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
-    [JsonProperty("atd")] public DateTime? Atd { get; set; }
-    [JsonProperty("etd")] public DateTime? Etd { get; set; }
-    [JsonProperty("eet_minutes")] public int? EetMinutes { get; set; }
-    [JsonProperty("tas")] public int? Tas { get; set; }
-    [JsonProperty("label_op_data")] public string? LabelOpData { get; set; }
-    [JsonProperty("remarks")] public string? Remarks { get; set; }
-    [JsonProperty("last_seen_at")] public DateTimeOffset? LastSeenAt { get; set; }
 }
 
 // AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
@@ -494,10 +457,6 @@ public class OzServerApiClient
     public Task DeleteAnnotationAsync(string id) =>
         PostAsync($"/annotations/{id}/delete");
 
-    // FlightDataRecordController::sync - every FDR row OzServer currently holds, for
-    // FdrActivationSync's own comparison against local FDP2.FDR state.
-    public Task<List<OzServerFdrRecordDto>> GetFdrSyncAsync() =>
-        GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
 
     // AtisController::update - upserts this ICAO's current ATIS state, keyed by icao.
     public Task UpdateAtisAsync(OzServerAtisUpdateDto atis) => PostAsync("/atis", atis);

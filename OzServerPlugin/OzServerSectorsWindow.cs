@@ -1920,7 +1920,7 @@ public class OzServerSectorsWindow : BaseForm
     // Rebuilds the Controlled snapshot from the tracker's own last refresh instead of issuing a
     // second GET /sectors/controlled.
     //
-    // The tracker already fetches that endpoint (TagOwnershipSync needs everyone else's ownership),
+    // The tracker already fetches that endpoint for its own ownership picture,
     // and this window was fetching it again on the same 2s tick - so the heaviest of the three
     // queries was being pulled twice per tick, per client. Nothing here needs to be async any more:
     // the data is already in hand by the time the tracker has refreshed.

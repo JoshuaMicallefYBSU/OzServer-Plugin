@@ -13,10 +13,9 @@ namespace OzServerPlugin;
 // traffic) to OzServer's /fdr/batch endpoint - but only for a flight this controller currently holds
 // and has activated: fdr.IsTrackedByMe && fdr.ESTed, checked fresh on every update (see ShouldPush).
 // No grace period, no "used to own it" carve-out: the moment either goes false, nothing more is
-// pushed for that flight until (if ever) this controller holds it again. TagOwnershipSync is what
-// keeps IsTrackedByMe in step with live subsector ownership on OzServer, so this single condition
-// already captures both "owned by this controller" and "not merely a flight plan sitting inactive" -
-// see its own class comment for the two things allowed to move a tag between controllers.
+// pushed for that flight until (if ever) this controller holds it again. IsTrackedByMe is now
+// whatever vatSys itself says it is - nothing in this plugin moves tags between controllers any
+// more - so the condition simply follows the controller's own working state.
 //
 // Because a push only ever happens while this controller holds the flight, the datalink authority it
 // reports is always this session's own identity (see FillAuthority) - there is no "assumed by
@@ -89,11 +88,6 @@ public class FdrSync
     // race the timer, send a partial DTO, or overlap an in-flight batch. If a flush happens to be
     // running, FlushAsync declines and the update simply stays queued for the next tick - no worse
     // than the old behaviour, and the common case sends at once.
-    public void PushImmediately(FDP2.FDR fdr)
-    {
-        OnFdrUpdate(fdr);
-        _ = FlushAsync();
-    }
 
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
@@ -116,32 +110,6 @@ public class FdrSync
     // see the class comment.
     static bool ShouldPush(FDP2.FDR fdr) => fdr.IsTrackedByMe && fdr.ESTed;
 
-    // Called by TagOwnershipSync when this controller drops a tag to none. ShouldPush's "the moment
-    // IsTrackedByMe goes false, nothing more is pushed for that flight" (see the class comment)
-    // otherwise leaves OzServer's own record of who holds it exactly as it was the instant before
-    // the drop - stale, and actively misleading, since nobody is pushing anything to correct it
-    // until (if ever) some controller picks the flight back up, or the 10-minute idle drop mentioned
-    // in the class comment eventually clears the row. This pushes the correction immediately instead
-    // of waiting on either.
-    //
-    // Goes through the same batched _pending/flush path as every other update rather than firing its
-    // own request - one more field changing for a flight already due to go out on the next tick is
-    // exactly what merging into _pending is for. ControllingCid/ControllingCallsign are the two
-    // fields marked NullValueHandling.Include on OzServerFdrUpdateDto specifically so a deliberate
-    // null like this one actually reaches the server instead of being skipped like every other unset
-    // field - see CopyNonNull's own comment.
-    public void ClearControllingAuthority(string callsign)
-    {
-        if (string.IsNullOrEmpty(callsign))
-            return;
-
-        Merge(new OzServerFdrUpdateDto { Callsign = callsign, ControllingCid = null, ControllingCallsign = null });
-
-        // Flushed at once for the same reason PushImmediately exists: this is an authority change,
-        // and leaving it queued means the backend goes on telling every other controller that this
-        // one still holds a tag they have deliberately let go of.
-        _ = FlushAsync();
-    }
 
     void Merge(OzServerFdrUpdateDto dto)
     {
@@ -237,7 +205,7 @@ public class FdrSync
 
     // The geographic subsector fdr is physically inside of right now - a different question from
     // who owns the tag (FillAuthority, above): resolved against the full SectorsVolumes.Sectors
-    // list, not tracker.ClaimedSectors the way TagOwnershipSync's own resolution is, so this reports
+    // list rather than only sectors somebody has claimed, so this reports
     // real geography regardless of whether anyone has actually claimed that sector on OzServer.
     // Left null (and, via CopyNonNull's ordinary skip-null merge, simply not overwritten) when the
     // aircraft isn't inside any known sector volume at its current position/level.
