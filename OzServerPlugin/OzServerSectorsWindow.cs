@@ -677,6 +677,11 @@ public class OzServerSectorsWindow : BaseForm
         else
         {
             _pollTimer.Stop();
+
+            // Closing is a cancel. The window hides rather than closes (HideOnClose), so this is
+            // the only place the X button can be caught - there is no Closed event to hook - and it
+            // covers every other route to hidden as well.
+            DiscardStagedChanges();
         }
     }
 
@@ -2443,9 +2448,25 @@ public class OzServerSectorsWindow : BaseForm
     }
 
     // Throws the staged selection away and goes back to what OzServer says is actually owned.
-    void CancelButton_Click(object? sender, EventArgs e)
+    void CancelButton_Click(object? sender, EventArgs e) => DiscardStagedChanges();
+
+    // Throws away everything staged but not applied, putting the lists back to what OzServer
+    // actually says. Shared by Cancel and by closing the window, which mean the same thing: staged
+    // changes are a sentence the controller has not finished, and nothing about them survives
+    // walking away from it. Leaving them queued meant the window reopened - possibly much later,
+    // after the sectors involved had changed hands - still holding moves the controller had
+    // abandoned, one Apply away from committing them by accident.
+    void DiscardStagedChanges()
     {
+        // An Apply already in flight is not staged any more - it has been committed and is being
+        // carried out. Clearing underneath it would only desynchronise the lists from the commit
+        // that is still running; ReportCommitResult repopulates from the result either way.
         if (_applyRunning)
+            return;
+
+        // Visible also goes false while the form is being torn down, and the rebuild below touches
+        // every tree and scrollbar in the window. Nothing needs discarding at that point anyway.
+        if (IsDisposed || Disposing)
             return;
 
         _stagedNames.Clear();

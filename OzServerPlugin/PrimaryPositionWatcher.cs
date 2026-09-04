@@ -89,6 +89,14 @@ public class PrimaryPositionWatcher
         var arrived = online.Where(a => !_onlineCallsigns.Contains(a.Callsign)).ToList();
         _onlineCallsigns = current;
 
+        // Logged because this whole path used to be invisible: when a primary logged on and their
+        // group was not handed back, nothing anywhere said whether this client had even noticed
+        // them. Note the list this is derived from is filtered by IsRealATC, which lags a genuine
+        // controller's connect by some seconds - so an arrival can legitimately be seen a poll or
+        // two after the logon, and if it is never seen at all that is the thing to look at first.
+        if (arrived.Count > 0)
+            ActionLog.Log("Primary", $"ATC arrived: {string.Join(", ", arrived.Select(a => a.Callsign))}");
+
         var start = false;
         lock (_pendingGate)
         {
@@ -167,13 +175,24 @@ public class PrimaryPositionWatcher
         var mine = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
 
         var owned = _tracker.Owned;
-        var relinquishing = PrimaryPosition.DefaultSectorsFor(atc.Callsign)
+        var theirs = PrimaryPosition.DefaultSectorsFor(atc.Callsign);
+        var relinquishing = theirs
             .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name))
             .Where(s => !mine.Any(m => m.Name == s.Name))
             .ToList();
 
+        // Both outcomes are logged. "Decided to relinquish nothing" and "never ran at all" look
+        // identical from the outside, and they have completely different causes.
         if (relinquishing.Count == 0)
+        {
+            ActionLog.Log("Primary",
+                $"{atc.Callsign} arrived - nothing of theirs is owned here "
+                + $"(their group: {(theirs.Count == 0 ? "none resolved" : string.Join(", ", theirs.Select(s => s.Name)))})");
             return;
+        }
+
+        ActionLog.Log("Primary",
+            $"Relinquishing to {atc.Callsign}: {string.Join(", ", relinquishing.Select(s => s.Name))}");
 
         // Shown before the releases rather than after: each one is a round trip, and the controller
         // should see why their sectors are about to disappear as it happens rather than several
