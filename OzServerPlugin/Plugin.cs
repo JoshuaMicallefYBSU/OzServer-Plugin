@@ -479,17 +479,36 @@ public class Plugin : IPlugin
 
     public void OnFDRUpdate(FDP2.FDR updated)
     {
-        _fdrSync.OnFdrUpdate(updated);
+        // Each subsystem isolated from the next. vatSys calls this inside its own catch-and-log, so
+        // a throw in the first call used to take the other two with it and leave no trace anywhere
+        // OzServer can see - a tag silently never accepted, ghosts silently never reasserted, and
+        // nothing in the log to say which. These are three unrelated jobs that happen to share a
+        // callback; one failing is not a reason to skip the others.
+        Isolate("FdrSync", () => _fdrSync.OnFdrUpdate(updated));
         // Watches for the handoffs an OzServer sector transfer produces, so one is accepted the
         // moment it lands rather than on a poll of its own.
-        _sectorTagHandoff.OnFdrUpdate(updated);
+        Isolate("TagHandoff", () => _sectorTagHandoff.OnFdrUpdate(updated));
         // vatSys has just recomputed this track's state, so any ghost of ours needs reasserting.
-        _pendingSectorGhosts.Reassert();
+        Isolate("Ghost", () => _pendingSectorGhosts.Reassert());
     }
 
     public void OnRadarTrackUpdate(RDP.RadarTrack updated)
     {
-        _fdrSync.OnRadarTrackUpdate(updated);
-        _pendingSectorGhosts.Reassert();
+        Isolate("FdrSync", () => _fdrSync.OnRadarTrackUpdate(updated));
+        Isolate("Ghost", () => _pendingSectorGhosts.Reassert());
+    }
+
+    // Runs one of the per-update subsystems, reporting a failure rather than letting it escape into
+    // vatSys's own handler where nothing this plugin logs would ever record it.
+    static void Isolate(string category, Action work)
+    {
+        try
+        {
+            work();
+        }
+        catch (Exception ex)
+        {
+            ActionLog.Log(category, $"update handler failed: {ex.Message}");
+        }
     }
 }

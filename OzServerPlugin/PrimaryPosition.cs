@@ -140,6 +140,65 @@ public static class PrimaryPosition
         return named.Count == 1 && named[0].Equals(sector);
     }
 
+    // The sectors a claim for `sector` would sweep up that somebody is actually logged on as, to be
+    // sent as that claim's exclusion list.
+    //
+    // A claim expands through ResponsibleSectors - that is what top-down means: Benalla covers
+    // Melbourne Approach because Benalla works that airspace when nobody is on it. What the bundle
+    // does not say is whether anybody IS on it, and a sector belongs to whoever is logged on as it.
+    // Without this, an enroute controller logging on while Melbourne Approach was already online
+    // took MAE - and MDN, MDS, MAV and MAW behind it - straight off them.
+    //
+    // Note this walks ResponsibleSectors rather than the Positions.xml grouping the rest of this
+    // class is so careful to use. That is deliberate and is not the bug the header warns about:
+    // this is not deciding what a position owns, it is describing what the *backend's* claim will
+    // expand to, so it has to model the backend's expansion exactly in order to carve pieces out
+    // of it.
+    //
+    // Read from Network.GetOnlineATCs - vatSys's own live view of the VATSIM ATC list, fed by the
+    // protocol connection itself. It reflects a logon within seconds, where the backend's copy is
+    // the public data feed and can lag one by the better part of a minute; and it is true whether
+    // or not the other controller is running this plugin at all, which the backend's
+    // ownership records are not. Both of those are why the question is answered here and not there.
+    // What is withheld is each online controller's whole position, not just the one sector their
+    // callsign names. Melbourne Approach is MAE, MDN, MDS, MAV and MAW; withholding only MAE would
+    // have handed the enroute controller the other four - the departures and radar sectors - out of
+    // the very group whose controller is sitting there working it. DefaultSectorsFor is what decides
+    // that, so the rule is the same one the rest of this class applies, from the same definition:
+    // a primary logging on holds their group, a member logging on holds only their own sector.
+    public static List<string> StaffedCoveredSectors(SectorsVolumes.Sector sector, string? ownCallsign)
+    {
+        var claimable = new HashSet<string>(CoveredBy(sector).Select(c => c.Name), StringComparer.OrdinalIgnoreCase);
+        var staffed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var atc in OnlineRealAtcs())
+        {
+            if (string.Equals(atc.Callsign, ownCallsign, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            foreach (var theirs in DefaultSectorsFor(atc.Callsign))
+            {
+                if (claimable.Contains(theirs.Name))
+                    staffed.Add(theirs.Name);
+            }
+        }
+
+        // Never the sector being claimed. Somebody is logged on as it - this controller - and
+        // excluding it would turn its own claim into a no-op.
+        staffed.Remove(sector.Name);
+
+        return staffed.ToList();
+    }
+
+    // Everything a claim for this sector expands to on the backend - the sector plus its
+    // responsible sectors, recursively. Mirrors the backend's own covered().
+    public static List<SectorsVolumes.Sector> CoveredBy(SectorsVolumes.Sector sector)
+    {
+        var covered = new List<SectorsVolumes.Sector>();
+        Collect(sector, covered, depth: 0);
+        return covered;
+    }
+
     // The sector plus everything it is responsible for, recursively.
     static void Collect(SectorsVolumes.Sector sector, List<SectorsVolumes.Sector> into, int depth)
     {

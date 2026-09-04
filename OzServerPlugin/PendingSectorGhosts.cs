@@ -40,6 +40,23 @@ public class PendingSectorGhosts
     readonly System.Threading.Timer _timer;
     readonly object _lock = new();
 
+    // One Apply at a time. vatSys dispatches OnFDRUpdate and OnRadarTrackUpdate through Task.Run -
+    // one fire-and-forget task per update, with no serialisation of its own - so Reassert() is
+    // entered by many thread-pool threads at once, alongside the timer's own pass. Two overlapping
+    // passes race on _painted: one enumerates it while the other Clears and re-Adds, which throws
+    // "Collection was modified; enumeration operation may not execute." and aborts the whole apply,
+    // leaving ghosts stuck on. That is the error every client was logging several times a minute.
+    //
+    // Note this is the *only* collection in the pass that can throw it - HashSet.Clear() invalidates
+    // a live enumerator even when the set is already empty, so a client with nothing staged hit it
+    // just as often. FDP2.GetFDRs is snapshotted below, but List<T>.ToList() copies via CopyTo and
+    // never enumerates, so that snapshot could never have been the cause.
+    //
+    // TryEnter and skip, rather than lock and queue: a skipped pass costs nothing because the
+    // one-second timer re-asserts anyway, whereas queueing would pile pool threads up behind a pass
+    // that is about to be repeated.
+    readonly object _applyGate = new();
+
     // Sectors staged in the window right now. Pushed in by the window, which owns that state.
     List<SectorsVolumes.Sector> _staged = new();
 
@@ -67,12 +84,20 @@ public class PendingSectorGhosts
     }
 
     // Called on every FDR and radar update, which is where vatSys has just recomputed the state
-    // this needs to overwrite.
-    public void Reassert() => Apply();
+    // this needs to overwrite. Marshalled like every other entry point: Apply writes Track.State and
+    // calls MMI.RequestRedraw, both of which are vatSys UI state, and these callbacks arrive on
+    // pool threads.
+    public void Reassert() => RunOnUiThread(Apply);
 
     void Apply()
     {
         if (!Network.IsConnected)
+            return;
+
+        // See _applyGate. RunOnUiThread is not enough on its own - it falls back to running inline
+        // on the calling thread whenever MainForm isn't there to marshal through, so the gate is
+        // what actually holds.
+        if (!System.Threading.Monitor.TryEnter(_applyGate))
             return;
 
         try
@@ -120,6 +145,10 @@ public class PendingSectorGhosts
         {
             // Presentation only - a failure here must never disturb the traffic picture.
             ActionLog.Log("Ghost", $"could not apply: {ex.Message}");
+        }
+        finally
+        {
+            System.Threading.Monitor.Exit(_applyGate);
         }
     }
 

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -436,6 +436,121 @@ public class OzServerOwnershipTracker
         }
     }
 
+    // Claims a sector, carving out whatever covered sub-sectors somebody is currently logged on as.
+    //
+    // Every claim on the backend expands through the dataset's responsible_sectors, which is what
+    // makes top-down work at all - but the expansion says nothing about who is actually on those
+    // sectors, so an enroute controller logging on while an approach controller was already online
+    // took the approach sectors straight off them. The exclusion list is what stops that, and it is
+    // computed here rather than on the backend because this side can see the live VATSIM ATC list;
+    // see PrimaryPosition.StaffedCoveredSectors.
+    //
+    // The same list, recomputed on every claim, is also what gives the sectors back: once that
+    // controller logs off they stop being excluded, so the next claim takes them. See
+    // PrimaryPositionWatcher, which runs one on a departure.
+    //
+    // `also` carries anything else to leave out - the contested sub-sectors from a 409 retry.
+    Task ClaimWithExclusionsAsync(SectorsVolumes.Sector sector, IEnumerable<string>? also = null)
+    {
+        var exclude = PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign);
+
+        foreach (var name in also ?? Enumerable.Empty<string>())
+        {
+            if (!exclude.Contains(name, StringComparer.OrdinalIgnoreCase))
+                exclude.Add(name);
+        }
+
+        return _api.ClaimSectorAsync(sector.Name, exclude);
+    }
+
+    // Takes back top-down cover that was withheld while somebody was logged on as it, now that they
+    // have left. The other half of the rule ClaimWithExclusionsAsync implements: if an approach
+    // controller is online their sectors are not the enroute controller's to take, and when they log
+    // off they are again.
+    //
+    // Re-claiming a sector this controller already owns is all it takes, because the exclusion list
+    // is recomputed on every claim - the pieces of the group that have since gone unstaffed simply
+    // stop being excluded. Nothing else would pick them up: the withheld sector was never in this
+    // client's MMI, so the MMI-driven claim path never looks at it, and vatSys has no give-back of
+    // its own - it drops a sector when its controller comes online and never restores it.
+    public async Task ReclaimTopDownCoverAsync(IReadOnlyCollection<string> freed)
+    {
+        if (!Network.IsConnected || !IsRealAtc || freed.Count == 0)
+            return;
+
+        // Only the groups actually affected. Re-claiming every owned sector on any departure would
+        // put a burst of writes on the backend for airspace that has not changed hands.
+        var roots = _owned
+            .Where(owned => PrimaryPosition.CoveredBy(owned)
+                .Any(covered => freed.Contains(covered.Name, StringComparer.OrdinalIgnoreCase)))
+            .ToList();
+
+        foreach (var sector in roots)
+        {
+            IReadOnlyList<OzServerSectorConflictDto>? conflicts = null;
+
+            try
+            {
+                await ClaimWithExclusionsAsync(sector);
+                ActionLog.Log("Ownership", $"Took back top-down cover under {sector.Name}");
+            }
+            catch (OzServerApiException ex) when (ex.StatusCode == 409 && ex.Conflicts.Count > 0)
+            {
+                // Same catch-clause escape rule as the other claim paths - handled after the try.
+                conflicts = ex.Conflicts;
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't take back cover under {sector.Name}: {ex.Message}", ex), "OzServer");
+            }
+
+            if (conflicts == null)
+                continue;
+
+            // Somebody claimed a piece of it in the meantime. Leave those with them, take the rest -
+            // deliberately not requested, for the reason ClaimMmiControlledSectorsAsync gives.
+            try
+            {
+                await ClaimWithExclusionsAsync(sector, conflicts.Select(c => c.Sector));
+                ActionLog.Log("Ownership",
+                    $"Took back cover under {sector.Name} (excluding {string.Join(", ", conflicts.Select(c => c.Sector))})");
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't take back the rest of {sector.Name}: {ex.Message}", ex), "OzServer");
+            }
+        }
+
+        await RefreshFromServerAsync();
+    }
+
+    // Applies a sync that came back attached to an action (claim, release, accept, resume, batch)
+    // rather than from a poll, under the same gate the polls use.
+    //
+    // These used to call ApplySync directly, which put them outside _refreshGate entirely - and the
+    // gate is not about the HTTP call, it is about the fact that ApplySync *diffs against the last
+    // thing applied*. A poll issued before an action and answered after it would overwrite _owned
+    // with a payload the server built before the action ran, then diff the next real update against
+    // that stale baseline. The visible result is a sector reappearing seconds after it was given
+    // away: accepting a request for ESP logged "ESP went to ML-HYD_CTR", and twelve seconds later
+    // the same client logged "Gained ESP from ML-HYD_CTR" and pushed it back into MMI - a sector it
+    // had just handed over, taken back from a controller who by then legitimately owned it.
+    //
+    // Waits rather than dropping: an action's own result is never redundant, which is exactly the
+    // difference between this and RefreshFromServerIfIdleAsync.
+    async Task ApplySyncGatedAsync(OzServerSyncDto sync)
+    {
+        await _refreshGate.WaitAsync();
+        try
+        {
+            ApplySync(sync);
+        }
+        finally
+        {
+            _refreshGate.Release();
+        }
+    }
+
     // One GET for all three of this plugin's read-only views of server state - owned, everyone
     // else's ownership, and this controller's requests in both directions.
     //
@@ -493,7 +608,7 @@ public class OzServerOwnershipTracker
             var response = await _api.ResumeAsync();
 
             if (response.Sync != null)
-                ApplySync(response.Sync);
+                await ApplySyncGatedAsync(response.Sync);
             else
                 await RefreshFromServerAsync();
 
@@ -674,7 +789,7 @@ public class OzServerOwnershipTracker
 
         try
         {
-            await _api.ClaimSectorAsync(sector.Name);
+            await ClaimWithExclusionsAsync(sector);
             ActionLog.Log("Ownership", $"Claimed {sector.Name}");
         }
         catch (OzServerApiException ex) when (ex.StatusCode == 409 && ex.Conflicts.Count > 0)
@@ -739,10 +854,22 @@ public class OzServerOwnershipTracker
         // backend that predates /sectors/commit.
         try
         {
+            // One exclusion list for the whole batch - the union of what each claimed sector would
+            // sweep up that somebody is on. A name only excluded for one of the claims is still
+            // correct to exclude for all of them: it is staffed, so none of them may take it.
+            var staffed = toClaim
+                .SelectMany(s => PrimaryPosition.StaffedCoveredSectors(s, Network.Me?.Callsign))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                // Never carve out a sector the controller explicitly staged: they asked for it by
+                // name, and if it is somebody else's the ordinary conflict path is what answers.
+                .Where(name => !toClaim.Any(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
             var response = await _api.CommitAsync(
                 toClaim.Select(s => s.Name),
                 toRelease.Select(s => s.Name),
-                (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name));
+                (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name),
+                staffed);
 
             result.Claimed.AddRange(response.Result.Claimed);
             result.Released.AddRange(response.Result.Released);
@@ -751,7 +878,7 @@ public class OzServerOwnershipTracker
             result.Failed.AddRange(response.Result.Failed);
 
             if (response.Sync != null)
-                ApplySync(response.Sync);
+                await ApplySyncGatedAsync(response.Sync);
             else
                 await RefreshFromServerAsync();
 
@@ -790,7 +917,7 @@ public class OzServerOwnershipTracker
 
             try
             {
-                await _api.ClaimSectorAsync(sector.Name);
+                await ClaimWithExclusionsAsync(sector);
                 result.Claimed.Add(sector.Name);
                 ActionLog.Log("Ownership", $"Claimed {sector.Name}");
             }
@@ -827,7 +954,7 @@ public class OzServerOwnershipTracker
             // sub-sector would hand over none of the others, even though they were free.
             try
             {
-                await _api.ClaimSectorAsync(sector.Name, conflicts.Select(c => c.Sector));
+                await ClaimWithExclusionsAsync(sector, conflicts.Select(c => c.Sector));
                 result.Claimed.Add(sector.Name);
                 ActionLog.Log("Ownership", $"Claimed {sector.Name} (excluding {string.Join(", ", conflicts.Select(c => c.Sector))})");
             }
@@ -882,7 +1009,7 @@ public class OzServerOwnershipTracker
     public async Task ApplyActionResultAsync(OzServerActionResultDto? result)
     {
         if (result?.Sync != null)
-            ApplySync(result.Sync);
+            await ApplySyncGatedAsync(result.Sync);
         else
             await RefreshFromServerAsync();
     }
@@ -899,7 +1026,7 @@ public class OzServerOwnershipTracker
         // The accept's own response carries the resulting state, so there is nothing left to ask
         // for. Falls back to a refresh only if an older backend answered without it.
         if (response.Sync != null)
-            ApplySync(response.Sync);
+            await ApplySyncGatedAsync(response.Sync);
         else
             await RefreshFromServerAsync();
 
@@ -919,7 +1046,7 @@ public class OzServerOwnershipTracker
             ActionLog.Log("Ownership", $"Rejected request #{id}");
 
         if (response.Sync != null)
-            ApplySync(response.Sync);
+            await ApplySyncGatedAsync(response.Sync);
         else
             await RefreshFromServerAsync();
 
@@ -980,7 +1107,7 @@ public class OzServerOwnershipTracker
 
             try
             {
-                await _api.ClaimSectorAsync(sector.Name);
+                await ClaimWithExclusionsAsync(sector);
             }
             catch (OzServerApiException ex) when (ex.StatusCode == 409 && ex.Conflicts.Count > 0)
             {
@@ -1076,7 +1203,7 @@ public class OzServerOwnershipTracker
 
         try
         {
-            await _api.ClaimSectorAsync(sector.Name, conflicts.Select(c => c.Sector));
+            await ClaimWithExclusionsAsync(sector, conflicts.Select(c => c.Sector));
         }
         catch (Exception ex)
         {
@@ -1149,7 +1276,9 @@ public class OzServerOwnershipTracker
                 if (!Network.IsConnected)
                     return;
 
-                if (!stillMine.Any(s => s.Name == name) || _owned.Any(o => o.Name == name))
+                var sector = stillMine.FirstOrDefault(s => s.Name == name);
+
+                if (sector == null || _owned.Any(o => o.Name == name))
                 {
                     Drop(name);
                     continue;
@@ -1157,7 +1286,7 @@ public class OzServerOwnershipTracker
 
                 try
                 {
-                    await _api.ClaimSectorAsync(name);
+                    await ClaimWithExclusionsAsync(sector);
                     claimedAny = true;
                     Drop(name);
                     continue;

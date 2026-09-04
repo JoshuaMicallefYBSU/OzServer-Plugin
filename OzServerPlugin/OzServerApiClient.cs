@@ -394,13 +394,19 @@ public class OzServerApiClient
     // per-request cost for data that is always consumed together.
     // One Apply in one call. Sending a POST per sector meant applying three staged sectors paid full
     // latency four times over, with the lists frozen until the last one returned.
+    // exclude applies to every sector in `claim`, for the same reason the single-sector claim takes
+    // one: a claim expands through the dataset's responsible sectors, and the pieces of that
+    // expansion somebody is currently logged on as are not this controller's to take. See
+    // PrimaryPosition.StaffedCoveredSectors.
     public Task<OzServerCommitResponseDto> CommitAsync(
-        IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request) =>
+        IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request,
+        IEnumerable<string> exclude) =>
         PostAsync<OzServerCommitResponseDto>("/sectors/commit", new
         {
             claim = claim.ToArray(),
             release = release.ToArray(),
             request = request.ToArray(),
+            exclude = exclude.ToArray(),
         });
 
     public Task<OzServerSyncDto> GetSyncAsync() =>
