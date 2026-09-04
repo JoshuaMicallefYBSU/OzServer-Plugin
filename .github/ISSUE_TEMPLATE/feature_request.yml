@@ -1,0 +1,45 @@
+name: Feature request
+description: Something the plugin should do that it doesn't
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem
+      description: >
+        What you're trying to do and where the plugin gets in the way. Describe the situation on
+        the scope rather than the solution — the best fixes here have usually not been the one
+        originally asked for.
+      placeholder: |
+        When I hand a group to someone I have to tell them separately which sectors I mean,
+        because nothing on their scope shows what was requested.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like it to do
+      description: If you have something specific in mind. Skip it if you don't — the problem is the important half.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Sector ownership / requests
+        - Tags and jurisdiction (FDR)
+        - Shared markup (drawing, notes)
+        - The Sectors window
+        - ATIS
+        - Updates / installation
+        - Something else
+    validations:
+      required: true
+
+  - type: input
+    id: position
+    attributes:
+      label: Positions this affects
+      description: Whether this is about enroute, TCU, tower, or all of them. Grouping rules differ between them.
+      placeholder: Enroute primaries with sub-sectors

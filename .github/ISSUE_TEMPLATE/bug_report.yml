@@ -1,0 +1,76 @@
+name: Bug report
+description: Something the plugin did that it shouldn't have, or didn't do that it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The log is the single most useful thing you can attach. Nearly every bug in this plugin has
+        been diagnosed from it, and a report without one usually ends with us asking for it anyway.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        Logged on as ML-ASP_CTR while another controller held ASP.
+        Expected the whole Alice Springs group to come back to me.
+        Only the ASP sector did.
+    validations:
+      required: true
+
+  - type: input
+    id: position
+    attributes:
+      label: Position / callsign
+      description: What you were logged on as. Sector ownership behaviour depends heavily on this.
+      placeholder: ML-ASP_CTR
+    validations:
+      required: true
+
+  - type: input
+    id: others
+    attributes:
+      label: Other controllers involved
+      description: >
+        Callsigns of anyone else in the situation, and what they held. Most of this plugin is about
+        two clients agreeing, so a one-sided report is often only half the story.
+      placeholder: BN-TRT_CTR was holding ASW
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: >
+        From `Documents\vatSys Files\ozserver_YYYYMMDD.txt` — the lines around when it happened.
+        Attach the whole file if you're not sure what's relevant. It contains callsigns, sector
+        names and API calls; no passwords or tokens.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: Settings → OzServer, or right-click `OzServerPlugin.dll` → Properties → Details.
+      placeholder: 0.1.2
+    validations:
+      required: true
+
+  - type: input
+    id: vatsys-version
+    attributes:
+      label: vatSys version and profile
+      placeholder: vatSys 0.4.9, Australia profile
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: reproducible
+    attributes:
+      label: Does it happen again?
+      options:
+        - label: I've seen this more than once
+        - label: I can reproduce it on demand
