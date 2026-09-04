@@ -37,9 +37,12 @@ public class Plugin : IPlugin
     // because disconnect recovery is built entirely on the controlling_cid and current_sector this
     // pushes - without it a resume has nothing to give back.
     readonly FdrSync _fdrSync;
-    // All that is left of tag handling: restores tags the backend confirms were this controller's
-    // moments ago. Nothing decides tag ownership any more.
+    // Restores tags the backend confirms were this controller's moments ago.
     readonly TagResumeRecovery _tagResumeRecovery;
+    // Moves aircraft with their sector when one changes hands on OzServer.
+    readonly SectorTagHandoff _sectorTagHandoff;
+    // Previews which aircraft a staged or pending sector request would bring with it.
+    readonly PendingSectorGhosts _pendingSectorGhosts;
     readonly AtisSync _atisSync;
     readonly BadVectorsAtisSync _badVectorsAtisSync;
     // Held for the same reason as the two above: it lives entirely off Network's own events, and a
@@ -81,6 +84,10 @@ public class Plugin : IPlugin
         _fdrSync = new FdrSync();
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
+        // After the tracker, whose OwnershipChanged tells it a sector moved.
+        _sectorTagHandoff = new SectorTagHandoff(_ownershipTracker);
+        // After the tracker, whose own open requests it reads alongside the window's staged set.
+        _pendingSectorGhosts = new PendingSectorGhosts(_ownershipTracker);
         _atisSync = new AtisSync();
         _badVectorsAtisSync = new BadVectorsAtisSync();
         // After the tracker, which it releases through.
@@ -423,7 +430,7 @@ public class Plugin : IPlugin
         // instance is reused (and its event subscriptions stay alive) for the plugin's lifetime.
         if (_sectorsWindow == null)
         {
-            _sectorsWindow = new OzServerSectorsWindow(_ownershipTracker);
+            _sectorsWindow = new OzServerSectorsWindow(_ownershipTracker, _pendingSectorGhosts);
 
             // What puts the requested sectors on the scope, and takes them off again. Hooked here
             // rather than inside the window so the window stays about managing sectors and knows
@@ -466,9 +473,19 @@ public class Plugin : IPlugin
         window.BringToFront();
     }
 
-    // Only the state push remains on these. Nothing reacts to a flight moving any more - no pickup
-    // offers, no handoffs, no activation - which is the whole point of the removal.
-    public void OnFDRUpdate(FDP2.FDR updated) => _fdrSync.OnFdrUpdate(updated);
+    public void OnFDRUpdate(FDP2.FDR updated)
+    {
+        _fdrSync.OnFdrUpdate(updated);
+        // Watches for the handoffs an OzServer sector transfer produces, so one is accepted the
+        // moment it lands rather than on a poll of its own.
+        _sectorTagHandoff.OnFdrUpdate(updated);
+        // vatSys has just recomputed this track's state, so any ghost of ours needs reasserting.
+        _pendingSectorGhosts.Reassert();
+    }
 
-    public void OnRadarTrackUpdate(RDP.RadarTrack updated) => _fdrSync.OnRadarTrackUpdate(updated);
+    public void OnRadarTrackUpdate(RDP.RadarTrack updated)
+    {
+        _fdrSync.OnRadarTrackUpdate(updated);
+        _pendingSectorGhosts.Reassert();
+    }
 }

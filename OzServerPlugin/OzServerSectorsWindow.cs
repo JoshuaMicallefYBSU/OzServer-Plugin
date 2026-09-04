@@ -168,6 +168,9 @@ public class OzServerSectorsWindow : BaseForm
     // They are not added to _sectorsSelected, because staging one does not make it this controller's
     // even provisionally: it shows under Requested By Me until Apply actually sends the request.
     readonly List<SectorsVolumes.Sector> _stagedRequests = new();
+    // Shows the aircraft a staged request would bring with it. The window owns the staged set, so
+    // it is the only place that can say when it changes.
+    readonly PendingSectorGhosts _ghosts;
     bool _applyRunning;
 
     readonly TableLayoutPanel _tableLayoutPanel1;
@@ -199,8 +202,9 @@ public class OzServerSectorsWindow : BaseForm
     readonly TreeViewEx _requestedChangesView;
     readonly FlowLayoutPanel _requestedChangesPanel;
 
-    public OzServerSectorsWindow(OzServerOwnershipTracker tracker)
+    public OzServerSectorsWindow(OzServerOwnershipTracker tracker, PendingSectorGhosts ghosts)
     {
+        _ghosts = ghosts;
         _tracker = tracker;
         Text = "OzServer - Sector Configuration Window";
         Name = nameof(OzServerSectorsWindow);
@@ -1551,6 +1555,10 @@ public class OzServerSectorsWindow : BaseForm
 
     void RefreshStagedHighlight()
     {
+        // Every staging change comes through here, so this is the one place the ghost preview has
+        // to be told - including Cancel and closing the window, which clear the staged set.
+        _ghosts.SetStaged(_stagedRequests);
+
         _currSectorsView.Invalidate();
         _availSectorsView.Invalidate();
     }

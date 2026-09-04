@@ -22,6 +22,33 @@ public class SectorCommitResult
     public List<string> Failed { get; } = new();
 }
 
+// One sector changing hands, and who the other party was - the controller it went to when this
+// session lost it, or the one who had it when this session gained it.
+//
+// The counterparty is the point. "I lost ASW" alone says nothing about what to do with the aircraft
+// in it; "I lost ASW to BN-TRT_CTR" is what lets the losing client hand those tags to the right
+// controller, and the gaining client recognise the resulting handoffs as an OzServer transfer
+// rather than a manual one somebody made by hand.
+public class SectorTransfer
+{
+    public SectorTransfer(SectorsVolumes.Sector sector, OzServerControlledSectorOwnerDto? counterparty)
+    {
+        Sector = sector;
+        Counterparty = counterparty;
+    }
+
+    public SectorsVolumes.Sector Sector { get; }
+
+    // Null when nobody else is involved - a sector released to nobody, or claimed from nobody.
+    public OzServerControlledSectorOwnerDto? Counterparty { get; }
+}
+
+public class SectorOwnershipDiff
+{
+    public List<SectorTransfer> Gained { get; } = new();
+    public List<SectorTransfer> Lost { get; } = new();
+}
+
 // Keeps OzServer's sector-ownership record in sync with MMI.SectorsControlled, independent of
 // whether OzServerSectorsWindow happens to be open. Constructed unconditionally by Plugin (like
 // AfvSectorClaimer) rather than lazily: a VSCS/AFV transmit press only ever touches
@@ -85,6 +112,10 @@ public class OzServerOwnershipTracker
     // popup naming the sector and who asked, which a bare count cannot do. Still only raised when
     // the set actually changes, so it fires once per new request rather than once per poll.
     public event EventHandler<IReadOnlyList<OzServerSectorOwnershipRequestDto>>? IncomingRequestsChanged;
+    // Fires whenever Owned actually gains or loses a sector, with who it changed hands with.
+    // Consumed by SectorTagHandoff, which moves the aircraft in that sector to match.
+    public event EventHandler<SectorOwnershipDiff>? OwnershipChanged;
+
     // The full requests payload from the last sync, for the Sectors window - which renders both
     // directions and needs the rejected rows too, not just a changed/unchanged signal.
     public event EventHandler<OzServerMyRequestsDto>? RequestsChanged;
@@ -529,6 +560,10 @@ public class OzServerOwnershipTracker
     // with the action, so the same code applies it either way and the UI moves on the first reply.
     void ApplySync(OzServerSyncDto sync)
     {
+        // Captured before the replacement: a sector this session just gained needs the owner it had
+        // a moment ago, which the incoming payload no longer mentions.
+        var previousControlled = _controlled;
+
         _controlled = sync.Controlled
             .Where(c => c.Owner != null)
             .ToDictionary(c => c.Name, c => c.Owner!, StringComparer.OrdinalIgnoreCase);
@@ -549,7 +584,7 @@ public class OzServerOwnershipTracker
         // reading _owned at that point would pick up whatever a *later* refresh had since assigned
         // and diff it against this run's `previous`, reporting a change neither run actually saw.
         if (_hasBaseline)
-            RunOnUiThread(() => ReconcileMmiWithOwned(previous, current));
+            RunOnUiThread(() => ReconcileMmiWithOwned(previous, current, previousControlled));
         else
             _hasBaseline = true;
 
@@ -561,13 +596,27 @@ public class OzServerOwnershipTracker
     // UI. Calling MMI.SetControlledSectors here re-fires MMI.SectorsControlledChanged, which calls
     // ClaimMmiControlledSectorsAsync -> RefreshFromServerAsync again - harmless: by then Owned
     // already matches what was just pushed, so that second pass finds no further diff and stops.
-    void ReconcileMmiWithOwned(List<SectorsVolumes.Sector> previous, List<SectorsVolumes.Sector> current)
+    void ReconcileMmiWithOwned(List<SectorsVolumes.Sector> previous, List<SectorsVolumes.Sector> current,
+        IReadOnlyDictionary<string, OzServerControlledSectorOwnerDto> previousControlled)
     {
         var gained = current.Where(s => !previous.Any(p => p.Equals(s))).ToList();
         var lost = previous.Where(p => !current.Any(s => s.Equals(p))).ToList();
 
         if (gained.Count == 0 && lost.Count == 0)
             return;
+
+        var diff = new SectorOwnershipDiff();
+        // Gained: who had it before, from the snapshot taken before this sync overwrote it.
+        // Lost: who has it now, which is exactly what the new snapshot records.
+        foreach (var sector in gained)
+            diff.Gained.Add(new SectorTransfer(sector,
+                previousControlled.TryGetValue(sector.Name, out var had) ? had : null));
+
+        foreach (var sector in lost)
+            diff.Lost.Add(new SectorTransfer(sector,
+                _controlled.TryGetValue(sector.Name, out var has) ? has : null));
+
+        OwnershipChanged?.Invoke(this, diff);
 
         var mmiSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
