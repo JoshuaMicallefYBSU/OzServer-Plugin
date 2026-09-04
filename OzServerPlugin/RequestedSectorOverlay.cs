@@ -55,7 +55,17 @@ public class RequestedSectorOverlay
 
     public void SetRequested(IReadOnlyList<SectorsVolumes.Sector> sectors)
     {
-        _requested = sectors.ToList();
+        // Shaded as the whole group, not just the sector named in the request. Accepting a request
+        // for BLA hands over ELW and the Melbourne Approach sectors as well - the backend resolves
+        // the transfer through the same responsible-sectors chain a claim expands through - so
+        // shading BLA alone showed the controller a fraction of the airspace they were being asked
+        // to give up.
+        _requested = sectors
+            .SelectMany(PrimaryPosition.CoveredBy)
+            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+
         Apply();
     }
 

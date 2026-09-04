@@ -243,6 +243,19 @@ public class SectorTagHandoff
         // as the previous owner, or the aircraft not resolving inside the sector that moved.
         if (match == null)
         {
+            // Ask the backend now rather than waiting to be told.
+            //
+            // The two halves of a transfer arrive over different channels: the handoff comes over
+            // VATSIM, the ownership change over OzServer, and the VATSIM one is routinely first.
+            // Until the sector lands there is nothing to match the handoff against, so the tag sits
+            // in handover - visibly blue for a moment on every transfer.
+            //
+            // An unmatched handoff is a good reason to suspect ownership has moved, so this pulls
+            // the sync forward instead of waiting for the push signal or the next poll. Rate-limited
+            // because an ordinary manual handoff is also unmatched and will stay that way for as
+            // long as it flashes - that must not turn into a request per FDR update.
+            RequestOwnershipCatchUp();
+
             bool report;
             string expecting;
 
@@ -285,6 +298,24 @@ public class SectorTagHandoff
             lock (_lock)
                 _accepting.Remove(fdr.Callsign);
         }
+    }
+
+    // At most one catch-up refresh per interval, however many unmatched handoffs are in view. See
+    // the caller for why an unmatched handoff is worth asking about at all.
+    static readonly TimeSpan CatchUpInterval = TimeSpan.FromSeconds(2);
+    DateTime _lastCatchUp = DateTime.MinValue;
+
+    void RequestOwnershipCatchUp()
+    {
+        lock (_lock)
+        {
+            if (DateTime.UtcNow - _lastCatchUp < CatchUpInterval)
+                return;
+
+            _lastCatchUp = DateTime.UtcNow;
+        }
+
+        _ = _tracker.RefreshFromServerIfIdleAsync();
     }
 
     // The accept itself, split out only so the in-flight guard above has a body to wrap.

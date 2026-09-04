@@ -184,6 +184,14 @@ public class OzServerOwnershipTracker
     // while RefreshFromServerIfIdleAsync gives up (a periodic poll has nothing to add by asking the
     // same question again a moment later, and queueing them just builds a backlog).
     readonly SemaphoreSlim _refreshGate = new(1, 1);
+    // A push signal that arrived while a refresh was already running, to be answered as soon as it
+    // finishes rather than dropped - see RefreshFromServerIfIdleAsync.
+    //
+    // Its own lock object rather than the semaphore: SemaphoreSlim takes an internal lock of its
+    // own on some runtimes, and locking application state on the same instance is how that turns
+    // into contention nobody can see from here.
+    readonly object _refreshQueueGate = new();
+    bool _refreshQueued;
 
     // Sectors this session is the primary for that were already owned by someone else at the moment
     // it logged on - see HandleConflictAsync. Keyed by sector name, valued by how many poll ticks
@@ -423,12 +431,38 @@ public class OzServerOwnershipTracker
             return;
 
         // WaitAsync(0) completes synchronously - "take it if it's free, otherwise give up".
+        //
+        // Giving up is right for a poll tick, which is asking a question nothing prompted. It is
+        // wrong for the push channel: an SSE "sectors" signal means something actually changed, and
+        // dropping it because a poll happened to be in flight left the client on the pre-change
+        // picture until its next tick - up to ten seconds of a transferred tag sitting in handover
+        // waiting for its sector to arrive. Those are coalesced instead: one more pass runs when the
+        // in-flight one finishes, however many signals arrived while it was running.
         if (!await _refreshGate.WaitAsync(0))
+        {
+            lock (_refreshQueueGate)
+                _refreshQueued = true;
+
             return;
+        }
 
         try
         {
-            await RefreshFromServerCoreAsync();
+            while (true)
+            {
+                await RefreshFromServerCoreAsync();
+
+                // Test-and-clear as one step, the same shape as _claimGate: cleared separately, a
+                // signal arriving between the test and the clear would be dropped by a pass that had
+                // already decided to stop.
+                lock (_refreshQueueGate)
+                {
+                    if (!_refreshQueued)
+                        break;
+
+                    _refreshQueued = false;
+                }
+            }
         }
         finally
         {

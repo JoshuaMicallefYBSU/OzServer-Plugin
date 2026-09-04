@@ -167,7 +167,18 @@ public class PendingSectorGhosts
             .Where(s => s != null)
             .Select(s => s!);
 
-        return staged.Concat(open).Distinct().ToList();
+        // Expanded to the whole group each one carries, because that is what actually transfers: a
+        // request for BLA moves ELW and the Melbourne Approach sectors with it, since the backend
+        // resolves a transfer through the same responsible-sectors chain a claim expands through.
+        //
+        // Previewing only the sector named in the request understated it every time a group changed
+        // hands - asking for Benalla ghosted nothing in Eildon Weir, so an aircraft that was about
+        // to arrive looked like it was staying put.
+        return staged.Concat(open)
+            .SelectMany(PrimaryPosition.CoveredBy)
+            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
     }
 
     // The transfer rule, matched to SectorTagHandoff: inside one of the pending sectors, and held
