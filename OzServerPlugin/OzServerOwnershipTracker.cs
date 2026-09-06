@@ -85,8 +85,12 @@ public class SectorOwnershipDiff
 public class OzServerOwnershipTracker
 {
     // Idle cadence. Nothing is expected to change on its own, so this only has to be often enough
-    // that a sector claimed elsewhere shows up in reasonable time.
-    static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(10);
+    // that a sector claimed elsewhere shows up in reasonable time. Also doubles as the server's own
+    // floor for how fast it can safely let a different controller take over a sector whose owner
+    // has gone quiet (OzServer-API's PRESENCE_TIMEOUT_SECONDS) - that check can never be faster than
+    // this without risking a false takeover on a controller who is still connected and simply
+    // hasn't ticked yet, so lowering one means lowering the other to match.
+    static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(3);
     // Cadence while a handoff is actually in flight - this controller is waiting on someone's
     // decision, or owes one. That is exactly the window where reflection latency is felt, and it is
     // short-lived, so it costs nothing the rest of the time. Without it, being told your request was
@@ -198,7 +202,7 @@ public class OzServerOwnershipTracker
     // are left to keep trying. Bounded rather than infinite: the previous holder might not be
     // running this plugin at all, or might have crashed out still holding the position, and quietly
     // re-POSTing a doomed claim forever is worse than stopping and leaving it to be claimed by hand.
-    const int PrimaryClaimRetryTicks = 12; // ~2 minutes at PollInterval
+    const int PrimaryClaimRetryTicks = 40; // ~2 minutes at PollInterval - keep this in sync if PollInterval changes
     readonly object _primaryClaimGate = new();
     readonly Dictionary<string, int> _pendingPrimaryClaims = new(StringComparer.OrdinalIgnoreCase);
     bool _primaryClaimRetryRunning;
