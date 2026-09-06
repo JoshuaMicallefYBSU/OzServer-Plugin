@@ -97,6 +97,19 @@ public class SectorTagHandoff
     // MMI.AcceptJurisdiction on it.
     readonly HashSet<string> _accepting = new(StringComparer.OrdinalIgnoreCase);
 
+    // How long after a silent accept to keep reasserting Jurisdiction against whatever vatSys's own
+    // FDR/radar processing does to the tag afterwards, and how often. See ReassertConfirmations for
+    // why one correct SetTrackState call at accept time is not enough to guarantee it stays correct -
+    // this fights the identical battle PendingSectorGhosts already fights for its own preview state,
+    // on the same cadence.
+    static readonly TimeSpan ConfirmationWindow = TimeSpan.FromSeconds(10);
+    static readonly TimeSpan ConfirmationInterval = TimeSpan.FromSeconds(1);
+
+    // Callsigns AcceptTransfer just accepted, and the sector jurisdiction should stick to, until
+    // ReassertConfirmations has either confirmed it stuck or given up.
+    readonly Dictionary<string, PendingConfirmation> _confirming = new(StringComparer.OrdinalIgnoreCase);
+    readonly System.Threading.Timer _confirmTimer;
+
     sealed class PendingTransfer
     {
         public PendingTransfer(SectorsVolumes.Sector sector, string fromCallsign)
@@ -113,11 +126,24 @@ public class SectorTagHandoff
         public void RefreshUntil() => Until = DateTime.UtcNow + TransferWindow;
     }
 
+    sealed class PendingConfirmation
+    {
+        public PendingConfirmation(SectorsVolumes.Sector sector)
+        {
+            Sector = sector;
+            Until = DateTime.UtcNow + ConfirmationWindow;
+        }
+
+        public SectorsVolumes.Sector Sector { get; }
+        public DateTime Until { get; }
+    }
+
     public SectorTagHandoff(OzServerOwnershipTracker tracker, FdrSync fdrSync)
     {
         _tracker = tracker;
         _fdrSync = fdrSync;
         _tracker.OwnershipChanged += (_, diff) => RunOnUiThread(() => OnOwnershipChanged(diff));
+        _confirmTimer = new System.Threading.Timer(_ => RunOnUiThread(ReassertConfirmations), null, ConfirmationInterval, ConfirmationInterval);
         Network.Disconnected += (_, _) =>
         {
             lock (_lock)
@@ -125,8 +151,69 @@ public class SectorTagHandoff
                 _incoming.Clear();
                 _reportedUnmatched.Clear();
                 _accepting.Clear();
+                _confirming.Clear();
             }
         };
+    }
+
+    // Fights the same battle PendingSectorGhosts fights for its own preview state, for the same
+    // reason: vatSys recomputes track.State on every subsequent FDR/radar callback using whatever
+    // fdr.ControllingSector and MMI.SectorsControlled happen to be at that instant, on its own
+    // schedule, independent of anything this plugin does. AcceptTransfer's own success check only
+    // ever verified fdr.State reached STATE_CONTROLLED, never the actual track.State SetTrackState
+    // computed - so a transfer that logged "no flash" success could still visibly settle on
+    // Announced (or another demoted state) moments later, with nothing in the log to show it, because
+    // whatever caused that settling ran entirely inside vatSys, after this plugin had already moved
+    // on. One correct SetTrackState call at accept time is not durable against that. Reasserting it
+    // for a few seconds afterwards is: if vatSys knocks it back down, this puts it back, on the same
+    // 1-second cadence PendingSectorGhosts already uses to win the identical fight.
+    void ReassertConfirmations()
+    {
+        List<KeyValuePair<string, PendingConfirmation>> toCheck;
+        lock (_lock)
+        {
+            var expired = _confirming.Where(kv => kv.Value.Until < DateTime.UtcNow).Select(kv => kv.Key).ToList();
+            foreach (var callsign in expired)
+                _confirming.Remove(callsign);
+
+            if (_confirming.Count == 0)
+                return;
+
+            toCheck = _confirming.ToList();
+        }
+
+        foreach (var entry in toCheck)
+        {
+            var callsign = entry.Key;
+            var confirmation = entry.Value;
+            var fdr = FDP2.GetFDRs.FirstOrDefault(f => string.Equals(f.Callsign, callsign, StringComparison.OrdinalIgnoreCase));
+
+            // No longer tracked by us at all - handed off again, dropped, or gone. Nothing left to
+            // assert, and no reason to keep trying.
+            if (fdr == null || !fdr.IsTrackedByMe)
+            {
+                lock (_lock)
+                    _confirming.Remove(callsign);
+                continue;
+            }
+
+            var track = MMI.FindTrack(fdr);
+            if (track == null || track.State == MMI.HMIStates.Jurisdiction)
+                continue;
+
+            var wasState = track.State;
+            fdr.ControllingSector = confirmation.Sector;
+            MMI.SetTrackState(track);
+
+            ActionLog.Log("Tag", $"Reasserted jurisdiction on {callsign}, which had settled on {wasState} instead", new
+            {
+                action = "handoff_reassert",
+                fdr_callsign = callsign,
+                sector = confirmation.Sector.Name,
+                was_state = wasState.ToString(),
+                now_state = track.State.ToString()
+            });
+        }
     }
 
     // Called for every FDR update, so an incoming transfer is accepted as soon as it lands rather
@@ -436,6 +523,12 @@ public class SectorTagHandoff
         var track = MMI.FindTrack(fdr);
         if (track != null)
             MMI.SetTrackState(track);
+
+        // Registered even though the state was just set correctly above - see
+        // ReassertConfirmations for why that alone is not durable, and why this keeps checking
+        // rather than trusting the one call that just ran.
+        lock (_lock)
+            _confirming[fdr.Callsign] = new PendingConfirmation(mine);
 
         _fdrSync.PushNow(fdr);
 
