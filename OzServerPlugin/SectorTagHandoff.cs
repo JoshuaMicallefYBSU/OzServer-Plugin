@@ -288,20 +288,32 @@ public class SectorTagHandoff
             // never ControllingSector; that field is normally left exactly where it was until
             // ProcessHandoffAccepted moves it, seconds later, once the round trip completes).
             //
-            // This runs from OnOwnershipChanged, which ReconcileMmiWithOwned fires synchronously
-            // right before it calls MMI.SetControlledSectors to actually drop this sector from
-            // SectorsControlled - and THAT method's own internal cleanup hands off to nobody any FDR
-            // whose ControllingSector was in the old list and isn't in the new one, checked purely
-            // against ControllingSector/IsTrackedByMe, with no idea that fdr.State just became
-            // STATE_HANDOVER a moment ago. Left at the old sector, it matches that cleanup and gets
-            // dropped from the network outright (Network.StopTracking) - cancelling the very handoff
-            // this loop just initiated, before the aircraft had any real chance to reach the
-            // controller it was being given to. Reassigning it here, to the sector the receiving
-            // controller is actually working, means SetControlledSectors' own check no longer
-            // matches (that sector was never in this session's own list to begin with), so its
-            // cleanup leaves this aircraft alone. ProcessHandoffAccepted resolves to the same sector
-            // once the real accept arrives, so this is only ever redundant with it, never in conflict.
+            // ReconcileMmiWithOwned calls OwnershipChanged (which is what runs this) before its own,
+            // later MMI.SetControlledSectors call actually drops this sector from SectorsControlled -
+            // and THAT method's own internal cleanup hands off to nobody any FDR whose
+            // ControllingSector was in the old list and isn't in the new one, checked purely against
+            // ControllingSector/IsTrackedByMe, with no idea that fdr.State just became STATE_HANDOVER
+            // a moment ago. Left at the old sector, it matches that cleanup and gets dropped from the
+            // network outright (Network.StopTracking) - cancelling the very handoff this loop just
+            // initiated, before the aircraft had any real chance to reach the controller it was being
+            // given to. Reassigning it here, to the sector the receiving controller is actually
+            // working, means that later cleanup's own check no longer matches (that sector was never
+            // in this session's own list to begin with), so it leaves this aircraft alone.
+            // ProcessHandoffAccepted resolves to the same sector once the real accept arrives, so this
+            // is only ever redundant with it, never in conflict.
             fdr.ControllingSector = toSector;
+
+            // Cancels ReassertConfirmations' own claim on this callsign, if AcceptTransfer registered
+            // one - see there for why it exists. Without this, giving an aircraft away again inside
+            // its own 10-second confirmation window (the same rapid back-and-forth this whole class
+            // exists for) raced the two fixes against each other: the reassert timer saw this FDR's
+            // track sitting on HandoverOut - correct, mid-handoff, but not Jurisdiction - and forced
+            // ControllingSector straight back to the sector this loop is actively giving away, which
+            // undid the reassignment two lines up and reopened the exact drop this was written to
+            // prevent. Once GiveAway has taken an aircraft, nothing it used to hold jurisdiction for
+            // is this plugin's to keep asserting.
+            lock (_lock)
+                _confirming.Remove(fdr.Callsign);
 
             moved.Add(fdr.Callsign);
         }
@@ -480,7 +492,7 @@ public class SectorTagHandoff
 
     // At most one catch-up refresh per interval, however many unmatched handoffs are in view. See
     // the caller for why an unmatched handoff is worth asking about at all.
-    static readonly TimeSpan CatchUpInterval = TimeSpan.FromSeconds(2);
+    static readonly TimeSpan CatchUpInterval = TimeSpan.FromSeconds(1);
     DateTime _lastCatchUp = DateTime.MinValue;
 
     void RequestOwnershipCatchUp()

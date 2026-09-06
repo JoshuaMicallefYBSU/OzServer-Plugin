@@ -188,12 +188,18 @@ public static class PrimaryPosition
     // the very group whose controller is sitting there working it. DefaultSectorsFor is what decides
     // that, so the rule is the same one the rest of this class applies, from the same definition:
     // a primary logging on holds their group, a member logging on holds only their own sector.
-    public static List<string> StaffedCoveredSectors(SectorsVolumes.Sector sector, string? ownCallsign)
+    public static List<string> StaffedCoveredSectors(SectorsVolumes.Sector sector, string? ownCallsign) =>
+        StaffedCoveredSectors(sector, ownCallsign, OnlineRealAtcs());
+
+    public static List<string> StaffedCoveredSectors(
+        SectorsVolumes.Sector sector,
+        string? ownCallsign,
+        IEnumerable<NetworkATC> onlineAtcs)
     {
         var claimable = new HashSet<string>(CoveredBy(sector).Select(c => c.Name), StringComparer.OrdinalIgnoreCase);
         var staffed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var atc in OnlineRealAtcs())
+        foreach (var atc in onlineAtcs.Where(a => a.IsRealATC && !string.IsNullOrEmpty(a.Callsign)))
         {
             if (string.Equals(atc.Callsign, ownCallsign, StringComparison.OrdinalIgnoreCase))
                 continue;

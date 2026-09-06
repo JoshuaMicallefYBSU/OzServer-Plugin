@@ -75,6 +75,8 @@ public class OzServerSectorsWindow : BaseForm
 
     enum SectorListMode { Available, Controlled }
 
+    enum RequestListDirection { Outgoing, Incoming }
+
     List<SectorsVolumes.Sector> _sectorsSelected = new();
     readonly List<SectorChangeRequest> _requestsFromMe = new();
     readonly List<SectorChangeRequest> _requestsByMe = new();
@@ -128,11 +130,13 @@ public class OzServerSectorsWindow : BaseForm
     // everything else rather than only when Controlled happens to be showing.
     // Online controllers by callsign, rebuilt once per populate - see RefreshOnlineControllerIndex.
     readonly Dictionary<string, NetworkATC> _onlineByCallsign = new(StringComparer.OrdinalIgnoreCase);
-    // Memoizes ShouldListAsAvailable/ResolveDisplayController for the lifetime of one
-    // PopulateAvailableList pass - see the Clear() calls there. Keyed by name, not the Sector
-    // instance, for the same reason every other Owned/Available comparison in this window is.
+    // Memoizes ShouldListAsAvailable/ResolveDisplayController/staffed-cover filtering for the
+    // lifetime of one PopulateAvailableList pass - see the Clear() calls there. Keyed by name, not
+    // the Sector instance, for the same reason every other Owned/Available comparison in this
+    // window is.
     readonly Dictionary<string, bool> _availabilityCache = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, NetworkATC?> _displayControllerCache = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, HashSet<string>> _staffedCoveredCache = new(StringComparer.OrdinalIgnoreCase);
     // One canonical TreeNode built per sector per populate pass, cloned (TreeNode.Clone() is a
     // plain managed deep copy - Text/Name/Tag/NodeFont/ToolTipText and every descendant node, no
     // native calls) wherever else that same sector needs to appear: its own top-level row and again
@@ -874,24 +878,31 @@ public class OzServerSectorsWindow : BaseForm
         // fall back on for expanding a primary any more, so the one click has to do both. A heading
         // with no Name is one of the Requested ones - not collapsible, so a left click on it only
         // selects (which is still meaningful: selecting "Requested From Me" is the
-        // accept-everything-incoming gesture).
+        // accept-all-incoming-requests gesture).
         if (!string.IsNullOrEmpty(e.Node.Name))
             ToggleNodeExpansion(treeView, e.Node);
     }
 
     static bool IsCategoryNode(TreeNode node) => ReferenceEquals(node.Tag, CategoryTag);
 
-    // Only rows that stand for something - a sector, or a request - can be highlighted. The group
-    // headings (Flow/Centre/Approach/..., Requested By/From Me) and the informational placeholder
-    // rows are labels, and highlighting a label suggests it can be acted on when it cannot.
+    // Only rows that stand for something - a sector, a request, or the incoming-request heading
+    // that Accept handles as a batch - can be highlighted. The ordinary group headings and the
+    // informational placeholder rows are labels, and highlighting a label suggests it can be acted
+    // on when it cannot.
     //
     // Cancelling here rather than only in the click handler covers every route into a selection:
     // keyboard navigation, and the selection restore that runs after a rebuild.
     static void TreeView_BeforeSelect(object? sender, TreeViewCancelEventArgs e)
     {
+        if (e.Node is { } node && IsIncomingRequestHeading(node))
+            return;
+
         if (e.Node?.Tag is not SectorsVolumes.Sector && e.Node?.Tag is not SectorChangeRequest)
             e.Cancel = true;
     }
+
+    static bool IsIncomingRequestHeading(TreeNode node) =>
+        ReferenceEquals(node.Tag, CategoryTag) && node.Text == RequestedFromMeName;
 
     // The Requested From Me heading, on the lit half of its flash cycle, while requests are waiting.
     bool IsFlashingHeading(TreeNode node) =>
@@ -1193,7 +1204,7 @@ public class OzServerSectorsWindow : BaseForm
     {
         SectorsVolumes.Sector sector => "sector:" + sector.Name,
         SectorChangeRequest request => "request:" + request.Id,
-        _ when ReferenceEquals(node.Tag, CategoryTag) => "category:" + node.Name,
+        _ when ReferenceEquals(node.Tag, CategoryTag) => "category:" + (string.IsNullOrEmpty(node.Name) ? node.Text : node.Name),
         _ => "text:" + node.Text
     };
 
@@ -1485,16 +1496,16 @@ public class OzServerSectorsWindow : BaseForm
         var blockedByRequest = ownedSelected && ownedNode != null && HasOutstandingRequest(ownedNode);
 
         // Deliberately reads only the Owned and Available trees. A row in Requested is a request in
-        // flight, not a sector sitting somewhere it can be moved out of - Accept, Reject, Add and
-        // Remove there are all decisions about that request, which is what the right-click menu is
-        // for. Letting the arrow act on it broke the flow: the button means "move between these two
-        // lists", and Requested is neither of them.
+        // flight, not a sector sitting somewhere it can be moved out of. Accept and Reject are the
+        // decisions about a request; the arrow is only for moving sectors between Owned and
+        // Available/Controlled.
         _arrowButton.Text = ownedSelected ? ArrowRight : availSelected ? ArrowLeft : ArrowIdle;
 
         // Disabled rather than hidden for the request case, unlike the Requested-tree case below:
         // there the arrow is the wrong control entirely, whereas here it is the right control and
         // will work as soon as the request is answered - which is what a greyed-out button means.
-        _arrowButton.Enabled = !_applyRunning && (ownedSelected || availSelected) && !blockedByRequest;
+        _arrowButton.Enabled = !_applyRunning && !_requestActionRunning
+                               && (ownedSelected || availSelected) && !blockedByRequest;
 
         // An incoming request is an Accept-or-Reject decision, not a list move. The arrow acts on
         // whatever is selected over in Owned/Available, and that selection stays highlighted while a
@@ -1503,7 +1514,7 @@ public class OzServerSectorsWindow : BaseForm
         //
         // Hidden rather than disabled: a greyed-out button still reads as "this is the control for
         // what I am looking at, just not right now", which is the opposite of true here. Accept and
-        // Reject are the only actions an incoming request has.
+        // Reject are the actions an incoming request has.
         _arrowButton.Visible = !IsObserver
                                && CategoryNameOf(_requestedChangesView.SelectedNode) != RequestedFromMeName;
     }
@@ -1528,8 +1539,9 @@ public class OzServerSectorsWindow : BaseForm
         // difference the two happened to have for unrelated reasons, such as a dummy backfill or a
         // sector held on the network but not yet recorded on OzServer.
         //
-        // Nothing to commit and nothing to discard while an Apply is still in flight.
-        var pending = HasStagedEdits && !_applyRunning;
+        // Nothing to commit and nothing to discard while another sector/request action is in
+        // flight.
+        var pending = HasStagedEdits && !_applyRunning && !_requestActionRunning;
 
         _applyButton.Visible = !IsObserver;
         _cancelButton.Visible = !IsObserver;
@@ -1574,6 +1586,7 @@ public class OzServerSectorsWindow : BaseForm
 
         _currSectorsView.Invalidate();
         _availSectorsView.Invalidate();
+        _requestedChangesView.Invalidate();
     }
 
     void SetSectorListMode(SectorListMode mode)
@@ -1806,6 +1819,7 @@ public class OzServerSectorsWindow : BaseForm
         // not per call site.
         _availabilityCache.Clear();
         _displayControllerCache.Clear();
+        _staffedCoveredCache.Clear();
         _availableNodeCache.Clear();
 
         var candidates = SectorsVolumes.Sectors.Where(s => s.CSECEligible && ShouldListAsAvailable(s)).ToList();
@@ -1895,17 +1909,11 @@ public class OzServerSectorsWindow : BaseForm
         {
             foreach (var child in children)
             {
-                // A sub-sector this controller owns is not "controlled by someone else", even when
-                // the group above it belongs to someone else. Exactly the same trap as
-                // BuildOwnedSectorNode: this tree is built from the local dataset's groupings, which
-                // know nothing about a sub-sector having been handed over individually. The symptom
-                // was taking a sub-sector off another controller and watching it sit in Controlled -
-                // correctly gone from their side, but never showing up as ours.
-                //
-                // Only our own are filtered. A sub-sector held by a third controller still belongs
-                // in this tree: every node here is labelled with its actual holder, so the nesting
-                // reads correctly rather than misleading.
-                if (!ReferenceEquals(child, sector) && _tracker.IsMine(child))
+                // Controlled is a snapshot, not a raw grouping preview. A child only belongs under
+                // this parent if OzServer says somebody else controls that child too; otherwise a
+                // parent like BLA visually claimed MAE/MAV even after live APP cover carved those
+                // sectors out.
+                if (!ReferenceEquals(child, sector) && !_controlledNames.Contains(child.Name))
                     continue;
 
                 node.Nodes.Add(ReferenceEquals(child, sector)
@@ -2131,6 +2139,7 @@ public class OzServerSectorsWindow : BaseForm
 
         var controller = ResolveDisplayController(sector);
         var node = new TreeNode { Tag = sector, NodeFont = _availSectorsView.Font };
+        var staffed = StaffedCoveredSectorsForDisplay(sector);
 
         // See BuildOwnedSectorNode for why the self-reference case (e.g. TBD listing itself in its
         // own SectorGroupings) has to be a leaf, not a recursive call - it would otherwise loop
@@ -2146,6 +2155,12 @@ public class OzServerSectorsWindow : BaseForm
                     node.Nodes.Add(new TreeNode(text) { Tag = child, NodeFont = node.NodeFont, ToolTipText = text });
                     continue;
                 }
+
+                // A live staffed child is not part of this parent right now. Keep the child's own
+                // top-level row available, but do not show it under the parent action that would
+                // deliberately exclude it.
+                if (staffed.Contains(child.Name))
+                    continue;
 
                 var childNode = BuildAvailableSectorNode(child, depth + 1);
                 if (childNode != null)
@@ -2185,6 +2200,18 @@ public class OzServerSectorsWindow : BaseForm
     // several hundred times. Indexed once per populate instead - see RefreshOnlineControllerIndex.
     NetworkATC? FindController(SectorsVolumes.Sector sector) =>
         sector.Callsign != null && _onlineByCallsign.TryGetValue(sector.Callsign, out var atc) ? atc : null;
+
+    HashSet<string> StaffedCoveredSectorsForDisplay(SectorsVolumes.Sector sector)
+    {
+        if (_staffedCoveredCache.TryGetValue(sector.Name, out var cached))
+            return cached;
+
+        var staffed = new HashSet<string>(
+            PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign, _onlineByCallsign.Values),
+            StringComparer.OrdinalIgnoreCase);
+        _staffedCoveredCache[sector.Name] = staffed;
+        return staffed;
+    }
 
     // Rebuilt at the start of each populate so every node built in that pass sees one consistent
     // view of who is online, rather than re-reading a list that can change underneath the walk.
@@ -2346,7 +2373,10 @@ public class OzServerSectorsWindow : BaseForm
     // and takes vatSys down with it rather than surfacing in the error log.
     async void ApplyButton_Click(object? sender, EventArgs e)
     {
-        if (_applyRunning || !HasStagedEdits)
+        if (_applyRunning || _requestActionRunning)
+            return;
+
+        if (!HasStagedEdits)
             return;
 
         // Scoped to the sectors the controller actually moved, not to every difference between the
@@ -2563,7 +2593,7 @@ public class OzServerSectorsWindow : BaseForm
     // claim the server rejects as already-owned.
     void RunSectorAction(SectorsVolumes.Sector sector, bool add)
     {
-        if (_applyRunning)
+        if (_applyRunning || _requestActionRunning)
             return;
 
         StageSectorChange(sector, add);
@@ -2857,13 +2887,13 @@ public class OzServerSectorsWindow : BaseForm
     void PopulateRequestedChanges()
     {
         var byMeNode = CreateCategoryNode(_requestedChangesView, RequestedByMeName, collapsible: false);
-        AddRequestNodes(byMeNode, _requestsByMe, NoRequestsByMe, _stagedRequests);
+        AddRequestNodes(byMeNode, _requestsByMe, NoRequestsByMe, RequestListDirection.Outgoing, _stagedRequests);
 
         var fromMeNode = CreateCategoryNode(_requestedChangesView, RequestedFromMeName, collapsible: false);
         // Marked so DrawNode can flash it - the last step of the chain that starts at the Settings
         // menu: something is waiting, and this is the half of the list it is waiting in.
         _fromMeHasPending = _requestsFromMe.Count > 0;
-        AddRequestNodes(fromMeNode, _requestsFromMe, NoRequestsFromMe);
+        AddRequestNodes(fromMeNode, _requestsFromMe, NoRequestsFromMe, RequestListDirection.Incoming);
 
         var rootNodes = new[] { byMeNode, fromMeNode };
         var signature = "requested|" + TreeSignature(rootNodes);
@@ -2918,7 +2948,7 @@ public class OzServerSectorsWindow : BaseForm
     }
 
     void AddRequestNodes(TreeNode parent, List<SectorChangeRequest> requests, string emptyText,
-        List<SectorsVolumes.Sector>? staged = null)
+        RequestListDirection direction, List<SectorsVolumes.Sector>? staged = null)
     {
         // Staged rows first: they are the ones the controller just acted on, and they are tagged
         // with the sector so IsStagedNode paints them yellow. Once Apply sends them the server
@@ -2949,15 +2979,19 @@ public class OzServerSectorsWindow : BaseForm
                      .OrderBy(r => r.Sector.Name, StringComparer.OrdinalIgnoreCase)
                      .ThenBy(r => r.Controller, StringComparer.OrdinalIgnoreCase)
                      .ThenBy(r => r.Id))
-            parent.Nodes.Add(BuildRequestNode(request));
+            parent.Nodes.Add(BuildRequestNode(request, direction));
     }
 
-    // Mirrors BuildOwnedSectorNode's own nesting - a request against a primary sector that bundles
-    // its own sub-sectors (e.g. WOL) shows them nested underneath, same as Owned/Available already
-    // do, rather than as one flat line. Only the node this returns carries Tag = request - that's
-    // what GetRequestsToAccept/UpdateRequestActionButtons resolve a selection to (directly, or via
-    // FindOwningRequest for a click on one of the nested informational rows below it).
-    TreeNode BuildRequestNode(SectorChangeRequest request)
+    // Mirrors BuildOwnedSectorNode's own nesting, but only for sectors that still belong to the
+    // request's actual transfer. Incoming requests can only give away sectors this controller still
+    // holds; outgoing requests can only receive sectors the target controller still holds. Raw
+    // Sectors.xml grouping alone is not enough here - it would make a request for BLA still look as
+    // if it included MAE/MAV after ML_APP had carved those sectors out.
+    //
+    // Only the node this returns carries Tag = request - that's what GetRequestsToAccept/
+    // UpdateRequestActionButtons resolve a selection to (directly, or via FindOwningRequest for a
+    // click on one of the nested informational rows below it).
+    TreeNode BuildRequestNode(SectorChangeRequest request, RequestListDirection direction)
     {
         var text = $"{request.Sector.Name} - {request.Sector.FullName} ({request.Controller})";
         var node = new TreeNode { Tag = request, NodeFont = _requestedChangesView.Font };
@@ -2967,9 +3001,16 @@ public class OzServerSectorsWindow : BaseForm
         {
             foreach (var child in children)
             {
-                node.Nodes.Add(ReferenceEquals(child, request.Sector)
-                    ? new TreeNode(LeafText(FormatSectorText(child))) { NodeFont = node.NodeFont, ToolTipText = LeafText(FormatSectorText(child)) }
-                    : BuildRequestDescendantNode(child));
+                if (ReferenceEquals(child, request.Sector))
+                {
+                    var selfText = LeafText(FormatSectorText(child));
+                    node.Nodes.Add(new TreeNode(selfText) { NodeFont = node.NodeFont, ToolTipText = selfText });
+                    continue;
+                }
+
+                var childNode = BuildRequestDescendantNode(child, request, direction);
+                if (childNode != null)
+                    node.Nodes.Add(childNode);
             }
         }
 
@@ -2979,36 +3020,62 @@ public class OzServerSectorsWindow : BaseForm
 
     // Same recursion (and same self-reference/depth guard) as BuildOwnedSectorNode, but never
     // carries a Tag - these exist purely to show what a primary's request also covers, not as
-    // their own checkable/actionable request rows.
-    TreeNode BuildRequestDescendantNode(SectorsVolumes.Sector sector, int depth = 0)
+    // their own checkable/actionable request rows. Returns null when this branch no longer belongs
+    // to the transfer shown by the request.
+    TreeNode? BuildRequestDescendantNode(SectorsVolumes.Sector sector, SectorChangeRequest request,
+        RequestListDirection direction, int depth = 0)
     {
         var node = new TreeNode { NodeFont = _requestedChangesView.Font };
+        var includeSelf = RequestCoversSector(sector, request, direction);
 
         // See BuildOwnedSectorNode for why this is TryGetValue rather than an indexer.
         if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
             foreach (var child in children)
             {
-                node.Nodes.Add(ReferenceEquals(child, sector)
-                    ? new TreeNode(LeafText(FormatSectorText(child))) { NodeFont = node.NodeFont, ToolTipText = LeafText(FormatSectorText(child)) }
-                    : BuildRequestDescendantNode(child, depth + 1));
+                if (ReferenceEquals(child, sector))
+                {
+                    if (includeSelf)
+                    {
+                        var selfText = LeafText(FormatSectorText(child));
+                        node.Nodes.Add(new TreeNode(selfText) { NodeFont = node.NodeFont, ToolTipText = selfText });
+                    }
+
+                    continue;
+                }
+
+                var childNode = BuildRequestDescendantNode(child, request, direction, depth + 1);
+                if (childNode != null)
+                    node.Nodes.Add(childNode);
             }
         }
+
+        if (!includeSelf && node.Nodes.Count == 0)
+            return null;
 
         ApplySectorNodeText(node, FormatSectorText(sector));
         return node;
     }
 
+    bool RequestCoversSector(SectorsVolumes.Sector sector, SectorChangeRequest request, RequestListDirection direction)
+    {
+        if (direction == RequestListDirection.Incoming)
+            return _tracker.IsMine(sector);
+
+        return _tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner)
+               && string.Equals(owner.Callsign, request.Controller, StringComparison.OrdinalIgnoreCase);
+    }
+
     // The single "request state changed" notification point - called after every rebuild of
     // Requested Changes, every selection change in it, and every Accept/Reject/connectivity change,
     // so the two buttons can never show enabled for something they would actually refuse to act on.
-    // Accept only ever means something for an incoming request; Reject covers both directions (see
-    // RejectSelectedRequestAsync) so it enables for either category, as long as a real request - not
-    // a placeholder row or a not-yet-applied staged one - is what's actually selected.
+    // Accept means either one incoming request or the incoming heading's whole batch. Reject covers
+    // both directions (see RejectSelectedRequestAsync) so it enables for either category, as long
+    // as a real request - not a placeholder row or a not-yet-applied staged one - is selected.
     void UpdateRequestActionButtons()
     {
         var selected = _requestedChangesView.SelectedNode;
-        var requestsActionable = !_requestActionRunning && Network.IsConnected;
+        var requestsActionable = !_requestActionRunning && !_applyRunning && Network.IsConnected;
         var category = CategoryNameOf(selected);
 
         _acceptButton.Visible = !IsObserver;
@@ -3023,9 +3090,8 @@ public class OzServerSectorsWindow : BaseForm
     //   - the "Requested From Me" header  -> every incoming request, accepted as one batch
     //   - a request row (or any of the informational sub-sector rows under it) -> just that one
     //   - anything else (an outgoing request, the empty placeholder) -> nothing, Accept greyed out
-    // Takes the node explicitly rather than reading the selection, because the headings this can
-    // act on are no longer selectable - right-clicking "Requested From Me" is now the only way to
-    // reach the accept-everything gesture, and a right click does not move the selection.
+    // Takes the node explicitly rather than reading the selection so the heading and row paths both
+    // resolve through the same Accept button logic.
     static List<SectorChangeRequest> GetRequestsToAccept(TreeNode? selected)
     {
         if (selected == null)
@@ -3093,7 +3159,7 @@ public class OzServerSectorsWindow : BaseForm
         // so no failure is reported, and RefreshRequestedChangesAsync bails out before reaching
         // PopulateRequestedChanges - which is what would have called UpdateRequestActionButtons.
         // The buttons stayed greyed out until the next successful poll after reconnecting.
-        if (!Network.IsConnected || _requestActionRunning)
+        if (!Network.IsConnected || _requestActionRunning || _applyRunning)
             return;
 
         _requestActionRunning = true;
@@ -3130,7 +3196,7 @@ public class OzServerSectorsWindow : BaseForm
 
     async Task RejectRequestAsync(SectorChangeRequest request)
     {
-        if (!Network.IsConnected || _requestActionRunning)
+        if (!Network.IsConnected || _requestActionRunning || _applyRunning)
             return;
 
         _requestActionRunning = true;
@@ -3157,7 +3223,7 @@ public class OzServerSectorsWindow : BaseForm
 
     async Task CancelRequestAsync(SectorChangeRequest request)
     {
-        if (!Network.IsConnected || _requestActionRunning)
+        if (!Network.IsConnected || _requestActionRunning || _applyRunning)
             return;
 
         _requestActionRunning = true;

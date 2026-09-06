@@ -95,7 +95,7 @@ public class OzServerOwnershipTracker
     // decision, or owes one. That is exactly the window where reflection latency is felt, and it is
     // short-lived, so it costs nothing the rest of the time. Without it, being told your request was
     // accepted took up to ten seconds with the Sectors window closed.
-    static readonly TimeSpan PendingPollInterval = TimeSpan.FromSeconds(2);
+    static readonly TimeSpan PendingPollInterval = TimeSpan.FromSeconds(1);
 
     public event EventHandler? OwnedChanged;
     // Raised after every successful refresh, whether or not anything changed.
@@ -269,7 +269,7 @@ public class OzServerOwnershipTracker
         // A "sectors" signal covers ownership *and* requests: RefreshFromServerIfIdleAsync reads
         // /sectors/sync, which returns owned, controlled and requests together, so one signal
         // answers all three - including the incoming request that drives the popup. Previously
-        // that popup waited on a 10s poll tick (2s once a handoff was already in flight).
+        // that popup waited on a poll tick (1s once a handoff is already in flight).
         OzServerEventStream.Shared.EventReceived += name =>
         {
             if (name != "sectors" || !Network.IsConnected)
@@ -790,27 +790,16 @@ public class OzServerOwnershipTracker
         // NOT switch its VSCS line to Transmit - issue #5. Forcing Transmit on put the controller on
         // a frequency they never asked to be on, as a side effect of accepting a request; whether to
         // actually talk on a sector is theirs to decide, and the VSCS panel is where they decide it.
-        // Losing a sector still drops its line to Idle below, which is cleanup of something this
-        // plugin is giving up rather than something it is taking on the controller's behalf.
         foreach (var sector in gained)
         {
             if (!mmiSectors.Any(s => s.Equals(sector)))
                 mmiSectors.Add(sector);
         }
 
-        foreach (var sector in lost)
-        {
-            mmiSectors.RemoveAll(s => s.Equals(sector));
-
-            var freq = Audio.VSCSFrequencies.FirstOrDefault(f => f.Name == sector.Callsign);
-            if (freq is { Transmit: true })
-                freq.Transmit = false;
-        }
-
-        // MMI.SectorsControlled has to already include the gained sector (and already exclude the
-        // lost one) before OwnershipChanged fires below. SectorTagHandoff's accept path -
-        // MMI.AcceptJurisdiction -> FDP2.AcceptJurisdiction -> MMI.SetTrackState - decides
-        // Jurisdiction vs. a demoted state (Announced/Preactive/NonJurisdiction) by checking
+        // Pushed to MMI *before* OwnershipChanged fires below, with the lost sectors still in the
+        // list - not removed yet, see the second call further down for why. SectorTagHandoff's
+        // accept path - MMI.AcceptJurisdiction -> FDP2.AcceptJurisdiction -> MMI.SetTrackState -
+        // decides Jurisdiction vs. a demoted state (Announced/Preactive/NonJurisdiction) by checking
         // MMI.SectorsControlled.Contains(fdr.ControllingSector) at the exact moment it runs.
         //
         // Firing the event first - as this used to - let that check run against the sector list from
@@ -825,9 +814,41 @@ public class OzServerOwnershipTracker
         //
         // Updating MMI first removes the race entirely: every SetTrackState call SectorTagHandoff's
         // accept can trigger already sees the correct sector list on its first try.
-        MMI.SetControlledSectors(mmiSectors);
+        if (gained.Count > 0)
+            MMI.SetControlledSectors(mmiSectors.ToList());
 
+        // GiveAway (lost) and the accept sweep (gained) both run here, against MMI.SectorsControlled
+        // as it stands right now: the gained sector already added above, the lost ones deliberately
+        // still present - not yet removed, on purpose. See the second MMI.SetControlledSectors call
+        // below for why removing them first would silently cancel every handoff this is about to
+        // make.
         OwnershipChanged?.Invoke(this, diff);
+
+        // Only now are the lost sectors actually taken out of MMI, once GiveAway (just above) has
+        // had its chance to hand off whatever it holds inside them. Removing them any earlier - as
+        // this used to, in the same call as adding the gained ones - handed MMI.SetControlledSectors
+        // a list that no longer contained a sector this session still had a tracked aircraft
+        // sitting under, and that method's own cleanup (drops to uncontrolled anything whose
+        // ControllingSector was in the old list and isn't in the new one, checked purely against
+        // ControllingSector/IsTrackedByMe, with no idea an aircraft is mid-handoff) ran before
+        // GiveAway ever got a chance to touch it - matching a real FDR ending up flown with nobody
+        // working it, mid-transfer, with GiveAway's own log innocently reporting "no tags of ours
+        // inside it" because vatSys had already stopped tracking it by the time GiveAway checked.
+        // GiveAway itself also reassigns ControllingSector to the new owner the moment it hands an
+        // aircraft off (see its own comment), which is what keeps this second call from re-catching
+        // the same aircraft on its way out: by now ControllingSector points at the new owner's
+        // sector, which was never in this session's own list to begin with.
+        foreach (var sector in lost)
+        {
+            mmiSectors.RemoveAll(s => s.Equals(sector));
+
+            var freq = Audio.VSCSFrequencies.FirstOrDefault(f => f.Name == sector.Callsign);
+            if (freq is { Transmit: true })
+                freq.Transmit = false;
+        }
+
+        if (lost.Count > 0)
+            MMI.SetControlledSectors(mmiSectors);
     }
 
     // Whether this session is actually connected as ATC, not merely a connection that happens to
