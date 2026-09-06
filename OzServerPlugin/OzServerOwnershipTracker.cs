@@ -780,8 +780,6 @@ public class OzServerOwnershipTracker
             diff.Lost.Add(new SectorTransfer(sector,
                 _controlled.TryGetValue(sector.Name, out var has) ? has : null));
 
-        OwnershipChanged?.Invoke(this, diff);
-
         var mmiSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
         // Gaining a sector adds it to MMI (so the airspace and its tags appear) but deliberately does
@@ -805,7 +803,27 @@ public class OzServerOwnershipTracker
                 freq.Transmit = false;
         }
 
+        // MMI.SectorsControlled has to already include the gained sector (and already exclude the
+        // lost one) before OwnershipChanged fires below. SectorTagHandoff's accept path -
+        // MMI.AcceptJurisdiction -> FDP2.AcceptJurisdiction -> MMI.SetTrackState - decides
+        // Jurisdiction vs. a demoted state (Announced/Preactive/NonJurisdiction) by checking
+        // MMI.SectorsControlled.Contains(fdr.ControllingSector) at the exact moment it runs.
+        //
+        // Firing the event first - as this used to - let that check run against the sector list from
+        // before this gain, so a just-accepted tag could be computed as Announced instead of
+        // Jurisdiction despite AcceptTransfer itself logging success, because all it actually checks
+        // is fdr.State (STATE_CONTROLLED), never the track state SetTrackState wrote. vatSys does
+        // reassert every FDR's track state again at the end of MMI.SetControlledSectors, which is why
+        // this was intermittent rather than universal - but if a track had a PostJurisdiction timer
+        // still armed from an earlier handoff (20s, see vatSys's own PostJurisdictionTimeout), that
+        // reassert is skipped too and the demoted state stuck until the timer elapsed - exactly "came
+        // back jurisdiction initially but then switched to Announced", needing a manual accept.
+        //
+        // Updating MMI first removes the race entirely: every SetTrackState call SectorTagHandoff's
+        // accept can trigger already sees the correct sector list on its first try.
         MMI.SetControlledSectors(mmiSectors);
+
+        OwnershipChanged?.Invoke(this, diff);
     }
 
     // Whether this session is actually connected as ATC, not merely a connection that happens to
