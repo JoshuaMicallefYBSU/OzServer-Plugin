@@ -282,6 +282,27 @@ public class SectorTagHandoff
                 continue;
 
             MMI.HandoffJurisdiction(fdr, toSector);
+
+            // Reassigned immediately, not left for the real PDUHandoffAccept round trip to set it
+            // (which is what FDP2.Handoff itself does - it only touches State and HandoffSector,
+            // never ControllingSector; that field is normally left exactly where it was until
+            // ProcessHandoffAccepted moves it, seconds later, once the round trip completes).
+            //
+            // This runs from OnOwnershipChanged, which ReconcileMmiWithOwned fires synchronously
+            // right before it calls MMI.SetControlledSectors to actually drop this sector from
+            // SectorsControlled - and THAT method's own internal cleanup hands off to nobody any FDR
+            // whose ControllingSector was in the old list and isn't in the new one, checked purely
+            // against ControllingSector/IsTrackedByMe, with no idea that fdr.State just became
+            // STATE_HANDOVER a moment ago. Left at the old sector, it matches that cleanup and gets
+            // dropped from the network outright (Network.StopTracking) - cancelling the very handoff
+            // this loop just initiated, before the aircraft had any real chance to reach the
+            // controller it was being given to. Reassigning it here, to the sector the receiving
+            // controller is actually working, means SetControlledSectors' own check no longer
+            // matches (that sector was never in this session's own list to begin with), so its
+            // cleanup leaves this aircraft alone. ProcessHandoffAccepted resolves to the same sector
+            // once the real accept arrives, so this is only ever redundant with it, never in conflict.
+            fdr.ControllingSector = toSector;
+
             moved.Add(fdr.Callsign);
         }
 
