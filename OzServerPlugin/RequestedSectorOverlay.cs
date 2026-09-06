@@ -55,13 +55,23 @@ public class RequestedSectorOverlay
 
     public void SetRequested(IReadOnlyList<SectorsVolumes.Sector> sectors)
     {
-        // Shaded as the whole group, not just the sector named in the request. Accepting a request
-        // for BLA hands over ELW and the Melbourne Approach sectors as well - the backend resolves
-        // the transfer through the same responsible-sectors chain a claim expands through - so
-        // shading BLA alone showed the controller a fraction of the airspace they were being asked
-        // to give up.
+        // Shaded to what would actually move, not the whole responsible-sectors group the named
+        // sector expands through. That WAS the whole group once - accepting a request for BLA handed
+        // over ELW and the Melbourne Approach sectors right along with it, because the backend's own
+        // transfer did the same undiscriminating expansion, and shading BLA alone would have shown
+        // only a fraction of the airspace actually at risk.
+        //
+        // It no longer works that way (see transferRequest/covered's own "only what the accepting
+        // controller actually holds" fix): a sector someone else is already working - staffed,
+        // running this plugin or not - stays with them, and only what THIS controller actually owns
+        // among the covered set would ever move. Still shading the old, wider group here kept this
+        // overlay telling the controller a request covered airspace that had not been at risk since
+        // that fix landed - MAE and MAV highlighted, and looking taken, for a BLA request while a
+        // controller was sitting on them the entire time. IsMine narrows it to what is actually
+        // being asked for, the same filter the backend itself now applies.
         _requested = sectors
             .SelectMany(PrimaryPosition.CoveredBy)
+            .Where(_tracker.IsMine)
             .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
             .Select(group => group.First())
             .ToList();
