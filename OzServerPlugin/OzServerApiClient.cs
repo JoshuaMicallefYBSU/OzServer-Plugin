@@ -445,6 +445,24 @@ public class OzServerApiClient
     public Task UpdateFdrBatchAsync(IEnumerable<OzServerFdrUpdateDto> flights) =>
         PostAsync("/fdr/batch", new { flights = flights.ToArray() });
 
+    // One flight's current server-side record - see SectorTagHandoff.AcceptTransfer, which is the
+    // only caller: accepting jurisdiction moves who is tracking a tag, never any of vatSys's own
+    // local FDR fields, so the clearance data (CFL in particular) a previous controller already
+    // entered has to be fetched and applied by hand rather than arriving for free. Null on a 404 -
+    // no record yet is an ordinary, expected case (a tag nobody has pushed anything for), not a
+    // failure worth throwing over.
+    public async Task<OzServerFdrUpdateDto?> GetFlightAsync(string callsign)
+    {
+        try
+        {
+            return await GetAsync<OzServerFdrUpdateDto?>($"/fdr/{Uri.EscapeDataString(callsign)}", () => null);
+        }
+        catch (OzServerApiException ex) when (ex.StatusCode == 404)
+        {
+            return null;
+        }
+    }
+
     // Shared markup (issue #9). Every controller reads the whole set: it is a few dozen small
     // shapes, all of it is needed to draw anything, and an area filter would have to be recomputed
     // on every pan and zoom.

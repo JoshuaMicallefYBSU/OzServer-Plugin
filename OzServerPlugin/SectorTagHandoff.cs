@@ -79,6 +79,7 @@ public class SectorTagHandoff
 
     readonly OzServerOwnershipTracker _tracker;
     readonly FdrSync _fdrSync;
+    readonly OzServerApiClient _api = new();
     readonly object _lock = new();
 
     // Sectors just taken from someone, and who from.
@@ -368,13 +369,21 @@ public class SectorTagHandoff
                 .Where(pending => SectorLocator.Resolve(fdr, new[] { pending.Sector }) != null)
                 .ToList();
 
+            // Deliberately requires a positive identity match - who actually sent this handoff -
+            // against who OzServer says this sector was gained from. There used to be a fallback
+            // here that trusted geometry alone whenever exactly one transfer was pending and the
+            // sender couldn't be identified (HandoffFrom returning null), on the reasoning that no
+            // other pending sector could explain it. In practice that let an ordinary, deliberate
+            // handoff from any controller auto-accept the instant it landed inside a sector this
+            // session had recently gained from *someone*, without ever checking it came from that
+            // same someone - "tags being auto accepted should only happen during sector changes",
+            // not merely because an aircraft happens to be inside one. An unmatched handoff still
+            // flashes for the controller to accept by hand, same as an unrecognized sender always
+            // has - see the "not part of a transfer" branch below.
             match = string.IsNullOrEmpty(from)
-                ? geometryMatches.Count == 1 ? geometryMatches[0] : null
+                ? null
                 : geometryMatches.FirstOrDefault(pending =>
                     string.Equals(pending.FromCallsign, from, StringComparison.OrdinalIgnoreCase));
-
-            if (match != null && string.IsNullOrEmpty(from))
-                from = match.FromCallsign;
         }
 
         // Not part of a transfer - somebody handed this over deliberately, so it stays flashing for
@@ -564,6 +573,7 @@ public class SectorTagHandoff
             _confirming[fdr.Callsign] = new PendingConfirmation(mine);
 
         _fdrSync.PushNow(fdr);
+        _ = ApplyClearanceDataAsync(fdr);
 
         ActionLog.Log("Tag", $"Accepted {fdr.Callsign} with {match.Sector.Name} from {from}, no flash", new
         {
@@ -587,6 +597,64 @@ public class SectorTagHandoff
                 controlling_sector = fdr.ControllingSector?.Name
             }
         });
+    }
+
+    // Applies the previous controller's clearance data - CFL in particular - onto a tag just
+    // accepted. Fire-and-forget from AcceptTransfer rather than awaited inline: the jurisdiction
+    // accept there is timing-sensitive (see ReassertConfirmations, which starts fighting for it
+    // immediately) and must not wait on a network round trip, whereas a CFL landing a few hundred
+    // milliseconds after the tag itself is not something a controller would ever notice. Accepting
+    // jurisdiction only ever moves who is tracking a tag - none of vatSys's own local FDR fields -
+    // so without this the new controller's screen simply shows no CFL at all until they enter one
+    // themselves, even though OzServer's own record of it survived the transfer intact.
+    async System.Threading.Tasks.Task ApplyClearanceDataAsync(FDP2.FDR fdr)
+    {
+        OzServerFdrUpdateDto? flight;
+
+        try
+        {
+            flight = await _api.GetFlightAsync(fdr.Callsign);
+        }
+        catch (Exception ex)
+        {
+            Errors.Add(new Exception($"Couldn't fetch clearance data for {fdr.Callsign}: {ex.Message}", ex), "OzServer");
+            return;
+        }
+
+        if (flight == null)
+            return;
+
+        // Still ours - a tag handed off again, or dropped, in the time this round trip took is not
+        // something to write clearance data onto after the fact.
+        if (!fdr.IsTrackedByMe)
+            return;
+
+        var changed = false;
+
+        if (flight.CflLower is { } lower && fdr.CFLLower != lower)
+        {
+            fdr.CFLLower = lower;
+            changed = true;
+        }
+
+        if (flight.CflUpper is { } upper && fdr.CFLUpper != upper)
+        {
+            fdr.CFLUpper = upper;
+            changed = true;
+        }
+
+        if (!changed)
+            return;
+
+        ActionLog.Log("Tag", $"Applied clearance data to {fdr.Callsign} from OzServer (CFL {flight.CflLower?.ToString() ?? "-"}/{flight.CflUpper?.ToString() ?? "-"})", new
+        {
+            action = "handoff_cfl_applied",
+            fdr_callsign = fdr.Callsign,
+            cfl_lower = flight.CflLower,
+            cfl_upper = flight.CflUpper
+        });
+
+        _fdrSync.PushNow(fdr);
     }
 
     object[] PendingTransferContext()
