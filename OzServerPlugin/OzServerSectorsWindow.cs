@@ -218,7 +218,6 @@ public class OzServerSectorsWindow : BaseForm
             NetworkServer.Live => "Live VATSIM",
             NetworkServer.SweatBox1 => "SweatBox 1",
             NetworkServer.SweatBox2 => "SweatBox 2",
-            NetworkServer.NewSweatBox => "LocalHost",
             _ => null
         };
         Text = label == null ? BaseTitle : $"{BaseTitle} — {label}";
