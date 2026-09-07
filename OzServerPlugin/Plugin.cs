@@ -178,10 +178,10 @@ public class Plugin : IPlugin
 
                 NotificationSound.PlayRequestArrived();
 
-                // SetRevealed as well as SetRequested: nothing is drawn until the window opens, and
+                // SetRevealed as well as SetIncoming: nothing is drawn until the window opens, and
                 // this is standing in for that having happened.
                 var sectors = DebugHighlightSectors();
-                _requestedSectorOverlay.SetRequested(sectors);
+                _requestedSectorOverlay.SetIncoming(sectors);
                 _requestedSectorOverlay.SetRevealed(true);
 
                 ActionLog.Log("Debug", $"highlighting {string.Join(", ", sectors.Select(s => s.Name))}");

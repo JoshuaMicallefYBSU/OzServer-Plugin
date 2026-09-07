@@ -1149,6 +1149,31 @@ public class OzServerSectorsWindow : BaseForm
         e.Graphics.Clear(background);
         TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, foreground);
 
+        // The Requested By/From Me headings each carry a small swatch of the colour their half of
+        // the list is shaded on the scope with - see RequestedSectorOverlay, which is the only
+        // place IncomingColour/OutgoingColour are actually defined, so the legend can't drift from
+        // the highlight it describes. Drawn after the text, in the same clip, at a fixed offset past
+        // it - both headings are short, fixed strings, so there is always room in a window this wide.
+        if (IsCategoryNode(e.Node) && (e.Node.Text == RequestedByMeName || e.Node.Text == RequestedFromMeName))
+        {
+            var swatchColour = e.Node.Text == RequestedByMeName
+                ? RequestedSectorOverlay.OutgoingColour
+                : RequestedSectorOverlay.IncomingColour;
+
+            var textWidth = TextRenderer.MeasureText(e.Graphics, e.Node.Text, e.Node.NodeFont).Width;
+            const int swatchSize = 10;
+            const int swatchGap = 8;
+            var swatchRect = new Rectangle(
+                e.Node.Bounds.Left + textWidth + swatchGap,
+                e.Node.Bounds.Top + (e.Node.Bounds.Height - swatchSize) / 2,
+                swatchSize, swatchSize);
+
+            using var swatchBrush = new SolidBrush(swatchColour);
+            e.Graphics.FillRectangle(swatchBrush, swatchRect);
+            using var swatchPen = new Pen(Color.FromArgb(180, Color.Black));
+            e.Graphics.DrawRectangle(swatchPen, swatchRect);
+        }
+
         e.Graphics.Clip = previousClip;
     }
 
