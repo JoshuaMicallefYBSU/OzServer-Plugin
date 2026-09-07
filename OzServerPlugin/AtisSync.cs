@@ -12,9 +12,9 @@ namespace OzServerPlugin;
 //
 // Deliberately push-on-change only, subscribed straight to vatsys.ATIS.Updated (which fires from
 // UpdateATIS/UpdateATISNoTTS on a real content/letter change, and from DeleteATIS when the ATIS is
-// torn down) - no periodic heartbeat. The backend's own staleness rule (90 minutes since the last
-// push - see PruneStaleAtisJob) is what ages an abandoned entry out, not a liveness ping, so there is
-// nothing to send here beyond "the content changed to this".
+// torn down) - no periodic heartbeat. The backend's own staleness rule (60 minutes since the last
+// push - see OzServer-API's runMaintenance/ATIS_RETAIN_MINUTES) is what ages an abandoned entry out,
+// not a liveness ping, so there is nothing to send here beyond "the content changed to this".
 //
 // Only vatsys.ATIS itself (slot 0) is covered. The SDK's other 3 ATIS slots (vatsys.Network.
 // ConnectATIS/DisconnectATIS/UpdateATIS(atisIndex, ...)) are a separate public API meant for a

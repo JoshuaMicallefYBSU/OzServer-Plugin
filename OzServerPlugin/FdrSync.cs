@@ -23,7 +23,7 @@ namespace OzServerPlugin;
 // safe to just trust and forward as-is, and FlightDataRecordController::upsert (backend) for what
 // actually happens with it. A row nothing has pushed to in 10 minutes - the natural backend
 // counterpart to a controller simply no longer pushing anything once they've let go of a flight - is
-// dropped server-side; that's a backend-only follow-up (same precedent as the existing 90-minute
+// dropped server-side; that's a backend-only follow-up (same precedent as the existing 60-minute
 // ATIS TTL - see AtisSync/README), not implemented in this repo.
 //
 // Also reports current_sector (see FillCurrentSector) - the real geographic subsector the aircraft

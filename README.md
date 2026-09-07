@@ -165,7 +165,7 @@ entry in the vatSys error log) if it fails.
 
 **Note for backend maintainers:** since a flight is now only ever pushed to while a controller
 actually holds it (see Tag ownership / Flight data above), a row nothing has pushed to in 10 minutes
-is stale and safe to drop server-side — the same precedent as the existing 90-minute ATIS TTL. Not
+is stale and safe to drop server-side — the same precedent as the existing 60-minute ATIS TTL. Not
 implemented in this repo; there is no backend code here to implement it in.
 
 Every `/fdr`, `/fdr/batch` push now also sends `current_sector` (nullable string) — the *name* of the
@@ -314,7 +314,7 @@ All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` at
 | `POST /sector-requests/{id}/accept`, `/reject`, `/cancel` | Single-request actions |
 | `POST /sector-requests/{id}/acknowledge-rejection` | Confirms a denial has been shown to the requester, which is what finally deletes it |
 | `POST /fdr`, `POST /fdr/batch` | Flight data upserts, keyed by callsign |
-| `POST /atis` | ATIS upsert, keyed by ICAO; dropped 90 minutes after the last update |
+| `POST /atis` | ATIS upsert, keyed by ICAO; dropped 60 minutes after the last update |
 
 ### Timings
 
