@@ -206,12 +206,39 @@ public class OzServerSectorsWindow : BaseForm
     readonly TreeViewEx _requestedChangesView;
     readonly FlowLayoutPanel _requestedChangesPanel;
 
+    // Base window title; suffixed with the connected server (see UpdateTitleForServer) so a
+    // controller cannot mistake a SweatBox/LocalHost session for the real network at a glance -
+    // the one thing on screen most likely to be trusted without a second thought.
+    const string BaseTitle = "OzServer - Sector Configuration Window";
+
+    void UpdateTitleForServer()
+    {
+        var label = NetworkServer.Current switch
+        {
+            NetworkServer.Live => "Live VATSIM",
+            NetworkServer.SweatBox1 => "SweatBox 1",
+            NetworkServer.SweatBox2 => "SweatBox 2",
+            NetworkServer.NewSweatBox => "LocalHost",
+            _ => null
+        };
+        Text = label == null ? BaseTitle : $"{BaseTitle} — {label}";
+    }
+
     public OzServerSectorsWindow(OzServerOwnershipTracker tracker, PendingSectorGhosts ghosts)
     {
         _ghosts = ghosts;
         _tracker = tracker;
-        Text = "OzServer - Sector Configuration Window";
+        Text = BaseTitle;
         Name = nameof(OzServerSectorsWindow);
+        // This window is constructed once at plugin load and reused for the life of the session
+        // (HideOnClose, below) - long before Network.IsConnected is ever true, so the Text set just
+        // above is a placeholder. UpdateTitleForServer runs it for real on every connect - marshalled
+        // like every other tracker/network event this window reacts to (see RunOnUiThread, below),
+        // since Network.Connected can fire off the UI thread - and again directly here in case this
+        // constructor ever runs after a connection already exists (safe unmarshalled: construction
+        // itself always happens on the UI thread).
+        Network.Connected += (_, _) => RunOnUiThread(UpdateTitleForServer);
+        UpdateTitleForServer();
         KeyPreview = true;
         MiddleClickClose = false;
         HasCloseButton = true;

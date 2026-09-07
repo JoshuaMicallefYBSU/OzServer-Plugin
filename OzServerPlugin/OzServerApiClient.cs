@@ -280,8 +280,10 @@ public class OzServerAtisUpdateDto
 }
 
 // Talks to the OzServer backend's sector-ownership API. Every call attaches this vatSys session's
-// CID and callsign, which the API uses as the controller identity without waiting for the lagging
-// VATSIM datafeed. No shared credential is compiled into or sent by the plugin.
+// CID, callsign and connected server (NetworkServer.Current - live/sb1/sb2/newsb), which the API
+// uses as the controller identity without waiting for the lagging VATSIM datafeed, and to keep
+// this session's data fully isolated from the other 3 environments. No shared credential is
+// compiled into or sent by the plugin.
 public class OzServerApiClient
 {
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
@@ -486,8 +488,8 @@ public class OzServerApiClient
 
     async Task<T> GetAsync<T>(string path, Func<T> empty)
     {
-        var (cid, callsign) = GetCredentials();
-        var url = $"{OzServerSettings.BaseUrl}/api/v1{path}?controller_cid={cid}&controller_callsign={Uri.EscapeDataString(callsign)}";
+        var (cid, callsign, server) = GetCredentials();
+        var url = $"{OzServerSettings.BaseUrl}/api/v1{path}?controller_cid={cid}&controller_callsign={Uri.EscapeDataString(callsign)}&server={Uri.EscapeDataString(server)}";
 
         HttpResponseMessage response;
         try
@@ -530,18 +532,19 @@ public class OzServerApiClient
         return JsonConvert.DeserializeObject<T>(body) ?? throw new OzServerApiException("Empty response from OzServer.");
     }
 
-    // body's own fields (if any) are serialized first, then controller_cid/controller_callsign are
-    // merged in on top via JObject rather than requiring every DTO to carry those two fields
-    // itself - every endpoint attaches this session's own identity the same way regardless of what,
-    // if anything, else is in the request.
+    // body's own fields (if any) are serialized first, then controller_cid/controller_callsign/
+    // server are merged in on top via JObject rather than requiring every DTO to carry those
+    // fields itself - every endpoint attaches this session's own identity the same way regardless
+    // of what, if anything, else is in the request.
     async Task PostAsync(string path, object body) => await PostRawAsync(path, body).ConfigureAwait(false);
 
     async Task<string> PostRawAsync(string path, object? requestBody = null)
     {
-        var (cid, callsign) = GetCredentials();
+        var (cid, callsign, server) = GetCredentials();
         var json = requestBody != null ? JObject.FromObject(requestBody, BodySerializer) : new JObject();
         json["controller_cid"] = cid;
         json["controller_callsign"] = callsign;
+        json["server"] = server;
         var payload = json.ToString(Formatting.None);
 
         HttpResponseMessage response;
@@ -600,7 +603,12 @@ public class OzServerApiClient
         return ($"OzServer request failed (HTTP {statusCode}): {snippet}", new List<OzServerSectorConflictDto>());
     }
 
-    static (int Cid, string Callsign) GetCredentials() =>
-        NetworkIdentity.Current
-        ?? throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
+    static (int Cid, string Callsign, string Server) GetCredentials()
+    {
+        var identity = NetworkIdentity.Current
+            ?? throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
+        var server = NetworkServer.Current
+            ?? throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
+        return (identity.Cid, identity.Callsign, server);
+    }
 }
