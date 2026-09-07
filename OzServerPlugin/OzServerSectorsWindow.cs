@@ -175,6 +175,10 @@ public class OzServerSectorsWindow : BaseForm
     // Shows the aircraft a staged request would bring with it. The window owns the staged set, so
     // it is the only place that can say when it changes.
     readonly PendingSectorGhosts _ghosts;
+    // Shows, on the scope, the sectors a staged claim or staged request would bring - the sector-
+    // boundary counterpart to _ghosts above, told about staging changes at the same single place
+    // (RefreshStagedHighlight) for the same reason: the window owns the staged set.
+    readonly RequestedSectorOverlay _overlay;
     bool _applyRunning;
 
     readonly TableLayoutPanel _tableLayoutPanel1;
@@ -223,9 +227,10 @@ public class OzServerSectorsWindow : BaseForm
         Text = label == null ? BaseTitle : $"{BaseTitle} — {label}";
     }
 
-    public OzServerSectorsWindow(OzServerOwnershipTracker tracker, PendingSectorGhosts ghosts)
+    public OzServerSectorsWindow(OzServerOwnershipTracker tracker, PendingSectorGhosts ghosts, RequestedSectorOverlay overlay)
     {
         _ghosts = ghosts;
+        _overlay = overlay;
         _tracker = tracker;
         Text = BaseTitle;
         Name = nameof(OzServerSectorsWindow);
@@ -1149,11 +1154,17 @@ public class OzServerSectorsWindow : BaseForm
         e.Graphics.Clear(background);
         TextRenderer.DrawText(e.Graphics, e.Node.Text, e.Node.NodeFont, e.Node.Bounds, foreground);
 
+        e.Graphics.Clip = previousClip;
+
         // The Requested By/From Me headings each carry a small swatch of the colour their half of
         // the list is shaded on the scope with - see RequestedSectorOverlay, which is the only
         // place IncomingColour/OutgoingColour are actually defined, so the legend can't drift from
-        // the highlight it describes. Drawn after the text, in the same clip, at a fixed offset past
-        // it - both headings are short, fixed strings, so there is always room in a window this wide.
+        // the highlight it describes. Drawn after the clip above is restored, not inside it: for an
+        // unselected row (the only state either heading is ever in - see TreeView_BeforeSelect,
+        // headings aren't selectable) fill/clip is e.Bounds, which under OwnerDrawText is just the
+        // text's own bounding box - a swatch positioned past the end of that text draws into a
+        // region the clip has already excluded and never actually appears, which is exactly what
+        // drawing it before this line did.
         if (IsCategoryNode(e.Node) && (e.Node.Text == RequestedByMeName || e.Node.Text == RequestedFromMeName))
         {
             var swatchColour = e.Node.Text == RequestedByMeName
@@ -1173,8 +1184,6 @@ public class OzServerSectorsWindow : BaseForm
             using var swatchPen = new Pen(Color.FromArgb(180, Color.Black));
             e.Graphics.DrawRectangle(swatchPen, swatchRect);
         }
-
-        e.Graphics.Clip = previousClip;
     }
 
     // Group headers (Approach/Centre/.../Requested By Me/...) and primary-position sectors that
@@ -1631,9 +1640,19 @@ public class OzServerSectorsWindow : BaseForm
 
     void RefreshStagedHighlight()
     {
-        // Every staging change comes through here, so this is the one place the ghost preview has
-        // to be told - including Cancel and closing the window, which clear the staged set.
+        // Every staging change comes through here, so this is the one place the ghost preview - and
+        // the scope overlay below - have to be told, including Cancel and closing the window, which
+        // clear the staged set.
         _ghosts.SetStaged(_stagedRequests);
+
+        // Same "what Apply would actually claim" computation CommitSectorChangesAsync itself uses
+        // for toClaim - staged sectors not yet owned on the server. Kept in sync with that one
+        // deliberately: the overlay should never promise more than Apply is actually about to do.
+        var owned = _tracker.Owned.Where(s => !s.IsDummy);
+        var stagedClaims = _sectorsSelected.Where(s => !s.IsDummy && _stagedNames.Contains(s.Name))
+            .Where(s => !owned.Any(o => o.Name == s.Name))
+            .ToList();
+        _overlay.SetStaged(stagedClaims, _stagedRequests);
 
         _currSectorsView.Invalidate();
         _availSectorsView.Invalidate();

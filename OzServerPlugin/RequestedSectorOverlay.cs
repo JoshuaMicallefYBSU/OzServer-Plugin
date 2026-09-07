@@ -53,7 +53,16 @@ public class RequestedSectorOverlay
     // it. Tracked whether or not anything is on screen, so opening the window shows what is pending
     // right now rather than only what arrives afterwards.
     List<SectorsVolumes.Sector> _incoming = new();
-    List<SectorsVolumes.Sector> _outgoing = new();
+    // Outgoing is two lists, not one, because a sector becomes "mine, pending" in two different
+    // ways that the tracker cannot see the first of at all: staged in this window but not yet
+    // Applied (a claim about to be made, or a request about to be sent - see SetStaged, called from
+    // OzServerSectorsWindow.RefreshStagedHighlight, the same single place that already tells
+    // PendingSectorGhosts about staged requests), and confirmed - already sent, waiting on the
+    // other controller's Accept (SetOutgoing, driven by the tracker's own RequestsChanged). Both
+    // read as the same orange; Apply unions them so a request does not visibly flicker off and back
+    // on in the moment it moves from one list to the other.
+    List<SectorsVolumes.Sector> _stagedOutgoing = new();
+    List<SectorsVolumes.Sector> _confirmedOutgoing = new();
     bool _revealed;
 
     public RequestedSectorOverlay(OzServerOwnershipTracker tracker)
@@ -112,7 +121,7 @@ public class RequestedSectorOverlay
         // against its own TargetCid rather than the whole group it names - a covered sub-sector a
         // *different* controller happens to hold is never at risk from this request and should not
         // paint as if it were.
-        _outgoing = requests
+        _confirmedOutgoing = requests
             .Where(request => request.RejectedAt == null && request.Sector != null)
             .SelectMany(request =>
             {
@@ -124,6 +133,39 @@ public class RequestedSectorOverlay
                     : PrimaryPosition.CoveredBy(named)
                         .Where(covered => _tracker.OwnerOf(covered)?.Cid == request.TargetCid);
             })
+            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+
+        Apply();
+    }
+
+    // Staged, not-yet-Applied changes - the other source of "about to be mine". Two different kinds,
+    // both narrowed the same way their eventual real counterpart is:
+    //
+    //   stagedClaims   - about to be claimed outright. Expands through the full covered-sectors
+    //                    group with no ownership narrowing, same as a real claim takes the whole
+    //                    group unconditionally (claimGroup on the backend) rather than only what a
+    //                    single other controller happens to hold.
+    //   stagedRequests - about to be sent as a request. Narrowed to whichever covered sub-sectors
+    //                    the *named* sector's own current owner holds - there is no per-request
+    //                    TargetCid yet (nothing has been sent), so the owner of the sector actually
+    //                    staged stands in for it, which is exactly who Apply will address the real
+    //                    request to.
+    //
+    // Called from OzServerSectorsWindow.RefreshStagedHighlight, the single place every staging
+    // change already funnels through for PendingSectorGhosts' own staged-request preview.
+    public void SetStaged(IReadOnlyList<SectorsVolumes.Sector> stagedClaims, IReadOnlyList<SectorsVolumes.Sector> stagedRequests)
+    {
+        var claimed = stagedClaims.SelectMany(PrimaryPosition.CoveredBy);
+
+        var requested = stagedRequests.SelectMany(named =>
+        {
+            var owner = _tracker.OwnerOf(named)?.Cid;
+            return PrimaryPosition.CoveredBy(named).Where(covered => _tracker.OwnerOf(covered)?.Cid == owner);
+        });
+
+        _stagedOutgoing = claimed.Concat(requested)
             .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
             .Select(group => group.First())
             .ToList();
@@ -145,14 +187,20 @@ public class RequestedSectorOverlay
     public void Clear()
     {
         _incoming = new List<SectorsVolumes.Sector>();
-        _outgoing = new List<SectorsVolumes.Sector>();
+        _stagedOutgoing = new List<SectorsVolumes.Sector>();
+        _confirmedOutgoing = new List<SectorsVolumes.Sector>();
         Apply();
     }
 
     void Apply()
     {
         var incoming = _revealed ? _incoming : new List<SectorsVolumes.Sector>();
-        var outgoing = _revealed ? _outgoing : new List<SectorsVolumes.Sector>();
+        var outgoing = _revealed
+            ? _stagedOutgoing.Concat(_confirmedOutgoing)
+                .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToList()
+            : new List<SectorsVolumes.Sector>();
         var incomingPolygons = incoming.SelectMany(Boundaries).ToList();
         var outgoingPolygons = outgoing.SelectMany(Boundaries).ToList();
 
@@ -165,7 +213,7 @@ public class RequestedSectorOverlay
 
         ActionLog.Log("Overlay",
             incoming.Count == 0 && outgoing.Count == 0
-                ? $"highlight cleared ({_incoming.Count} incoming, {_outgoing.Count} outgoing pending, revealed={_revealed})"
+                ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing pending, revealed={_revealed})"
                 : $"{incoming.Count} incoming, {outgoing.Count} outgoing sector(s) highlighted"
                   + (incoming.Count > 0 ? $" - from me: {string.Join(", ", incoming.Select(s => s.Name))}" : "")
                   + (outgoing.Count > 0 ? $" - by me: {string.Join(", ", outgoing.Select(s => s.Name))}" : ""));

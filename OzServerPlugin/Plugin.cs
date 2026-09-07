@@ -434,7 +434,7 @@ public class Plugin : IPlugin
         // instance is reused (and its event subscriptions stay alive) for the plugin's lifetime.
         if (_sectorsWindow == null)
         {
-            _sectorsWindow = new OzServerSectorsWindow(_ownershipTracker, _pendingSectorGhosts);
+            _sectorsWindow = new OzServerSectorsWindow(_ownershipTracker, _pendingSectorGhosts, _requestedSectorOverlay);
 
             // What puts the requested sectors on the scope, and takes them off again. Hooked here
             // rather than inside the window so the window stays about managing sectors and knows
