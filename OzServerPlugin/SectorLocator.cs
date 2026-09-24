@@ -85,6 +85,16 @@ public static class SectorLocator
             .Where(candidate => !matches.Any(other => !other.Equals(candidate) && candidate.SubSectors.Any(sub => sub.Equals(other))))
             .ToList();
 
+        // Sector.IsInSector(point, -1) ignores every Volume's LowerLevel/UpperLevel entirely - it's
+        // vatSys's own "unknown altitude" behaviour, not something introduced here - so with no Mode
+        // C yet, two sub-sectors stacked at different levels over the same ground both match with
+        // nothing left to tell them apart (they aren't in a SubSectors relationship with each other,
+        // so the filter above doesn't collapse them). Guessing one is exactly what LiveTrack's own
+        // comment above already refuses to do for position; do the same for the sector it resolves
+        // to. A real Mode C return re-asks and resolves it properly.
+        if (level == -1 && mostSpecific.Count > 1)
+            return null;
+
         return mostSpecific.FirstOrDefault() ?? matches[0];
     }
 }

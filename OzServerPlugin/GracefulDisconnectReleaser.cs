@@ -13,11 +13,29 @@ namespace OzServerPlugin;
 // event. Network's own Error event, which would separate them, is internal to vatSys. So intent has
 // to be inferred from the two places a controller can actually express it:
 //
-//   - closing vatSys while still connected (the confirmation prompt vatSys shows), caught on
-//     MainForm.FormClosing;
 //   - pressing Disconnect, which can only happen with the Connect window open - so a disconnect
 //     arriving while that window is on screen was asked for, and one arriving with no Connect
-//     window in sight was not.
+//     window in sight was not;
+//   - closing vatSys while still connected and answering Yes to the "you're still connected,
+//     confirm you wish to exit?" prompt MainForm.mainForm_FormClosing shows. That method sets
+//     BaseForm.AppClosing = true (public get, so readable here) right before it calls
+//     Network.Instance.Disconnect() - the same flag its own recursive Close() call checks to skip
+//     re-prompting. Network.Disconnected fires synchronously, nested inside that Disconnect() call,
+//     so AppClosing is already true by the time it reaches us.
+//
+//     This used to hook MainForm.FormClosing directly instead. That doesn't work: vatSys wires its
+//     own FormClosing handler in MainForm's constructor, which runs long before this class ever
+//     gets a chance to subscribe, so vatSys's handler is always first in that event's invocation
+//     list and this class's was always second. By the time a second subscriber gets a turn,
+//     mainForm_FormClosing has already run to completion - including the Disconnect() call - so
+//     Network.IsConnected was already false and the release never fired. Worse, on a *cancelled*
+//     close (the confirm prompt answered No), mainForm_FormClosing leaves e.Cancel = true and
+//     returns without ever disconnecting - so the second FormClosing subscriber still ran, saw
+//     Network.IsConnected still true, and released the controller's sectors anyway, on a close they
+//     had just said not to do. Keying off AppClosing instead of FormClosing sidesteps both bugs:
+//     Network.Disconnected (and therefore this class) simply never fires at all unless
+//     Network.Instance.Disconnect() actually ran, which only happens once the exit is genuinely
+//     confirmed.
 //
 // Everything else is treated as ungraceful, deliberately: silence is what earns the retention
 // window on the backend (SectorOwnership::DISCONNECT_GRACE_MINUTES), so guessing "graceful" wrongly
@@ -35,54 +53,48 @@ public class GracefulDisconnectReleaser
     static readonly TimeSpan ShutdownReleaseTimeout = TimeSpan.FromSeconds(3);
 
     readonly OzServerApiClient _api = new();
-    bool _hookedMainForm;
 
     public GracefulDisconnectReleaser()
     {
-        Network.Disconnected += (_, _) => OnDisconnected();
-
-        // MainForm does not exist yet when the plugin is constructed - same deferral Plugin uses for
-        // its own menu wiring.
-        EventHandler? hookMainForm = null;
-        hookMainForm = (_, _) =>
-        {
-            if (_hookedMainForm || Application.OpenForms["MainForm"] is not Form mainForm)
-                return;
-
-            _hookedMainForm = true;
-            Application.Idle -= hookMainForm;
-            mainForm.FormClosing += (_, _) => ReleaseOnShutdown();
-        };
-        Application.Idle += hookMainForm;
+        // vatSys never installs a SynchronizationContext on its FSDSession, so Network.Connected/
+        // Disconnected genuinely fire off the UI thread for a real network drop (only a
+        // user-initiated disconnect - pressing the button, or confirming Close - happens to already
+        // be on it). RunOnUiThread below is what makes the Application.OpenForms/Form reads in
+        // OnDisconnected safe either way.
+        Network.Disconnected += (_, _) => RunOnUiThread(OnDisconnected);
     }
 
     void OnDisconnected()
     {
         // Still on screen means they are looking at it, which means they pressed the button on it.
         // A dropped connection does not open this window.
-        if (!IsConnectWindowOpen())
+        if (IsConnectWindowOpen())
+        {
+            _ = ReleaseAsync();
             return;
+        }
 
-        _ = ReleaseAsync();
+        // See the class comment: only true once MainForm's own FormClosing handler has committed to
+        // actually closing, which only happens after its "still connected, confirm exit?" prompt is
+        // answered Yes (or there was nothing to confirm).
+        if (BaseForm.AppClosing)
+            ReleaseBlocking();
     }
 
     static bool IsConnectWindowOpen() =>
         Application.OpenForms[ConnectWindowName] is { IsDisposed: false, Visible: true };
 
-    // Closing vatSys while connected is unambiguous - there is no reading of it where the controller
-    // means to keep the sectors.
-    void ReleaseOnShutdown()
+    // Blocking, unlike ReleaseAsync below: this runs synchronously inside
+    // Network.Instance.Disconnect(), itself called from MainForm's FormClosing handler before its
+    // own first await - so vatSys is already mid-shutdown by the time this fires, and a
+    // fire-and-forget POST here would just be killed mid-flight racing the process actually
+    // exiting, which would look to the backend exactly like a crash and hold the sectors for five
+    // minutes anyway. Safe to block here specifically: nothing is waiting on this thread to pump
+    // messages yet, and OzServerApiClient awaits with ConfigureAwait(false) throughout.
+    void ReleaseBlocking()
     {
-        if (!Network.IsConnected)
-            return;
-
         try
         {
-            // Blocking, unlike every other call in this plugin: the process is about to end, and a
-            // fire-and-forget POST would simply be killed mid-flight, which would look to the
-            // backend exactly like a crash and hold the sectors for five minutes. Safe to Wait on
-            // here specifically because OzServerApiClient awaits with ConfigureAwait(false)
-            // throughout, so nothing is waiting on this thread to pump messages.
             _api.ReleaseAllSectorsAsync().Wait(ShutdownReleaseTimeout);
         }
         catch (Exception ex)
@@ -103,5 +115,13 @@ public class GracefulDisconnectReleaser
         {
             Errors.Add(new Exception($"Couldn't release sectors on disconnect: {ex.Message}", ex), "OzServer");
         }
+    }
+
+    static void RunOnUiThread(Action action)
+    {
+        if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
+            mainForm.BeginInvoke(action);
+        else
+            action();
     }
 }

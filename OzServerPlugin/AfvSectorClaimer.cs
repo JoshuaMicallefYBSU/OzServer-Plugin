@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Windows.Forms;
 using vatsys;
 
 namespace OzServerPlugin;
@@ -44,7 +45,13 @@ public class AfvSectorClaimer
 
     public AfvSectorClaimer()
     {
-        Network.Connected += (_, _) => BeginInit();
+        // Network.Connected, Audio.VSCSFrequenciesChanged and the retry timer below all end up in
+        // MMI.SetControlledSectors, which touches vatSys's own map/UI state - and none of the three
+        // are guaranteed to fire on the UI thread (vatSys never installs a SynchronizationContext on
+        // its FSDSession, and a System.Threading.Timer callback is never the UI thread either).
+        // RunOnUiThread is what the sibling trackers (PrimaryPositionWatcher, ObserverPositionMirror)
+        // already do for the same reason.
+        Network.Connected += (_, _) => RunOnUiThread(BeginInit);
         // VSCSFrequenciesChanged re-baselines via Init() (not CheckActive() - see Init()'s own
         // comment for why) only when the primary callsign has actually changed since Init() last
         // ran, i.e. only for a genuine position change. Init() unconditionally resets
@@ -54,16 +61,24 @@ public class AfvSectorClaimer
         // sectors disappearing, until a later TransmitChanged happened to sweep them back in via
         // CheckActive()'s own full read of current Transmit state - which is why pressing transmit
         // on the new station appeared to "bring everything back").
-        Audio.VSCSFrequenciesChanged += (_, _) =>
+        Audio.VSCSFrequenciesChanged += (_, _) => RunOnUiThread(() =>
         {
             ResubscribeTransmitChanged();
 
             if (Network.Me?.Callsign != _lastPrimaryCallsign)
                 BeginInit();
-        };
+        });
         _initRetryTimer = new System.Threading.Timer(
-            _ => RetryInit(), null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+            _ => RunOnUiThread(RetryInit), null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
         ResubscribeTransmitChanged();
+    }
+
+    static void RunOnUiThread(Action action)
+    {
+        if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
+            mainForm.BeginInvoke(action);
+        else
+            action();
     }
 
     void BeginInit()

@@ -14,7 +14,10 @@ namespace OzServerPlugin;
 //
 //   Giving side  - lost a sector to someone. For each aircraft it holds inside that sector, calls
 //                  MMI.HandoffJurisdiction to the sector the new owner now has. That is vatSys's
-//                  own handoff, travelling over vatSys's own protocol; nothing is invented here.
+//                  own handoff, travelling over vatSys's own protocol - PROVIDED the new owner is
+//                  already visible in this client's own Network.OnlineATC. If they aren't yet
+//                  (see IsOnline/_deferred below), HandoffJurisdiction does something else entirely
+//                  and this class defers the real handoff instead of calling it.
 //
 //   Taking side  - gained a sector from someone. Watches for the handoffs that produces and accepts
 //                  them silently, the way TagResumeRecovery accepts a resumed tag.
@@ -68,6 +71,32 @@ namespace OzServerPlugin;
 // deliberately NOT reused here - it exists to lift an *untracked* resumed FDR over
 // MMI.AcceptJurisdiction's "State > 5" precondition, and applying it to a real inbound handoff
 // would overwrite state 9, repoint HandoffSector at the sender, and skip the acceptance PDU.
+//
+// ---------------------------------------------------------------------------------------------
+// What MMI.HandoffJurisdiction does when the new owner isn't visible yet
+//
+// From the vatSys IL, MMI::HandoffJurisdiction(FDR, Sector) only sends a real handoff PDU when the
+// target sector's own Callsign is found in Network.Instance.OnlineATC. If it isn't, it takes a
+// completely different branch instead: Network.Instance.StopTracking(fdr) - which broadcasts a
+// drop and sets ControllerTracking null - followed by a *local-only* FDP2.AcceptJurisdiction(fdr,
+// to). Since the aircraft is untracked at that point, that resolves fdr.State to
+// STATE_UNCONTROLLED - the aircraft is silently released to nobody, not handed to the new owner.
+//
+// Network.OnlineATC is populated from a periodic ATCPosition broadcast (Network.cs), not an
+// instant announcement on connect - PrimaryPositionWatcher and OzServerOwnershipTracker already
+// document this same lag ("VATSIM's own update cycle a few seconds") for the exact scenario most
+// likely to trigger it here: a controller logs on under a primary's callsign and OzServer moves
+// that primary's sectors to them immediately, but the *previous* holder's client can notice the
+// loss (and run GiveAway) before its own OnlineATC snapshot has caught up to the new controller's
+// connection.
+//
+// So GiveAway checks IsOnline itself before ever calling MMI.HandoffJurisdiction. When the target
+// isn't online yet, it still reassigns fdr.ControllingSector immediately - the aircraft has to be
+// protected from MMI.SetControlledSectors's own old/new-sector cleanup exactly as the comment on
+// that reassignment below describes, and that cleanup runs whether or not the real handoff already
+// went out - but leaves the actual network handoff to RetryDeferredHandoffs, which finishes it
+// once the new controller becomes visible. The aircraft stays tracked by this session throughout
+// (nothing here ever calls StopTracking), so nothing is dropped while it waits.
 public class SectorTagHandoff
 {
     // How long after gaining a sector an incoming handoff for it still counts as part of that
@@ -111,6 +140,20 @@ public class SectorTagHandoff
     readonly Dictionary<string, PendingConfirmation> _confirming = new(StringComparer.OrdinalIgnoreCase);
     readonly System.Threading.Timer _confirmTimer;
 
+    // How long GiveAway waits for a new sector owner to appear in Network.OnlineATC before giving
+    // up on ever completing the real handoff PDU for a given aircraft - see the class header for
+    // why this wait exists at all. The owner was necessarily connected to claim the sector on
+    // OzServer in the first place, so this is generous relative to how long OnlineATC realistically
+    // lags a connection, not a guess at how long a connection itself might take.
+    static readonly TimeSpan DeferredHandoffWindow = TimeSpan.FromSeconds(60);
+    static readonly TimeSpan DeferredHandoffCheckInterval = TimeSpan.FromSeconds(2);
+
+    // Callsigns GiveAway reassigned locally but could not yet hand off for real, and the sector
+    // each is waiting to be handed to. Checked by RetryDeferredHandoffs until the new owner shows
+    // up in Network.OnlineATC or the window above expires.
+    readonly Dictionary<string, DeferredHandoff> _deferred = new(StringComparer.OrdinalIgnoreCase);
+    readonly System.Threading.Timer _deferredHandoffTimer;
+
     sealed class PendingTransfer
     {
         public PendingTransfer(SectorsVolumes.Sector sector, string fromCallsign)
@@ -139,12 +182,26 @@ public class SectorTagHandoff
         public DateTime Until { get; }
     }
 
+    sealed class DeferredHandoff
+    {
+        public DeferredHandoff(SectorsVolumes.Sector toSector)
+        {
+            ToSector = toSector;
+            Until = DateTime.UtcNow + DeferredHandoffWindow;
+        }
+
+        public SectorsVolumes.Sector ToSector { get; }
+        public DateTime Until { get; }
+    }
+
     public SectorTagHandoff(OzServerOwnershipTracker tracker, FdrSync fdrSync)
     {
         _tracker = tracker;
         _fdrSync = fdrSync;
         _tracker.OwnershipChanged += (_, diff) => RunOnUiThread(() => OnOwnershipChanged(diff));
         _confirmTimer = new System.Threading.Timer(_ => RunOnUiThread(ReassertConfirmations), null, ConfirmationInterval, ConfirmationInterval);
+        _deferredHandoffTimer = new System.Threading.Timer(
+            _ => RunOnUiThread(RetryDeferredHandoffs), null, DeferredHandoffCheckInterval, DeferredHandoffCheckInterval);
         Network.Disconnected += (_, _) =>
         {
             lock (_lock)
@@ -153,6 +210,7 @@ public class SectorTagHandoff
                 _reportedUnmatched.Clear();
                 _accepting.Clear();
                 _confirming.Clear();
+                _deferred.Clear();
             }
         };
     }
@@ -271,6 +329,7 @@ public class SectorTagHandoff
         }
 
         var moved = new List<string>();
+        var deferred = new List<string>();
 
         foreach (var fdr in FDP2.GetFDRs.ToList())
         {
@@ -282,27 +341,51 @@ public class SectorTagHandoff
             if (SectorLocator.Resolve(fdr, new[] { transfer.Sector }) == null)
                 continue;
 
-            MMI.HandoffJurisdiction(fdr, toSector);
+            // See the class header for why this check exists: MMI.HandoffJurisdiction silently does
+            // something else entirely - dropping the aircraft from network tracking rather than
+            // handing it off - when toSector's controller isn't visible in OnlineATC yet. Deferring
+            // here, rather than letting that happen, is the whole reason IsOnline/_deferred exist.
+            if (IsOnline(toSector))
+            {
+                MMI.HandoffJurisdiction(fdr, toSector);
+            }
+            else
+            {
+                lock (_lock)
+                    _deferred[fdr.Callsign] = new DeferredHandoff(toSector);
 
-            // Reassigned immediately, not left for the real PDUHandoffAccept round trip to set it
-            // (which is what FDP2.Handoff itself does - it only touches State and HandoffSector,
-            // never ControllingSector; that field is normally left exactly where it was until
-            // ProcessHandoffAccepted moves it, seconds later, once the round trip completes).
+                deferred.Add(fdr.Callsign);
+            }
+
+            // Reassigned immediately either way, not left for the real PDUHandoffAccept round trip to
+            // set it (which is what FDP2.Handoff itself does - it only touches State and
+            // HandoffSector, never ControllingSector; that field is normally left exactly where it
+            // was until ProcessHandoffAccepted moves it, seconds later, once the round trip
+            // completes).
             //
             // ReconcileMmiWithOwned calls OwnershipChanged (which is what runs this) before its own,
             // later MMI.SetControlledSectors call actually drops this sector from SectorsControlled -
             // and THAT method's own internal cleanup hands off to nobody any FDR whose
             // ControllingSector was in the old list and isn't in the new one, checked purely against
             // ControllingSector/IsTrackedByMe, with no idea that fdr.State just became STATE_HANDOVER
-            // a moment ago. Left at the old sector, it matches that cleanup and gets dropped from the
-            // network outright (Network.StopTracking) - cancelling the very handoff this loop just
-            // initiated, before the aircraft had any real chance to reach the controller it was being
-            // given to. Reassigning it here, to the sector the receiving controller is actually
+            // (or, on the deferred path, hasn't changed at all yet) a moment ago. Left at the old
+            // sector, it matches that cleanup and gets dropped from the network outright
+            // (Network.StopTracking) - cancelling the very handoff this loop just initiated (or is
+            // about to retry), before the aircraft had any real chance to reach the controller it was
+            // being given to. Reassigning it here, to the sector the receiving controller is actually
             // working, means that later cleanup's own check no longer matches (that sector was never
             // in this session's own list to begin with), so it leaves this aircraft alone.
             // ProcessHandoffAccepted resolves to the same sector once the real accept arrives, so this
             // is only ever redundant with it, never in conflict.
             fdr.ControllingSector = toSector;
+
+            // Recomputes the tag's displayed state against the ControllingSector just set above,
+            // rather than trusting whichever of the two branches above happened to touch it (a real
+            // handoff already does this internally via FDP2.Handoff, but calling it again here is
+            // harmless and covers the deferred branch, which does nothing to the track on its own).
+            var track = MMI.FindTrack(fdr);
+            if (track != null)
+                MMI.SetTrackState(track);
 
             // Cancels ReassertConfirmations' own claim on this callsign, if AcceptTransfer registered
             // one - see there for why it exists. Without this, giving an aircraft away again inside
@@ -321,14 +404,90 @@ public class SectorTagHandoff
 
         ActionLog.Log("Tag", moved.Count > 0
             ? $"{transfer.Sector.Name} went to {toCallsign} - handed over {string.Join(", ", moved)}"
+              + (deferred.Count > 0
+                  ? $" ({string.Join(", ", deferred)} deferred - {toCallsign} not yet visible on the network)"
+                  : "")
             : $"{transfer.Sector.Name} went to {toCallsign} - no tags of ours inside it",
             new
             {
                 action = "sector_lost_handoff_tags",
                 sector = transfer.Sector.Name,
                 to_callsign = toCallsign,
-                fdr_callsigns = moved.ToArray()
+                fdr_callsigns = moved.ToArray(),
+                deferred_callsigns = deferred.ToArray()
             });
+    }
+
+    // True once toSector's controller is visible in this client's own Network.OnlineATC snapshot -
+    // the only condition under which MMI.HandoffJurisdiction actually sends a real handoff PDU
+    // rather than silently dropping the aircraft (see the class header).
+    static bool IsOnline(SectorsVolumes.Sector toSector) =>
+        (Network.GetOnlineATCs ?? new List<NetworkATC>())
+            .Any(atc => string.Equals(atc.Callsign, toSector.Callsign, StringComparison.Ordinal));
+
+    // Finishes a handoff GiveAway couldn't send yet. Runs on its own timer rather than off
+    // OnFdrUpdate: an aircraft GiveAway has already reassigned locally keeps receiving ordinary FDR
+    // updates like any other, so there is no update-driven event left to hang a retry off.
+    void RetryDeferredHandoffs()
+    {
+        List<KeyValuePair<string, DeferredHandoff>> toCheck;
+        lock (_lock)
+        {
+            var expired = _deferred.Where(kv => kv.Value.Until < DateTime.UtcNow).ToList();
+            foreach (var kv in expired)
+            {
+                _deferred.Remove(kv.Key);
+                ActionLog.Log("Tag",
+                    $"Gave up waiting for {kv.Value.ToSector.Name}'s controller to appear online - "
+                    + $"{kv.Key} stays tracked by us under {kv.Value.ToSector.Name}",
+                    new
+                    {
+                        action = "handoff_deferred_timeout",
+                        fdr_callsign = kv.Key,
+                        sector = kv.Value.ToSector.Name
+                    });
+            }
+
+            if (_deferred.Count == 0)
+                return;
+
+            toCheck = _deferred.ToList();
+        }
+
+        foreach (var entry in toCheck)
+        {
+            var callsign = entry.Key;
+            var toSector = entry.Value.ToSector;
+
+            var fdr = FDP2.GetFDRs.FirstOrDefault(f => string.Equals(f.Callsign, callsign, StringComparison.OrdinalIgnoreCase));
+
+            // No longer tracked by us, or already pointed somewhere else - a later GiveAway, a
+            // manual handoff, TagResumeRecovery - so this deferred entry no longer describes
+            // anything real and is not this loop's to act on.
+            if (fdr == null || !fdr.IsTrackedByMe || fdr.ControllingSector?.Equals(toSector) != true)
+            {
+                lock (_lock)
+                    _deferred.Remove(callsign);
+                continue;
+            }
+
+            if (!IsOnline(toSector))
+                continue;
+
+            MMI.HandoffJurisdiction(fdr, toSector);
+
+            lock (_lock)
+                _deferred.Remove(callsign);
+
+            ActionLog.Log("Tag",
+                $"{toSector.Name}'s controller is now online - completed the deferred handoff for {callsign}",
+                new
+                {
+                    action = "handoff_deferred_completed",
+                    fdr_callsign = callsign,
+                    sector = toSector.Name
+                });
+        }
     }
 
     // The taking half. Accepts an incoming handoff silently when it belongs to a transfer.
