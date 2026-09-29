@@ -66,6 +66,12 @@ public class GracefulDisconnectReleaser
 
     void OnDisconnected()
     {
+        // Nothing was ever claimed on a server OzServer does not operate on (LocalHost, an
+        // unrecognised SweatBox), and the release would fail before it was sent - an error in the
+        // Errors window, or a blocked shutdown, for nothing.
+        if (NetworkServer.Current == null)
+            return;
+
         // Still on screen means they are looking at it, which means they pressed the button on it.
         // A dropped connection does not open this window.
         if (IsConnectWindowOpen())

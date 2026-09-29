@@ -62,6 +62,17 @@ public class FdrSync
     public FdrSync()
     {
         _flushTimer = new Timer(_ => _ = FlushAsync(), null, FlushInterval, FlushInterval);
+
+        // Whatever was still queued belongs to the session that just ended. FlushAsync holds it
+        // while disconnected, so it used to go out on the first tick after reconnecting - naming
+        // this controller as the authority for flights someone else may have picked up while they
+        // were away, and, after a switch between live and a SweatBox, into the wrong server's
+        // records entirely (the server is attached when the batch is sent, not when it is queued).
+        Network.Disconnected += (_, _) =>
+        {
+            lock (_lock)
+                _pending.Clear();
+        };
     }
 
     public void OnFdrUpdate(FDP2.FDR fdr)
@@ -133,7 +144,10 @@ public class FdrSync
 
     // Gates every push on this session's own relationship to the flight, checked fresh every time -
     // see the class comment.
-    static bool ShouldPush(FDP2.FDR fdr) => fdr.IsTrackedByMe && fdr.ESTed;
+    //
+    // Connected as well: vatSys keeps delivering updates for a while after a disconnect, and what is
+    // queued then would be sent first on the next session - see the Disconnected handler above.
+    static bool ShouldPush(FDP2.FDR fdr) => Network.IsConnected && fdr.IsTrackedByMe && fdr.ESTed;
 
 
     void Merge(OzServerFdrUpdateDto dto)
@@ -150,8 +164,10 @@ public class FdrSync
     async Task FlushAsync()
     {
         // Leaves whatever's pending queued rather than dropping it - not connected right now just
-        // means nothing gets pushed yet, not that this update never happened.
-        if (!Network.IsConnected)
+        // means nothing gets pushed yet, not that this update never happened. An unsupported server
+        // (see NetworkServer.Current) is the same: every push would fail before it was sent, and
+        // report that as an error every five seconds.
+        if (!Network.IsConnected || NetworkServer.Current == null)
             return;
 
         // See _flushing - one batch in flight at a time, no overlapping pushes.

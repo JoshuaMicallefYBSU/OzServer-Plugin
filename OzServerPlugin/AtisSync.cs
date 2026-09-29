@@ -44,7 +44,9 @@ public class AtisSync
         if (string.IsNullOrEmpty(icao) || letter == null || content == null || content.Count == 0 || !vatsys.ATIS.IsBroadcasting)
             return;
 
-        if (!Network.IsConnected)
+        // NetworkServer.Current: on LocalHost or an unrecognised SweatBox the push would fail before
+        // it was sent, and put that in the Errors window on every ATIS change.
+        if (!Network.IsConnected || NetworkServer.Current == null)
             return;
 
         var dto = new OzServerAtisUpdateDto

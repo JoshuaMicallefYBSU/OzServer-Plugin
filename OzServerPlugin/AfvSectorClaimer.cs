@@ -23,6 +23,9 @@ namespace OzServerPlugin;
 // the same free-text field would fight over it.
 public class AfvSectorClaimer
 {
+    // Read-only, and only for RecentlyResumed - see Init(). Everything else here still only ever
+    // touches MMI.SectorsControlled.
+    readonly OzServerOwnershipTracker _tracker;
     readonly HashSet<VSCSFrequency> _subscribed = new();
     // What Network.Me.Callsign was the last time Init() actually ran - see the
     // VSCSFrequenciesChanged handler for why this matters: that event fires both for a genuine
@@ -43,8 +46,10 @@ public class AfvSectorClaimer
     readonly System.Threading.Timer _initRetryTimer;
     int _initAttemptsLeft;
 
-    public AfvSectorClaimer()
+    public AfvSectorClaimer(OzServerOwnershipTracker tracker)
     {
+        _tracker = tracker;
+
         // Network.Connected, Audio.VSCSFrequenciesChanged and the retry timer below all end up in
         // MMI.SetControlledSectors, which touches vatSys's own map/UI state - and none of the three
         // are guaranteed to fire on the UI thread (vatSys never installs a SynchronizationContext on
@@ -176,6 +181,15 @@ public class AfvSectorClaimer
 
         LogWithheldTopDownCover("Withheld top-down cover on login", unfiltered, sectors);
 
+        // Anything a resume just handed back stays. Nothing orders this against the resume, and
+        // replacing MMI with the bare defaults after it had already restored the extras took them
+        // back out - see OzServerOwnershipTracker.RecentlyResumed.
+        foreach (var resumed in _tracker.RecentlyResumed)
+        {
+            if (!sectors.Any(s => s.Equals(resumed)))
+                sectors.Add(resumed);
+        }
+
         // Only recorded once the grant actually happened. Setting it on the way in marked the
         // position as handled even when nothing was granted, so the VSCSFrequenciesChanged
         // re-baseline below then saw no callsign change and never gave it a second attempt.
@@ -222,7 +236,13 @@ public class AfvSectorClaimer
         if (!Network.IsConnected)
             return;
 
-        var primarySector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == Network.Me.Callsign);
+        // Network.Me lags Connected (see Init), and a Transmit press in that window dereferenced it
+        // here unguarded - a NullReferenceException thrown into whatever vatSys code set Transmit.
+        var myCallsign = Network.Me?.Callsign;
+        if (string.IsNullOrEmpty(myCallsign))
+            return;
+
+        var primarySector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == myCallsign);
         if (primarySector == null)
             return;
 
@@ -239,7 +259,7 @@ public class AfvSectorClaimer
                 return;
 
             var withheld = new HashSet<string>(
-                PrimaryPosition.StaffedCoveredSectors(frequencySector, Network.Me?.Callsign),
+                PrimaryPosition.StaffedCoveredSectors(frequencySector, myCallsign),
                 StringComparer.OrdinalIgnoreCase);
 
             if (!withheld.Contains(frequencySector.Name))
@@ -262,7 +282,7 @@ public class AfvSectorClaimer
                         action = "withhold_top_down_cover_transmit",
                         sector = frequencySector.Name,
                         sectors = withheld.OrderBy(s => s).ToArray(),
-                        own_callsign = Network.Me?.Callsign
+                        own_callsign = myCallsign
                     });
         }
         else

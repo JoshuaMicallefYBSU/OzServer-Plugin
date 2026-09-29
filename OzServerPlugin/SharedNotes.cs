@@ -61,7 +61,20 @@ public class SharedNotes
         public string Text = "";
         public double Latitude;
         public double Longitude;
+        // Changed since the server was last told - see DetectLocalChanges.
+        public bool Dirty;
+        // Gone from every scope. Checked when a create call answers - see PublishAsync.
+        public bool Removed;
+        // A create call is on its way, so Push must not start a second one.
+        public bool InFlight;
+        // The server refused this text (a 4xx a retry cannot fix). Cleared by the next edit.
+        public bool Rejected;
+        // A transport or server failure is not held against the note, but neither is it retried on
+        // every two-second poll. Cleared by the next edit.
+        public DateTime RetryAt = DateTime.MinValue;
     }
+
+    static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(30);
 
     sealed class ReferenceEqualityComparer : IEqualityComparer<object>
     {
@@ -83,8 +96,8 @@ public class SharedNotes
 
         Network.Connected += (_, _) => _ = RefreshRemoteAsync();
 
-        // Everything is dropped on disconnect: the injected notes belong to sessions we are no
-        // longer watching, and our own tracking refers to a server that no longer knows us.
+        // Everyone else's notes are dropped on disconnect: they belong to sessions we are no longer
+        // watching. Our own are kept, with the ids they were published under - see Forget.
         Network.Disconnected += (_, _) => AsdMapLayer.RunOnUiThread(Forget);
 
         _timer = new System.Threading.Timer(
@@ -99,9 +112,16 @@ public class SharedNotes
             WriteTextAreas(control, mine);
         }
 
+        // _local is deliberately kept. Clearing it made the next poll find every one of the
+        // controller's own notes again as brand new and publish each a second time, while the
+        // server copy - still there through the author's grace window, and for good if they
+        // reconnect inside it - stayed on everyone else's scope with nothing here able to withdraw
+        // it. Kept, a note stays tied to the copy it was published as, and its next edit or delete
+        // reaches that copy. If that copy is no longer reachable from the new session (expired while
+        // the author was away, or published on a different server) the server answers 403 - see
+        // UpdateAsync - and the note is published afresh.
         _injected.Clear();
         _dismissed.Clear();
-        _local.Clear();
         _remote = new List<OzServerAnnotationDto>();
     }
 
@@ -148,6 +168,10 @@ public class SharedNotes
         {
             _local.Remove(pair.Key);
 
+            // No id yet may just mean the create call has not answered - flagged so PublishAsync
+            // withdraws the copy it makes rather than leaving it behind.
+            pair.Value.Removed = true;
+
             if (pair.Value.Id is not { } id)
                 continue;
 
@@ -174,18 +198,19 @@ public class SharedNotes
             {
                 // vatSys edits a note in place (left click) and moves it in place (right click), so
                 // the same instance can change under us - which is an update, not a new note.
-                if (known.Text == text
-                    && Math.Abs(known.Latitude - position.Latitude) < 0.000001
-                    && Math.Abs(known.Longitude - position.Longitude) < 0.000001)
-                    continue;
+                if (known.Text != text
+                    || Math.Abs(known.Latitude - position.Latitude) >= 0.000001
+                    || Math.Abs(known.Longitude - position.Longitude) >= 0.000001)
+                {
+                    known.Text = text;
+                    known.Latitude = position.Latitude;
+                    known.Longitude = position.Longitude;
+                    known.Dirty = true;
+                    known.Rejected = false;
+                    known.RetryAt = DateTime.MinValue;
+                }
 
-                known.Text = text;
-                known.Latitude = position.Latitude;
-                known.Longitude = position.Longitude;
-
-                if (known.Id is { } id && NetworkIdentity.CanPublishMarkup)
-                    _ = Safely(_api.UpdateNoteAsync(id, text, position), "update note");
-
+                Push(known);
                 continue;
             }
 
@@ -201,30 +226,137 @@ public class SharedNotes
             _local[area] = note;
 
             if (NetworkIdentity.CanPublishMarkup)
-                _ = PublishAsync(note, text, position);
+                Push(note);
             else
-                ActionLog.Log("Notes", "note stays on this scope only - observer or not connected");
+                ActionLog.Log("Notes", "note stays on this scope until connected as a controller");
         }
+    }
+
+    // Brings the server's copy of a note up to date, whatever state it is in: never published (made
+    // while disconnected or as an observer, or its create call failed), edited since it was, or fine.
+    //
+    // Held until it can be sent, rather than sent-or-dropped on the poll it was made in. An edit
+    // while the create call was still in flight had no id to go to, and one while disconnected had no
+    // session - either way the server, and every other controller's scope, kept the old text for
+    // good. A note made while disconnected likewise used to be tracked with no id and never published.
+    void Push(LocalNote note)
+    {
+        // NetworkServer.Current: on LocalHost or an unrecognised SweatBox every call fails before it is
+        // sent, and a note waiting to be published would log that every RetryDelay for the session.
+        if (!NetworkIdentity.CanPublishMarkup || NetworkServer.Current == null
+            || note.Rejected || DateTime.UtcNow < note.RetryAt)
+            return;
+
+        if (note.Id is not { } id)
+        {
+            if (note.InFlight)
+                return;
+
+            // The create call carries the current text, so there is nothing left to update.
+            note.InFlight = true;
+            note.Dirty = false;
+            _ = PublishAsync(note, note.Text, new Coordinate(note.Latitude, note.Longitude));
+            return;
+        }
+
+        if (!note.Dirty)
+            return;
+
+        note.Dirty = false;
+        _ = UpdateAsync(note, id, note.Text, new Coordinate(note.Latitude, note.Longitude));
+    }
+
+    // A 4xx other than "not yours / not there" means the server looked at the request and refused it
+    // (a note over 500 characters, say), and sending it again unchanged would only be refused again.
+    // Anything else - no connection, a 5xx - is worth another go, later.
+    static void HoldBack(LocalNote note, Exception failure, bool retryUpdate)
+    {
+        if (failure is OzServerApiException { StatusCode: >= 400 and < 500 })
+        {
+            note.Rejected = true;
+            return;
+        }
+
+        note.RetryAt = DateTime.UtcNow + RetryDelay;
+        if (retryUpdate)
+            note.Dirty = true;
     }
 
     async Task PublishAsync(LocalNote note, string text, Coordinate position)
     {
+        OzServerAnnotationDto? created = null;
+        Exception? failure = null;
+
         try
         {
-            var created = await _api.CreateNoteAsync(text, position).ConfigureAwait(false);
-
-            AsdMapLayer.RunOnUiThread(() =>
-            {
-                note.Id = created.Id;
-
-                // Ours, so it must never be injected back as somebody else's - the author filter on
-                // the fetch does that, and this covers the window before the next fetch.
-                _dismissed.Add(created.Id);
-            });
+            created = await _api.CreateNoteAsync(text, position).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            ActionLog.Log("Notes", $"could not share a note: {ex.Message}");
+            failure = ex;
+        }
+
+        AsdMapLayer.RunOnUiThread(() =>
+        {
+            note.InFlight = false;
+
+            if (created == null)
+            {
+                ActionLog.Log("Notes", $"could not share a note: {failure?.Message}");
+                if (failure != null)
+                    HoldBack(note, failure, retryUpdate: false);
+                return;
+            }
+
+            // Ours, so it must never be injected back as somebody else's - the author filter on
+            // the fetch does that, and this covers the window before the next fetch.
+            _dismissed.Add(created.Id);
+
+            // Deleted before the server answered. Nothing here points at the copy it just made,
+            // so it would sit on every other controller's scope until the author's session
+            // expired - withdrawn instead, as MapDrawing does for a stroke undone mid-publish.
+            if (note.Removed)
+            {
+                _ = Safely(_api.DeleteAnnotationAsync(created.Id), "delete note");
+                return;
+            }
+
+            // Any edit made while this call was in flight is already marked Dirty, and goes out
+            // on the next poll now that there is an id to send it to.
+            note.Id = created.Id;
+        });
+    }
+
+    async Task UpdateAsync(LocalNote note, string id, string text, Coordinate position)
+    {
+        try
+        {
+            await _api.UpdateNoteAsync(id, text, position).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AsdMapLayer.RunOnUiThread(() =>
+            {
+                ActionLog.Log("Notes", $"update note failed: {ex.Message}");
+
+                if (note.Removed || note.Id != id)
+                    return;
+
+                // The server answers "not yours" and "not there" the same way (see the annotations
+                // route). Either way the copy this note was tied to is not reachable from this
+                // session - expired while the author was away, or published on another server - so
+                // the note is published again with its current text, rather than left showing on
+                // this scope alone.
+                if (ex is OzServerApiException { StatusCode: 403 or 404 })
+                {
+                    note.Id = null;
+                    note.Dirty = false;
+                    ActionLog.Log("Notes", "the server no longer holds a note - publishing it again");
+                    return;
+                }
+
+                HoldBack(note, ex, retryUpdate: true);
+            });
         }
     }
 

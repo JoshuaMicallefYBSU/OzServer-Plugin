@@ -84,7 +84,8 @@ public class Plugin : IPlugin
         // First, so every decision logged below is forwarded from the outset.
         _clientLogForwarder = new ClientLogForwarder();
         _ownershipTracker = new OzServerOwnershipTracker();
-        _afvSectorClaimer = new AfvSectorClaimer();
+        // After the tracker, whose RecentlyResumed its connect-time grant keeps.
+        _afvSectorClaimer = new AfvSectorClaimer(_ownershipTracker);
         _fdrSync = new FdrSync();
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
@@ -254,6 +255,11 @@ public class Plugin : IPlugin
             // header and our own entry inside it definitely exist.
             _settingsMenuHeader = settingsMenu;
             _ozServerSectorsItem = sectorsMenuItem.Item;
+
+            // A request that arrived before the menu existed set _pendingRequests with nothing to
+            // paint it on, and IncomingRequestsChanged only fires again when the set changes - so
+            // without this its flash and badge would not appear until another request came in.
+            RefreshRequestFlash();
 
             // Opening Settings is "clicked" for the header's own flash, exactly like vatSys's real
             // Messages header stopping on its Click/MouseUp (see MainForm's

@@ -64,6 +64,10 @@ public class RequestedSectorOverlay
     List<SectorsVolumes.Sector> _stagedOutgoing = new();
     List<SectorsVolumes.Sector> _confirmedOutgoing = new();
     bool _revealed;
+    // The last line Apply logged. RequestsChanged fires on every sync - every one to three seconds,
+    // all session - and each one used to write an "Overlay" line to the daily log and forward it to
+    // client_logs, whether or not anything on the scope had changed.
+    string? _lastLogged;
 
     public RequestedSectorOverlay(OzServerOwnershipTracker tracker)
     {
@@ -192,7 +196,13 @@ public class RequestedSectorOverlay
         Apply();
     }
 
-    void Apply()
+    // Marshalled because its callers are not: the tracker raises IncomingRequestsChanged and
+    // RequestsChanged from its refresh continuation on a pool thread, while SetStaged and
+    // SetRevealed come from the UI. One thread doing every pass keeps a stale pool-thread pass from
+    // landing after a newer UI one and briefly putting back a highlight the controller just closed.
+    void Apply() => AsdMapLayer.RunOnUiThread(ApplyNow);
+
+    void ApplyNow()
     {
         var incoming = _revealed ? _incoming : new List<SectorsVolumes.Sector>();
         var outgoing = _revealed
@@ -211,12 +221,17 @@ public class RequestedSectorOverlay
         _outgoingFill.SetPolygons(outgoingPolygons);
         _outgoingBorder.SetPolygons(outgoingPolygons);
 
-        ActionLog.Log("Overlay",
-            incoming.Count == 0 && outgoing.Count == 0
-                ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing pending, revealed={_revealed})"
-                : $"{incoming.Count} incoming, {outgoing.Count} outgoing sector(s) highlighted"
-                  + (incoming.Count > 0 ? $" - from me: {string.Join(", ", incoming.Select(s => s.Name))}" : "")
-                  + (outgoing.Count > 0 ? $" - by me: {string.Join(", ", outgoing.Select(s => s.Name))}" : ""));
+        var message = incoming.Count == 0 && outgoing.Count == 0
+            ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing pending, revealed={_revealed})"
+            : $"{incoming.Count} incoming, {outgoing.Count} outgoing sector(s) highlighted"
+              + (incoming.Count > 0 ? $" - from me: {string.Join(", ", incoming.Select(s => s.Name))}" : "")
+              + (outgoing.Count > 0 ? $" - by me: {string.Join(", ", outgoing.Select(s => s.Name))}" : "");
+
+        if (message == _lastLogged)
+            return;
+
+        _lastLogged = message;
+        ActionLog.Log("Overlay", message);
     }
 
     List<SectorsVolumes.Sector> SectorsIn(IReadOnlyList<OzServerSectorOwnershipRequestDto> requests) =>

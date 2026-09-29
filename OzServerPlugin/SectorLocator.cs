@@ -61,15 +61,17 @@ public static class SectorLocator
 
     public static SectorsVolumes.Sector? Resolve(FDP2.FDR fdr, IEnumerable<SectorsVolumes.Sector> candidates)
     {
+        // Candidates first: LiveTrack can scan every radar track, and with nothing to match against
+        // that is wasted work.
+        var candidateList = candidates.ToList();
+        if (candidateList.Count == 0)
+            return null;
+
         if (LiveTrack(fdr) is not { } track)
             return null;
 
         var location = track.LatLong;
         if (location == null)
-            return null;
-
-        var candidateList = candidates.ToList();
-        if (candidateList.Count == 0)
             return null;
 
         var level = track.CorrectedAltitude;

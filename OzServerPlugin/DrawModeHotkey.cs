@@ -15,6 +15,8 @@ namespace OzServerPlugin;
 public sealed class DrawModeHotkey : IMessageFilter
 {
     const int WM_KEYDOWN = 0x0100;
+    // Bit 30 of a WM_KEYDOWN's lParam: the key was already down, i.e. this is auto-repeat.
+    const long KeyRepeatFlag = 1L << 30;
 
     readonly MapDrawing _drawing;
 
@@ -40,6 +42,12 @@ public sealed class DrawModeHotkey : IMessageFilter
         // anything but a plugin.
         if (IsTextEntry(Control.FromHandle(message.HWnd)))
             return false;
+
+        // One press, one toggle. Holding D a moment too long delivered auto-repeat WM_KEYDOWNs, each
+        // toggling again, so draw mode flickered and landed on whichever state the last repeat left.
+        // Still swallowed, so the repeats don't fall through to vatSys either.
+        if ((message.LParam.ToInt64() & KeyRepeatFlag) != 0)
+            return true;
 
         _drawing.Toggle();
 

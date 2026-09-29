@@ -103,6 +103,13 @@ public class PendingSectorGhosts
         try
         {
             var pending = PendingSectors();
+
+            // The overwhelmingly common case: nothing staged or requested, nothing painted. Reassert
+            // runs on every FDR and radar update, and each pass otherwise walks every flight - and
+            // scans the radar tracks for each uncoupled one - to conclude there is nothing to do.
+            if (pending.Count == 0 && _painted.Count == 0)
+                return;
+
             var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             // One snapshot for the whole pass. FDP2.GetFDRs is vatSys's live collection and it is

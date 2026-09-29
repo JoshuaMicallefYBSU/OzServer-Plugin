@@ -625,8 +625,12 @@ public class OzServerApiClient
     {
         var identity = NetworkIdentity.Current
             ?? throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
+        // Named when there is a server to name: connected to LocalHost or an unrecognised SweatBox
+        // host, "not connected" was the opposite of what the controller could see on screen.
         var server = NetworkServer.Current
-            ?? throw new OzServerApiException("Not connected to VATSIM under a callsign yet.");
+            ?? throw new OzServerApiException(string.IsNullOrEmpty(Network.ServerIP)
+                ? "Not connected to VATSIM under a callsign yet."
+                : $"OzServer isn't available on this server ({Network.ServerIP}) - only live VATSIM and the VATPAC SweatBoxes are supported.");
         return (identity.Cid, identity.Callsign, server);
     }
 }

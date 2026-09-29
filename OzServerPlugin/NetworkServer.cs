@@ -35,6 +35,11 @@ static class NetworkServer
     public const string SweatBox1 = "sb1";
     public const string SweatBox2 = "sb2";
 
+    // The last unrecognised ServerIP logged. Current is read by every API request, and every poll
+    // and flush makes one, so logging on each read wrote a line (and forwarded it to client_logs)
+    // every second or two for as long as the session lasted. Once per address says the same thing.
+    static string? _lastLoggedUnrecognised;
+
     // Deliberately NOT gated on Network.IsConnected, unlike an earlier version of this class -
     // IsOfficialServer/ServerIP hold their last real value for a moment after a disconnect (the
     // same way Network.Callsign/ControllerId do, which is what NetworkIdentity.Current already
@@ -61,8 +66,12 @@ static class NetworkServer
             // there is actually something to report - forwarded to client_logs the same way any
             // other ActionLog line is, so a hostname mismatch (like the one that caught SB1's real
             // address) is diagnosable in the field.
-            if (!string.IsNullOrEmpty(ip))
+            if (!string.IsNullOrEmpty(ip)
+                && !string.Equals(ip, _lastLoggedUnrecognised, StringComparison.OrdinalIgnoreCase))
+            {
+                _lastLoggedUnrecognised = ip;
                 ActionLog.Log("Network", $"Unrecognized server - OzServer will not operate here: ServerIP='{ip}'");
+            }
 
             return null;
         }

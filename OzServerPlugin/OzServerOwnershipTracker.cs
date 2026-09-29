@@ -207,7 +207,29 @@ public class OzServerOwnershipTracker
     readonly Dictionary<string, int> _pendingPrimaryClaims = new(StringComparer.OrdinalIgnoreCase);
     bool _primaryClaimRetryRunning;
 
+    // What the last resume handed back, for a short while afterwards - see RecentlyResumed. Long
+    // enough to outlast AfvSectorClaimer's own connect-time retries (up to 20s) plus a resume that
+    // waited on Network.Me and then a slow round trip.
+    static readonly TimeSpan ResumedGraceWindow = TimeSpan.FromSeconds(60);
+    readonly object _resumedGate = new();
+    List<SectorsVolumes.Sector> _resumed = new();
+    DateTime _resumedUntil = DateTime.MinValue;
+
     public IReadOnlyList<SectorsVolumes.Sector> Owned => _owned;
+
+    // Sectors a resume put back moments ago. AfvSectorClaimer.Init() replaces MMI.SectorsControlled
+    // wholesale with the position's defaults, and nothing orders it against the resume: both wait on
+    // Network.Me after Connected, so Init can land after RestoreResumedToMmi and silently take the
+    // resumed extras back out of MMI - dropping any tag TagResumeRecovery had just restored inside
+    // them, through SetControlledSectors' own old/new-sector cleanup. Init merges these in instead.
+    public IReadOnlyList<SectorsVolumes.Sector> RecentlyResumed
+    {
+        get
+        {
+            lock (_resumedGate)
+                return DateTime.UtcNow < _resumedUntil ? _resumed.ToList() : new List<SectorsVolumes.Sector>();
+        }
+    }
 
 
     // Everyone else's ownership as the window renders it, straight from the last refresh.
@@ -255,6 +277,12 @@ public class OzServerOwnershipTracker
         {
             lock (_primaryClaimGate)
                 _pendingPrimaryClaims.Clear();
+
+            lock (_resumedGate)
+            {
+                _resumed = new List<SectorsVolumes.Sector>();
+                _resumedUntil = DateTime.MinValue;
+            }
         };
         _pollTimer = new System.Threading.Timer(_ =>
         {
@@ -317,8 +345,10 @@ public class OzServerOwnershipTracker
     {
         // A stray MMI.SectorsControlled change before/after the network session is up (e.g. vatSys
         // clearing it out on disconnect) shouldn't touch OzServer or push anything back into MMI -
-        // see the class-wide "don't do anything while offline" rule.
-        if (!Network.IsConnected)
+        // see the class-wide "don't do anything while offline" rule. An unsupported server counts as
+        // offline here too (see CanSync): every claim would fail before it was sent, and report one
+        // error per sector on every VSCS press.
+        if (!CanSync)
             return;
 
         lock (_claimGate)
@@ -381,7 +411,11 @@ public class OzServerOwnershipTracker
         MyRequests = requests;
         RequestsChanged?.Invoke(this, requests);
 
-        SetPollCadence(requests.ByMe.Count > 0 || requests.FromMe.Count > 0);
+        // A rejected request in by_me is not in flight - it is decided, and only waiting for the
+        // Sectors window to report and acknowledge it. That window only exists once it has been
+        // opened, so a request made from the conflict prompt and then refused kept the poll on its
+        // fast cadence indefinitely. Only a request still awaiting an answer counts.
+        SetPollCadence(requests.ByMe.Any(r => r.RejectedAt == null) || requests.FromMe.Count > 0);
 
         // Compared on request ids, not on the count: one request being accepted while another
         // arrives between polls leaves the count identical while the actual requests differ, and
@@ -402,7 +436,7 @@ public class OzServerOwnershipTracker
         // Also called directly by OzServerSectorsWindow (on open, and on its own poll tick), not
         // just from within this class - guarded here too so neither path can slip an API call or an
         // MMI write past the "do nothing while offline" rule.
-        if (!Network.IsConnected)
+        if (!CanSync)
             return;
 
         // See _refreshGate. Callers still await a real refresh rather than being turned away, so
@@ -427,7 +461,7 @@ public class OzServerOwnershipTracker
     // the time they return (claim, release, accept) use RefreshFromServerAsync above and do queue.
     public async Task RefreshFromServerIfIdleAsync()
     {
-        if (!Network.IsConnected)
+        if (!CanSync)
             return;
 
         // WaitAsync(0) completes synchronously - "take it if it's free, otherwise give up".
@@ -649,6 +683,14 @@ public class OzServerOwnershipTracker
             return;
         }
 
+        // Same rule as CanSync. The request would fail before it was sent, and the catch below would
+        // put that in the Errors window on every connect to LocalHost or an unrecognised SweatBox.
+        if (NetworkServer.Current == null)
+        {
+            ActionLog.Log("Resume", "skipped - OzServer does not operate on this server");
+            return;
+        }
+
         ActionLog.Log("Resume", $"requesting for {Network.Me?.Callsign ?? "(callsign unknown)"}");
 
         try
@@ -663,6 +705,21 @@ public class OzServerOwnershipTracker
             ActionLog.Log("Resume",
                 $"backend returned {response.Resumed.Count} sector(s), {response.Flights.Count} tag(s)"
                 + (response.Flights.Count > 0 ? ": " + string.Join(", ", response.Flights) : ""));
+
+            // Queued before TagsResumed below, so the sectors are in MMI by the time
+            // TagResumeRecovery resolves the tags against it - both post to the UI thread, in order.
+            if (response.Resumed.Count > 0)
+            {
+                var resumed = _owned.ToList();
+
+                lock (_resumedGate)
+                {
+                    _resumed = resumed;
+                    _resumedUntil = DateTime.UtcNow + ResumedGraceWindow;
+                }
+
+                RunOnUiThread(() => RestoreResumedToMmi(resumed));
+            }
 
             if (response.Flights.Count > 0)
                 TagsResumed?.Invoke(this, response.Flights);
@@ -680,6 +737,34 @@ public class OzServerOwnershipTracker
             Errors.Add(new Exception($"Couldn't resume the previous session: {ex.Message}", ex), "OzServer");
             await RefreshFromServerIfIdleAsync();
         }
+    }
+
+    // Puts what a resume handed back into MMI.SectorsControlled, which nothing else does.
+    //
+    // ApplySync only pushes an ownership *change* into MMI, and a resume is usually not one: on the
+    // first connect after vatSys restarts, the resume's sync is the baseline, which is recorded
+    // without touching MMI; on a reconnect within the same run, Owned still holds the previous
+    // session's list, so the resumed sectors diff as unchanged. Either way MMI was left holding only
+    // the position defaults AfvSectorClaimer.Init() grants on connect, the extended sectors stayed
+    // owned on OzServer but absent locally, and every tag TagResumeRecovery was handed inside them
+    // failed with "(no sector)".
+    //
+    // Adds, never removes, and leaves VSCS alone - the same rule ReconcileMmiWithOwned applies to a
+    // gained sector.
+    void RestoreResumedToMmi(List<SectorsVolumes.Sector> resumed)
+    {
+        if (!Network.IsConnected || !IsRealAtc)
+            return;
+
+        var mmiSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
+        var missing = resumed.Where(sector => !mmiSectors.Any(s => s.Equals(sector))).ToList();
+        if (missing.Count == 0)
+            return;
+
+        mmiSectors.AddRange(missing);
+        MMI.SetControlledSectors(mmiSectors);
+
+        ActionLog.Log("Resume", $"put resumed sector(s) back into vatSys: {string.Join(", ", missing.Select(s => s.Name))}");
     }
 
     void SetPollCadence(bool fast)
@@ -865,6 +950,12 @@ public class OzServerOwnershipTracker
     // this is correct immediately, so a claim made in the first seconds of a session is no longer
     // silently dropped while the published ATC record catches up.
     static bool IsRealAtc => !NetworkIdentity.IsObserver;
+
+    // Connected, and to a server OzServer actually operates on. Anywhere else - LocalHost, or a
+    // SweatBox hostname NetworkServer does not recognise - every call fails before it is sent (see
+    // OzServerApiClient.GetCredentials), so a refresh there is a guaranteed failure, and the poll
+    // put one in front of the controller as an error every few seconds for the whole session.
+    static bool CanSync => Network.IsConnected && NetworkServer.Current != null;
 
     public async Task ClaimAsync(SectorsVolumes.Sector sector)
     {

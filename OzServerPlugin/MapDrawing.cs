@@ -62,7 +62,14 @@ public class MapDrawing
 
     // Everyone else's strokes, with the ids needed to tell them apart when one is middle-clicked.
     List<RemoteStroke> _remote = new();
+    // Written on the UI thread (RemoveAt) and read on a pool thread (RefreshRemoteAsync continues
+    // there), so every access goes through _dismissedGate.
     readonly HashSet<string> _dismissedRemote = new(StringComparer.OrdinalIgnoreCase);
+    readonly object _dismissedGate = new();
+
+    // The server refuses a stroke with more points than this (annotations.ts MaxStrokePoints). Capture
+    // thins to one point per few pixels, but a long enough drag still gets past it.
+    const int MaxPublishedPoints = 2_000;
 
     readonly AsdMapLayer _layer;
     readonly AsdMapLayer _remoteLayer;
@@ -113,13 +120,29 @@ public class MapDrawing
         // Ours goes with us. The server expires annotations once their author stops being seen, but
         // that is a grace window, and a clean sign-off should not leave markup on everyone's scope
         // for minutes afterwards.
-        Network.Disconnected += (_, _) =>
+        //
+        // This used to clear only the local copies, so the scope it was drawn on went blank while
+        // every other controller kept the strokes for the whole grace window - and, if the author
+        // reconnected inside it, for good, since nothing here held their ids any more. Withdrawn
+        // from the server as well now. Best effort: after a dropped connection the calls may simply
+        // fail, and the server's own expiry is still the backstop. A stroke whose create call is
+        // still in flight is withdrawn by PublishAsync's own orphan cleanup when it answers.
+        //
+        // On the UI thread, like every other touch of the stroke lists - Network.Disconnected fires
+        // on a socket thread for a real drop, and clearing the lists there raced RemoveAt and Redraw
+        // enumerating them.
+        Network.Disconnected += (_, _) => AsdMapLayer.RunOnUiThread(() =>
         {
+            foreach (var id in _strokeIds.Where(id => !string.IsNullOrEmpty(id)))
+                _ = SafelyAsync(_api.DeleteAnnotationAsync(id), "withdraw on disconnect");
+
             _strokes.Clear();
             _strokeIds.Clear();
-            AsdMapLayer.RunOnUiThread(Redraw);
+            Redraw();
+
+            _remote = new List<RemoteStroke>();
             _remoteLayer.Clear();
-        };
+        });
     }
 
     public bool Enabled => _enabled;
@@ -197,12 +220,16 @@ public class MapDrawing
             var mine = NetworkIdentity.Current?.Cid;
             var annotations = await _api.GetAnnotationsAsync().ConfigureAwait(false);
 
+            HashSet<string> dismissed;
+            lock (_dismissedGate)
+                dismissed = new HashSet<string>(_dismissedRemote, StringComparer.OrdinalIgnoreCase);
+
             var strokes = annotations
                 .Where(annotation => annotation.Kind == "stroke")
                 .Where(annotation => annotation.Author?.Cid != mine)
                 // Hidden on this scope by a middle click. Dropped here rather than when clicked so
                 // the next refresh cannot quietly put it back.
-                .Where(annotation => !_dismissedRemote.Contains(annotation.Id))
+                .Where(annotation => !dismissed.Contains(annotation.Id))
                 .Select(annotation => new RemoteStroke(
                     annotation.Id,
                     annotation.Points.Select(point => new Coordinate(point.Lat, point.Lon)).ToList()))
@@ -334,7 +361,8 @@ public class MapDrawing
 
         if (remote != null)
         {
-            _dismissedRemote.Add(remote.Id);
+            lock (_dismissedGate)
+                _dismissedRemote.Add(remote.Id);
             _remote = _remote.Where(stroke => stroke.Id != remote.Id).ToList();
             _remoteLayer.SetPolygons(_remote.Select(stroke => stroke.Points));
 
@@ -452,7 +480,10 @@ public class MapDrawing
 
         try
         {
-            var created = await _api.CreateStrokeAsync(stroke).ConfigureAwait(false);
+            // Only the copy sent is thinned; the author's own scope keeps the full line. Without this
+            // the server answered 422 to a long stroke and it stayed on this scope alone, looking
+            // exactly like one that had been shared.
+            var created = await _api.CreateStrokeAsync(Thinned(stroke)).ConfigureAwait(false);
 
             // Matched back to its stroke by identity, not by index. Undo can remove earlier strokes
             // while this call is in flight, so the position it had when it was sent may not be the
@@ -482,6 +513,21 @@ public class MapDrawing
         {
             ActionLog.Log("Drawing", $"could not share a stroke: {ex.Message}");
         }
+    }
+
+    // At most MaxPublishedPoints, spread evenly along the stroke with both ends kept.
+    static List<Coordinate> Thinned(List<Coordinate> stroke)
+    {
+        if (stroke.Count <= MaxPublishedPoints)
+            return stroke;
+
+        var step = (stroke.Count - 1) / (double)(MaxPublishedPoints - 1);
+        var thinned = new List<Coordinate>(MaxPublishedPoints);
+        for (var i = 0; i < MaxPublishedPoints; i++)
+            thinned.Add(stroke[(int)Math.Round(i * step)]);
+
+        ActionLog.Log("Drawing", $"stroke of {stroke.Count} points thinned to {thinned.Count} for sharing");
+        return thinned;
     }
 
     void Redraw()

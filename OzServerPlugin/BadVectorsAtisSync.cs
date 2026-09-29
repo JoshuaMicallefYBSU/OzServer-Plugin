@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -87,7 +88,8 @@ public class BadVectorsAtisSync
 
     async Task PushAsync(object? control)
     {
-        if (control == null || !Network.IsConnected)
+        // NetworkServer.Current: see AtisSync.PushAsync.
+        if (control == null || !Network.IsConnected || NetworkServer.Current == null)
             return;
 
         var type = control.GetType();
@@ -168,6 +170,13 @@ public class BadVectorsAtisSync
     // like "132.500" back to 32500 - the same FSD frequency Network.ATISFrequency?.GetFSDFrequency()
     // would report for the equivalent vatsys.ATIS station, keeping this consistent with AtisSync's
     // own Frequency field.
+    //
+    // Invariant culture, not the current one: FrequencyDisplay always uses "." as its decimal point.
+    // On a Windows install whose locale uses "." as the thousands separator (de-DE, for one) the
+    // culture-default overload read "132.500" as 132500 and pushed a frequency of 132400000 to
+    // OzServer; in most other comma-decimal locales it failed to parse and sent none at all.
     static int? ParseFsdFrequency(string? display) =>
-        double.TryParse(display, out var mhz) ? (int)Math.Round((mhz - 100) * 1000) : null;
+        double.TryParse(display, NumberStyles.Float, CultureInfo.InvariantCulture, out var mhz)
+            ? (int)Math.Round((mhz - 100) * 1000)
+            : null;
 }
