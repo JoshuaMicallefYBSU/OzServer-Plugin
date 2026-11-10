@@ -44,7 +44,11 @@ public class FdrSync
     // see its own comment for why they can't go through the same "skip nulls" merge as the rest.
     static readonly PropertyInfo[] MergeProperties = typeof(OzServerFdrUpdateDto).GetProperties()
         .Where(p => p.Name != nameof(OzServerFdrUpdateDto.ControllingCid)
-                    && p.Name != nameof(OzServerFdrUpdateDto.ControllingCallsign))
+                    && p.Name != nameof(OzServerFdrUpdateDto.ControllingCallsign)
+                    // The cleared level is merged as a unit too - see CopyNonNull.
+                    && p.Name != nameof(OzServerFdrUpdateDto.CflLower)
+                    && p.Name != nameof(OzServerFdrUpdateDto.CflUpper)
+                    && p.Name != nameof(OzServerFdrUpdateDto.ClearanceKnown))
         .ToArray();
 
     readonly OzServerApiClient _api = new();
@@ -193,7 +197,8 @@ public class FdrSync
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't push FDR batch to OzServer: {ex.Message}", ex), "OzServer");
+                // Once per outage, not once per five-second flush - see ErrorThrottle.
+                ErrorThrottle.Report("fdr-flush", $"Couldn't push FDR batch to OzServer: {ex.Message}", ex);
             }
         }
         finally
@@ -226,6 +231,9 @@ public class FdrSync
             Rfl = fdr.RFL > 0 ? fdr.RFL : null,
             CflLower = fdr.CFLLower > 0 ? fdr.CFLLower : null,
             CflUpper = fdr.CFLUpper > 0 ? fdr.CFLUpper : null,
+            // Read straight off the FDR, so "no cleared level" here is a fact to report, not a gap
+            // in what this push knows - see OzServerFdrUpdateDto.CflLower.
+            ClearanceKnown = true,
             AssignedSsrCode = fdr.AssignedSSRCode == -1 ? null : fdr.AssignedSSRCode,
             Atd = fdr.ATD == DateTime.MaxValue ? null : fdr.ATD,
             Etd = fdr.ETD == DateTime.MaxValue ? null : fdr.ETD,
@@ -334,6 +342,17 @@ public class FdrSync
     {
         target.ControllingCid = source.ControllingCid;
         target.ControllingCallsign = source.ControllingCallsign;
+
+        // The cleared level, likewise as a unit and likewise outside the skip-nulls loop - but only
+        // from a source that actually read it. A full FDR push's null means "no cleared level" and
+        // has to replace whatever is pending; a radar-only update's null means it never looked, and
+        // must not undo a clearance a fuller push has already queued.
+        if (source.ClearanceKnown)
+        {
+            target.ClearanceKnown = true;
+            target.CflLower = source.CflLower;
+            target.CflUpper = source.CflUpper;
+        }
 
         foreach (var prop in MergeProperties)
         {

@@ -542,7 +542,16 @@ public class OzServerOwnershipTracker
                 exclude.Add(name);
         }
 
-        return _api.ClaimSectorAsync(sector.Name, exclude);
+        return _api.ClaimSectorAsync(sector.Name, exclude, OwnPositionGroup());
+    }
+
+    // This session's own position, by name, for the backend's "the primary takes its group back"
+    // rule - see OzServerApiClient.ClaimSectorAsync. Null when the callsign names no sector at all
+    // (nothing is held by right, so there is nothing to say), which leaves the field off the request.
+    static List<string>? OwnPositionGroup()
+    {
+        var group = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
+        return group.Count == 0 ? null : group.Select(s => s.Name).ToList();
     }
 
     // Takes back top-down cover that was withheld while somebody was logged on as it, now that they
@@ -794,7 +803,8 @@ public class OzServerOwnershipTracker
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't refresh sector state from OzServer: {ex.Message}", ex), "OzServer");
+            // Once per outage rather than once per three-second poll - see ErrorThrottle.
+            ErrorThrottle.Report("sector-refresh", $"Couldn't refresh sector state from OzServer: {ex.Message}", ex);
             return;
         }
 
@@ -964,9 +974,9 @@ public class OzServerOwnershipTracker
 
         // The conflict is handled *after* the try block, not inside the catch clause that detects
         // it. An exception thrown from within a catch clause is not seen by that same try's other
-        // catch clauses, so HandleConflictAsync throwing (its AskYesNo marshals a dialog with a
-        // blocking Invoke, and RunOnUiThread posts with BeginInvoke - both can fail on a form that
-        // is going away) escaped this method entirely, straight out through the async void click
+        // catch clauses, so HandleConflictAsync throwing (it opens a window and posts to the UI
+        // thread with BeginInvoke - either can fail on a form that is going away) escaped this
+        // method entirely, straight out through the async void click
         // handler that called it and into vatSys as an unhandled exception.
         IReadOnlyList<OzServerSectorConflictDto>? conflicts = null;
 
@@ -1052,7 +1062,8 @@ public class OzServerOwnershipTracker
                 toClaim.Select(s => s.Name),
                 toRelease.Select(s => s.Name),
                 (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name),
-                staffed);
+                staffed,
+                OwnPositionGroup());
 
             result.Claimed.AddRange(response.Result.Claimed);
             result.Released.AddRange(response.Result.Released);
@@ -1298,7 +1309,8 @@ public class OzServerOwnershipTracker
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't sync {sector.Name} to OzServer: {ex.Message}", ex), "OzServer");
+                // RetryUnclaimedMmiSectors comes back here every poll tick until the claim lands.
+                ErrorThrottle.Report("mmi-claim:" + sector.Name, $"Couldn't sync {sector.Name} to OzServer: {ex.Message}", ex);
             }
 
             if (conflicts == null)
@@ -1364,7 +1376,7 @@ public class OzServerOwnershipTracker
                            ? "Request it from them?"
                            : "Request them from their current owners?");
 
-        if (contestedByOthers.Count > 0 && AskYesNo(question, "Sector already owned"))
+        if (contestedByOthers.Count > 0 && await AskYesNoAsync(question, "Sector already owned"))
         {
             foreach (var conflict in contestedByOthers)
             {
@@ -1480,7 +1492,8 @@ public class OzServerOwnershipTracker
                 }
                 catch (Exception ex)
                 {
-                    Errors.Add(new Exception($"Couldn't take {name} back for this position: {ex.Message}", ex), "OzServer");
+                    // Retried every poll tick for up to two minutes - see PrimaryClaimRetryTicks.
+                    ErrorThrottle.Report("primary-claim:" + name, $"Couldn't take {name} back for this position: {ex.Message}", ex);
                 }
 
                 lock (_primaryClaimGate)
@@ -1513,25 +1526,75 @@ public class OzServerOwnershipTracker
         }
     }
 
-    static bool AskYesNo(string message, string caption)
+    // How long the conflict question waits for an answer before it withdraws itself as "no".
+    //
+    // Nothing else can be claimed while it is open - the claim loop that asked is suspended on the
+    // answer, and later MMI changes queue behind it - so an unanswered prompt cannot be allowed to
+    // sit there for the rest of the session. "No" is the safe default: it leaves the contested
+    // sectors with whoever has them, which is exactly where they already are.
+    static readonly TimeSpan ConflictPromptTimeout = TimeSpan.FromSeconds(60);
+
+    // Asks without blocking. This used to be ShowDialog, which stops the whole vatSys window taking
+    // input until it is answered - and it is raised by a claim, which a VSCS transmit press or a
+    // logon triggers, so it could land on a controller in the middle of working traffic and lock
+    // their scope until they found and dismissed it. The same reasoning that turned every other
+    // popup here into a non-modal window (see SectorMessageWindow) applies to this one; it only
+    // looked different because the caller needs the answer, and awaiting it does that just as well.
+    static Task<bool> AskYesNoAsync(string message, string caption)
     {
-        if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            return (bool)mainForm.Invoke(new Func<bool>(() => ShowYesNo(mainForm, message, caption)));
+        var answer = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        return ShowYesNo(null, message, caption);
-    }
+        void Show()
+        {
+            try
+            {
+                var prompt = new SectorConflictPromptWindow(message, caption);
+                var timeout = new System.Windows.Forms.Timer { Interval = (int)ConflictPromptTimeout.TotalMilliseconds };
 
-    static bool ShowYesNo(IWin32Window? owner, string message, string caption)
-    {
-        using var prompt = new SectorConflictPromptWindow(message, caption);
-        var result = owner != null ? prompt.ShowDialog(owner) : prompt.ShowDialog();
+                timeout.Tick += (_, _) =>
+                {
+                    timeout.Stop();
+                    if (!prompt.IsDisposed)
+                        prompt.Close();
+                };
 
-        return result == DialogResult.Yes;
+                prompt.FormClosed += (_, _) =>
+                {
+                    timeout.Stop();
+                    timeout.Dispose();
+                    // Anything but an explicit Yes - No, the title bar's close, the timeout - is no.
+                    answer.TrySetResult(prompt.Answer);
+                };
+
+                if (Application.OpenForms["MainForm"] is Form mainForm)
+                    prompt.Show(mainForm);
+                else
+                    prompt.Show();
+
+                prompt.BringToFront();
+                timeout.Start();
+            }
+            catch (Exception ex)
+            {
+                answer.TrySetException(ex);
+            }
+        }
+
+        RunOnUiThread(Show);
+
+        // Belt and braces for the timeout above, which is a WinForms timer and so only fires where
+        // there is a message loop. RunOnUiThread falls back to running inline when it finds no main
+        // form, and a window opened on a pool thread would never tick - leaving the claim loop that
+        // asked waiting on an answer for the rest of the session.
+        _ = Task.Delay(ConflictPromptTimeout + TimeSpan.FromSeconds(10))
+            .ContinueWith(_ => answer.TrySetResult(false), TaskScheduler.Default);
+
+        return answer.Task;
     }
 
     // Fire-and-forget UI-thread marshaling for callers (the MMI.SectorsControlledChanged
-    // subscription) that don't need anything back - see AskYesNo above for the blocking variant
-    // used when a return value is needed.
+    // subscription) that don't need anything back - see AskYesNoAsync above for the awaited
+    // variant used when an answer is needed.
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)

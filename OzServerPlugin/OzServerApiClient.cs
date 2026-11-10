@@ -238,8 +238,26 @@ public class OzServerFdrUpdateDto
     [JsonProperty("runway_string")] public string? RunwayString { get; set; }
     [JsonProperty("departure_runway")] public string? DepartureRunway { get; set; }
     [JsonProperty("rfl")] public int? Rfl { get; set; }
-    [JsonProperty("cfl_lower")] public int? CflLower { get; set; }
-    [JsonProperty("cfl_upper")] public int? CflUpper { get; set; }
+
+    // The cleared level, and the one field pair here where "none" has to be *said*.
+    //
+    // Everything else on this DTO is left out when null, and the backend merges what it is sent
+    // over what it has - right for a field a partial push simply does not know. But a cleared level
+    // can go away again: a block clearance (lower + upper) reverts to a single level, and vatSys
+    // sets CFLLower back to its "not set" value. Left out, the backend kept the old lower level for
+    // good - and SectorTagHandoff.ApplyClearanceDataAsync, which copies the backend's CFL onto a
+    // tag this controller has just been handed, then put that stale block back on the *next*
+    // controller's label. A clearance nobody issued, appearing on a transfer.
+    //
+    // So these two are sent as explicit nulls whenever the push actually read them off the FDR
+    // (ClearanceKnown - a full FDR push), and still left out when it did not (a radar-only position
+    // update, which knows nothing about clearances and must not blank one).
+    [JsonProperty("cfl_lower", NullValueHandling = NullValueHandling.Include)] public int? CflLower { get; set; }
+    [JsonProperty("cfl_upper", NullValueHandling = NullValueHandling.Include)] public int? CflUpper { get; set; }
+    [JsonIgnore] public bool ClearanceKnown { get; set; }
+    // Newtonsoft's conditional-serialisation convention: ShouldSerialize + the property's own name.
+    public bool ShouldSerializeCflLower() => ClearanceKnown;
+    public bool ShouldSerializeCflUpper() => ClearanceKnown;
     [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
     [JsonProperty("atd")] public DateTime? Atd { get; set; }
     [JsonProperty("etd")] public DateTime? Etd { get; set; }
@@ -287,6 +305,14 @@ public class OzServerAtisUpdateDto
 public class OzServerApiClient
 {
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+
+    // The ownership poll's own, much shorter limit. That GET is what keeps this controller "present"
+    // on the backend (every request is a heartbeat, and presence lapses after a few seconds without
+    // one), and the tracker runs one poll at a time - so a single request left hanging for the full
+    // RequestTimeout held every later poll off and let the session read as gone while it was
+    // perfectly connected. The response is a few hundred bytes; one that has not arrived in this
+    // long is not coming, and giving up lets the next tick try on a fresh attempt.
+    static readonly TimeSpan SyncTimeout = TimeSpan.FromSeconds(6);
 
     // Enough that the background traffic (FDR batch, two polls, ATIS) can never occupy every slot
     // and leave a controller-initiated request waiting for one - see CreateClient.
@@ -359,8 +385,18 @@ public class OzServerApiClient
     // conflict-checked) - see SectorOwnershipController::claim. Used to retry a claim that 409'd,
     // carving out whichever sub-sectors turned out to already be owned by someone else rather than
     // failing the whole thing.
-    public Task ClaimSectorAsync(string sectorName, IEnumerable<string> exclude) =>
-        PostAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/claim", new { exclude = exclude.ToArray() });
+    //
+    // primaryGroup is this session's own position - the sectors it holds by right when logged on
+    // (PrimaryPosition.DefaultSectorsFor). The backend lets a position's own controller take those
+    // straight back from whoever extended into them, and nothing else: the rest of what a claim
+    // covers top-down is only taken when nobody present is working it. Left out when null, which an
+    // older backend ignores either way.
+    public Task ClaimSectorAsync(string sectorName, IEnumerable<string> exclude, IEnumerable<string>? primaryGroup = null) =>
+        PostAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/claim", new
+        {
+            exclude = exclude.ToArray(),
+            primary_group = primaryGroup?.ToArray()
+        });
 
     public Task ReleaseSectorAsync(string sectorName) => PostAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/release");
 
@@ -406,17 +442,19 @@ public class OzServerApiClient
     // PrimaryPosition.StaffedCoveredSectors.
     public Task<OzServerCommitResponseDto> CommitAsync(
         IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request,
-        IEnumerable<string> exclude) =>
+        IEnumerable<string> exclude, IEnumerable<string>? primaryGroup = null) =>
         PostAsync<OzServerCommitResponseDto>("/sectors/commit", new
         {
             claim = claim.ToArray(),
             release = release.ToArray(),
             request = request.ToArray(),
             exclude = exclude.ToArray(),
+            // See ClaimSectorAsync.
+            primary_group = primaryGroup?.ToArray(),
         });
 
     public Task<OzServerSyncDto> GetSyncAsync() =>
-        GetAsync("/sectors/sync", () => new OzServerSyncDto());
+        GetAsync("/sectors/sync", () => new OzServerSyncDto(), SyncTimeout);
 
     // Sectors someone *else* currently owns on OzServer (the backend excludes my own CID) - this
     // is "Controlled" mode's actual data source, not live VATSIM presence (see
@@ -504,7 +542,7 @@ public class OzServerApiClient
     // AtisController::update - upserts this ICAO's current ATIS state, keyed by icao.
     public Task UpdateAtisAsync(OzServerAtisUpdateDto atis) => PostAsync("/atis", atis);
 
-    async Task<T> GetAsync<T>(string path, Func<T> empty)
+    async Task<T> GetAsync<T>(string path, Func<T> empty, TimeSpan? timeout = null)
     {
         var (cid, callsign, server) = GetCredentials();
         var url = $"{OzServerSettings.BaseUrl}/api/v1{path}?controller_cid={cid}&controller_callsign={Uri.EscapeDataString(callsign)}&server={Uri.EscapeDataString(server)}";
@@ -512,11 +550,20 @@ public class OzServerApiClient
         HttpResponseMessage response;
         try
         {
-            response = await Http.GetAsync(url).ConfigureAwait(false);
+            if (timeout is { } limit)
+            {
+                // The client's own Timeout still applies; this only ever shortens it.
+                using var cancel = new System.Threading.CancellationTokenSource(limit);
+                response = await Http.GetAsync(url, cancel.Token).ConfigureAwait(false);
+            }
+            else
+            {
+                response = await Http.GetAsync(url).ConfigureAwait(false);
+            }
         }
         catch (Exception ex)
         {
-            var transportMessage = DescribeTransportFailure(ex);
+            var transportMessage = DescribeTransportFailure(ex, timeout ?? RequestTimeout);
             ActionLog.LogAttempt("GET", path, false, transportMessage);
             throw new OzServerApiException(transportMessage);
         }
@@ -596,9 +643,9 @@ public class OzServerApiClient
     // HttpClient reports its own Timeout as a bare TaskCanceledException whose Message is just
     // "A task was canceled." - indistinguishable, to anyone reading the vatSys error log, from a
     // cancellation this plugin asked for (it never does). Name the real cause instead.
-    static string DescribeTransportFailure(Exception ex) =>
+    static string DescribeTransportFailure(Exception ex, TimeSpan? timeout = null) =>
         ex is OperationCanceledException // TaskCanceledException, which is what a timeout raises, derives from this
-            ? $"OzServer at {OzServerSettings.BaseUrl} didn't respond within {RequestTimeout.TotalSeconds:0.#}s."
+            ? $"OzServer at {OzServerSettings.BaseUrl} didn't respond within {(timeout ?? RequestTimeout).TotalSeconds:0.#}s."
             : $"Couldn't reach OzServer at {OzServerSettings.BaseUrl}: {ex.Message}";
 
     static (string Message, List<OzServerSectorConflictDto> Conflicts) ParseError(string body, int statusCode)

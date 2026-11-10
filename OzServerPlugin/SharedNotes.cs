@@ -52,8 +52,14 @@ public class SharedNotes
     readonly Dictionary<object, LocalNote> _local = new(ReferenceEqualityComparer.Instance);
 
     // The last set fetched from the server. Held so a poll can inject without waiting on a request,
-    // and refreshed by the annotations signal rather than by polling the API.
+    // and refreshed by the annotations signal - with a slow fetch of its own behind that (see
+    // Poll), because a signal that never arrives must cost latency, not the notes themselves.
     List<OzServerAnnotationDto> _remote = new();
+
+    // Every this-many passes of Poll, re-read the server's notes whether or not anything signalled.
+    // Poll runs every two seconds, so this is about every twenty.
+    const int FallbackFetchEveryPolls = 10;
+    int _pollsSinceFetch;
 
     sealed class LocalNote
     {
@@ -129,6 +135,15 @@ public class SharedNotes
     // the server says. Runs on the UI thread, so nothing here races the controller's own edits.
     void Poll()
     {
+        // Outside the scope work below, which returns early when no scope is open.
+        if (++_pollsSinceFetch >= FallbackFetchEveryPolls)
+        {
+            _pollsSinceFetch = 0;
+
+            if (Network.IsConnected && NetworkServer.Current != null)
+                _ = RefreshRemoteAsync();
+        }
+
         try
         {
             var controls = AsdMapLayer.AsdControls().ToList();

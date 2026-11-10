@@ -10,11 +10,15 @@ namespace OzServerPlugin;
 // whenever its letter/content actually changes, so a controller taking over the same station later
 // can pull the last-broadcast info back in via GET /atis/{icao} (AtisController, backend).
 //
-// Deliberately push-on-change only, subscribed straight to vatsys.ATIS.Updated (which fires from
+// Pushed on change, subscribed straight to vatsys.ATIS.Updated (which fires from
 // UpdateATIS/UpdateATISNoTTS on a real content/letter change, and from DeleteATIS when the ATIS is
-// torn down) - no periodic heartbeat. The backend's own staleness rule (60 minutes since the last
-// push - see OzServer-API's runMaintenance/ATIS_RETAIN_MINUTES) is what ages an abandoned entry out,
-// not a liveness ping, so there is nothing to send here beyond "the content changed to this".
+// torn down) - and again every RefreshInterval for as long as it is still broadcasting.
+//
+// The second half exists because the backend ages an entry out 60 minutes after its last push (see
+// OzServer-API's runMaintenance/ATIS_RETAIN_MINUTES), which is how an abandoned one goes away. With
+// change-only pushes that same rule also removed an ATIS that was still on the air and simply had
+// not changed for an hour - settled weather, which is most of the time - from the map and from the
+// record the next controller on the station picks up.
 //
 // Only vatsys.ATIS itself (slot 0) is covered. The SDK's other 3 ATIS slots (vatsys.Network.
 // ConnectATIS/DisconnectATIS/UpdateATIS(atisIndex, ...)) are a separate public API meant for a
@@ -24,14 +28,22 @@ namespace OzServerPlugin;
 // 1-3 would need that other plugin to expose its own state to this one; out of scope until it exists.
 public class AtisSync
 {
+    // Comfortably inside the backend's 60 minute retention, so one missed push does not cost the entry.
+    static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(20);
+
     readonly OzServerApiClient _api = new();
+    readonly System.Threading.Timer _refreshTimer;
 
     public AtisSync()
     {
         vatsys.ATIS.Updated += (_, _) => _ = PushAsync();
+        // PushAsync already declines when nothing is broadcasting or there is no session.
+        _refreshTimer = new System.Threading.Timer(_ => _ = PushAsync(quiet: true), null, RefreshInterval, RefreshInterval);
     }
 
-    async Task PushAsync()
+    // quiet: the periodic re-push. A failure there is not worth the Errors window - the next change,
+    // or the next interval, sends the same thing again.
+    async Task PushAsync(bool quiet = false)
     {
         var icao = vatsys.ATIS.AirportIcao;
         var letter = vatsys.ATIS.Code;
@@ -63,7 +75,8 @@ public class AtisSync
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't push ATIS to OzServer: {ex.Message}", ex), "OzServer");
+            if (!quiet)
+                Errors.Add(new Exception($"Couldn't push ATIS to OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 }

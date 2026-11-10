@@ -40,6 +40,12 @@ public class BadVectorsAtisSync
     // so there's nothing to remove this on.
     readonly List<object> _subscribed = new();
 
+    // Every station still on the air is pushed again this often, for the reason AtisSync gives: the
+    // backend drops an entry 60 minutes after its last push, and an ATIS that has not changed for an
+    // hour is still an ATIS.
+    static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(20);
+    DateTime _nextRefresh = DateTime.UtcNow + RefreshInterval;
+
     public BadVectorsAtisSync()
     {
         _timer = new Timer(_ => Rescan(), null, RescanInterval, RescanInterval);
@@ -49,6 +55,15 @@ public class BadVectorsAtisSync
     {
         try
         {
+            if (DateTime.UtcNow >= _nextRefresh)
+            {
+                _nextRefresh = DateTime.UtcNow + RefreshInterval;
+
+                // PushAsync declines a station with nothing on it, and when there is no session.
+                foreach (var control in _subscribed.ToList())
+                    _ = PushAsync(control, quiet: true);
+            }
+
             var pluginType = AppDomain.CurrentDomain.GetAssemblies()
                 .FirstOrDefault(a => a.GetName().Name == "ATISPlugin")
                 ?.GetType("ATISPlugin.Plugin");
@@ -82,11 +97,12 @@ public class BadVectorsAtisSync
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't hook into badvectors/ATISPlugin: {ex.Message}", ex), "OzServer");
+            // This runs every five seconds; whatever broke will break again on the next pass.
+            ErrorThrottle.Report("atisplugin-hook", $"Couldn't hook into badvectors/ATISPlugin: {ex.Message}", ex);
         }
     }
 
-    async Task PushAsync(object? control)
+    async Task PushAsync(object? control, bool quiet = false)
     {
         // NetworkServer.Current: see AtisSync.PushAsync.
         if (control == null || !Network.IsConnected || NetworkServer.Current == null)
@@ -128,7 +144,8 @@ public class BadVectorsAtisSync
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't push ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
+            if (!quiet)
+                Errors.Add(new Exception($"Couldn't push ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 

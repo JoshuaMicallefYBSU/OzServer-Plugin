@@ -73,6 +73,9 @@ public class MapDrawing
 
     readonly AsdMapLayer _layer;
     readonly AsdMapLayer _remoteLayer;
+    // See the constructor. Slow, because it only matters when the push channel is not working.
+    static readonly TimeSpan FallbackPollInterval = TimeSpan.FromSeconds(20);
+    readonly System.Threading.Timer _fallbackTimer;
     // Its own client, the same way OzServerOwnershipTracker keeps one - the class is a thin
     // wrapper over a shared static HttpClient, so an instance costs nothing.
     readonly OzServerApiClient _api = new();
@@ -104,14 +107,24 @@ public class MapDrawing
         _remoteLayer = new AsdMapLayer("OzServer Drawing Remote", RemoteColourName,
             remote.Red, remote.Green, remote.Blue, remote.Alpha, PoolSize, StrokeWidth);
 
-        // Push, not poll: the backend signals "annotations" whenever anyone changes anything, and
-        // the plugin re-reads. Drawing is the one feature here where a delay is obvious - somebody
-        // is drawing while you watch.
+        // Push first: the backend signals "annotations" whenever anyone changes anything, and the
+        // plugin re-reads. Drawing is the one feature here where a delay is obvious - somebody is
+        // drawing while you watch.
         OzServerEventStream.Shared.EventReceived += name =>
         {
             if (name == "annotations")
                 _ = RefreshRemoteAsync();
         };
+
+        // And a slow poll behind it. Push was the *only* thing that ever re-read this, so while the
+        // event stream was down - which, for a long time, was always - everyone else's drawing was
+        // whatever happened to exist at the moment of connecting, and never changed again. Every
+        // other consumer of the stream keeps a fallback for exactly that reason; this one now does.
+        _fallbackTimer = new System.Threading.Timer(_ =>
+        {
+            if (Network.IsConnected && NetworkServer.Current != null)
+                _ = RefreshRemoteAsync();
+        }, null, FallbackPollInterval, FallbackPollInterval);
 
         // Someone else's markup outlives our own session, so what already exists has to be fetched
         // rather than waited for - the next signal might be minutes away.

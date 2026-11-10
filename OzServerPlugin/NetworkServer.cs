@@ -1,4 +1,6 @@
 using System;
+using System.Linq;
+using System.Reflection;
 using vatsys;
 
 namespace OzServerPlugin;
@@ -11,13 +13,26 @@ namespace OzServerPlugin;
 // this plugin. IsOfficialServer is true only for a real numbered VATSIM server; SweatBox-1,
 // SweatBox-2 and LocalHost all read false. ServerIP is the literal FSD hostname dialed.
 //
-// The two SweatBox hostnames below are VATPAC's own dedicated training servers, not the
-// VATSIM-wide sweatbox.vatsim.net/-2 defaults this class originally assumed - confirmed against
-// the real ServerIP a live SweatBox-1 connection reported (via the fallback log line below, which
-// is exactly what caught this the first time): VATPAC's Profile.xml overrides both targets
-// entirely, division-wide, the same way any division's own training server would. SweatBox-2's
-// value below mirrors SB1's naming and has not yet been directly observed - if it's wrong, the
-// same fallback line will say so the next time someone connects to it.
+// Which SweatBox is which is read from vatSys rather than from a list of hostnames kept here.
+//
+// The connection window offers "SweatBox-1" and "SweatBox-2"; what each one dials is whatever the
+// loaded profile says (Profile.xml's <SweatBox url> and <SweatBox2 url>, which Profile.cs copies
+// into Network.SweatBoxURL and Network.SweatBox2URL), and ServerIP is then simply that string. So
+// the question "is this SweatBox-1" is answered exactly by "does ServerIP equal SweatBoxURL" - and
+// answering it with a hardcoded hostname instead meant the plugin stopped recognising a SweatBox
+// the day VATPAC renamed its servers. That has already happened once: this class knew them as
+// sweatbox01-training/sweatbox02-training.vatpac.org, and the Australia profile now ships
+// sweatbox1/sweatbox2.vatpac.org - on which every OzServer call was refused as "not available on
+// this server".
+//
+// Both fields are internal to vatSys, so they are read by reflection. If a future vatSys renames
+// them, the known hostnames below are the fallback, and the log line at the bottom still names any
+// address that matches nothing.
+//
+// Only VATPAC's own servers count. A profile from another division points the same two slots at
+// its own training servers (or leaves vatSys's sweatbox.vatsim.net defaults), and OzServer's "sb1"
+// is one shared room - matching on the slot alone would put strangers from an unrelated exercise
+// into it.
 //
 // LocalHost is not a supported environment: OzServer simply does not operate there (every API
 // call fails the same way it does while fully disconnected - see GetCredentials), and Current
@@ -26,8 +41,40 @@ namespace OzServerPlugin;
 // reason to.
 static class NetworkServer
 {
-    const string SweatBox1Host = "sweatbox01-training.vatpac.org";
-    const string SweatBox2Host = "sweatbox02-training.vatpac.org"; // unconfirmed - see comment above
+    const string VatpacDomain = ".vatpac.org";
+
+    // Every address each SweatBox has been known by. Only consulted when the profile's own values
+    // cannot be read - see the class comment.
+    static readonly string[] KnownSweatBox1Hosts = { "sweatbox1.vatpac.org", "sweatbox01-training.vatpac.org" };
+    static readonly string[] KnownSweatBox2Hosts = { "sweatbox2.vatpac.org", "sweatbox02-training.vatpac.org" };
+
+    static readonly FieldInfo? SweatBox1Field =
+        typeof(Network).GetField("SweatBoxURL", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+    static readonly FieldInfo? SweatBox2Field =
+        typeof(Network).GetField("SweatBox2URL", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+
+    // Read each time rather than cached: the profile is loaded after plugins are constructed, and
+    // can be changed without restarting vatSys.
+    static string? ProfileHost(FieldInfo? field)
+    {
+        try
+        {
+            return field?.GetValue(null) as string;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    static bool IsSweatBox(string ip, FieldInfo? profileField, string[] knownHosts)
+    {
+        if (!ip.EndsWith(VatpacDomain, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return string.Equals(ip, ProfileHost(profileField), StringComparison.OrdinalIgnoreCase)
+               || knownHosts.Contains(ip, StringComparer.OrdinalIgnoreCase);
+    }
 
     // Must match the API's own allowlist (auth.ts SERVERS) exactly. Kept in sync by hand - there is
     // no shared source between a C# plugin and a Node API for this.
@@ -59,8 +106,8 @@ static class NetworkServer
             if (Network.IsOfficialServer) return Live;
 
             var ip = Network.ServerIP ?? "";
-            if (string.Equals(ip, SweatBox1Host, StringComparison.OrdinalIgnoreCase)) return SweatBox1;
-            if (string.Equals(ip, SweatBox2Host, StringComparison.OrdinalIgnoreCase)) return SweatBox2;
+            if (IsSweatBox(ip, SweatBox1Field, KnownSweatBox1Hosts)) return SweatBox1;
+            if (IsSweatBox(ip, SweatBox2Field, KnownSweatBox2Hosts)) return SweatBox2;
 
             // Blank (never connected, or LocalHost's own default) or unrecognized. Logged only when
             // there is actually something to report - forwarded to client_logs the same way any
