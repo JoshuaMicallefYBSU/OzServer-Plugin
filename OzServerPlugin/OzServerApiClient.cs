@@ -297,6 +297,58 @@ public class OzServerAtisUpdateDto
     [JsonProperty("frequency")] public int? Frequency { get; set; }
 }
 
+// PUT /api/v1/vatsim/atis/{icao} - the broadcast itself, published as the controller is making it.
+//
+// Not the same thing as OzServerAtisUpdateDto above, which records what one OzServer controller's
+// client last sent for one server, for the next controller on the station to pick up. This is the
+// public record: it is what the website map draws and what anything reading /api/v1/vatsim/atis
+// gets, so it carries the whole broadcast - the station it goes out on, whether it is a sectioned
+// ATIS or a closed tower's free text, when the controller issued it, and which sections this
+// letter changed.
+//
+// Replaces the entry for its airport outright, and sending the same one twice is harmless, so a
+// periodic re-send is a safe way to say "still on the air" (the backend drops an ATIS it has not
+// heard again in NETWORK_ATIS_RETAIN_MINUTES - 90 - and there is deliberately no way to withdraw
+// one before then).
+public class OzServerAtisPublishDto
+{
+    [JsonProperty("icao")] public string Icao { get; set; } = "";
+    // The ATIS station as connected - "YSSY_ATIS".
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    [JsonProperty("atis_letter")] public string AtisLetter { get; set; } = "";
+    // "atis" for an ordinary sectioned broadcast, "zulu" for the free text a closed tower leaves
+    // running. Decides what Content below is allowed to be - the backend refuses a mismatch.
+    [JsonProperty("type")] public string Type { get; set; } = "atis";
+    // "126.250", as it is displayed and spoken. Left out when the station has no frequency of its
+    // own - this is only ever shown, never tuned, so it stays the text the controller sees.
+    [JsonProperty("frequency")] public string? Frequency { get; set; }
+    // ISO 8601 UTC. When the controller issued this letter, NOT when this was sent: re-publishing
+    // an unchanged ATIS must not make it look newer than the broadcast actually is.
+    [JsonProperty("issued")] public string Issued { get; set; } = "";
+    // Section name (WIND, QNH, ...) -> value for an "atis"; the broadcast text itself, as a plain
+    // string, for a "zulu". A section name the backend does not serve is dropped there rather than
+    // refused, so sending one costs nothing.
+    [JsonProperty("content")] public object Content { get; set; } = new Dictionary<string, string>();
+    // The sections this letter changed - the ones vatSys marks with a leading + in the ATIS text.
+    [JsonProperty("changed")] public List<string> Changed { get; set; } = new();
+    // Who is broadcasting it, and what published it. Both are stored but never served publicly;
+    // they are what makes a wrong or stale ATIS traceable to the session that sent it.
+    [JsonProperty("controller")] public OzServerAtisControllerDto Controller { get; set; } = new();
+    [JsonProperty("client")] public OzServerAtisClientDto? Client { get; set; }
+}
+
+public class OzServerAtisControllerDto
+{
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    [JsonProperty("cid")] public int Cid { get; set; }
+}
+
+public class OzServerAtisClientDto
+{
+    [JsonProperty("name")] public string Name { get; set; } = "";
+    [JsonProperty("version")] public string Version { get; set; } = "";
+}
+
 // Talks to the OzServer backend's sector-ownership API. Every call attaches this vatSys session's
 // CID, callsign and connected server (NetworkServer.Current - live/sb1/sb2/newsb), which the API
 // uses as the controller identity without waiting for the lagging VATSIM datafeed, and to keep
@@ -542,6 +594,13 @@ public class OzServerApiClient
     // AtisController::update - upserts this ICAO's current ATIS state, keyed by icao.
     public Task UpdateAtisAsync(OzServerAtisUpdateDto atis) => PostAsync("/atis", atis);
 
+    // Publishes the broadcast itself (see OzServerAtisPublishDto). PUT rather than POST, and the
+    // only call here that does not carry this session's controller_cid/controller_callsign/server:
+    // that endpoint is not one of the plugin-authenticated routes, and the ATIS names its own
+    // controller inside the body instead.
+    public Task PublishAtisAsync(OzServerAtisPublishDto atis) =>
+        PutAsync($"/vatsim/atis/{Uri.EscapeDataString(atis.Icao)}", atis);
+
     async Task<T> GetAsync<T>(string path, Func<T> empty, TimeSpan? timeout = null)
     {
         var (cid, callsign, server) = GetCredentials();
@@ -637,6 +696,39 @@ public class OzServerApiClient
 
             ActionLog.LogAttempt("POST", path, true);
             return responseBody;
+        }
+    }
+
+    // Sent exactly as given - no identity merged in the way PostRawAsync does, because the one
+    // endpoint this serves authenticates nothing and would simply ignore it.
+    async Task PutAsync(string path, object requestBody)
+    {
+        var payload = JObject.FromObject(requestBody, BodySerializer).ToString(Formatting.None);
+
+        HttpResponseMessage response;
+        try
+        {
+            using var content = new StringContent(payload, Encoding.UTF8, "application/json");
+            response = await Http.PutAsync(OzServerSettings.BaseUrl + "/api/v1" + path, content).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            var transportMessage = DescribeTransportFailure(ex);
+            ActionLog.LogAttempt("PUT", path, false, transportMessage);
+            throw new OzServerApiException(transportMessage);
+        }
+
+        using (response)
+        {
+            var responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                var (message, _) = ParseError(responseBody, (int)response.StatusCode);
+                ActionLog.LogAttempt("PUT", path, false, message);
+                throw new OzServerApiException(message, (int)response.StatusCode);
+            }
+
+            ActionLog.LogAttempt("PUT", path, true);
         }
     }
 

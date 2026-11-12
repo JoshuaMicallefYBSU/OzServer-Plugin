@@ -65,6 +65,12 @@ public class SectorOwnershipDiff
 // MMI.SectorsControlled and releasing anything Owned showed that MMI didn't - which fought a VSCS
 // transmit claim (never reflected in MMI on its own) in a claim/release loop. One source of truth.
 //
+// So a release is never *inferred* from a sector's absence in MMI, but it is still driven by the
+// thing that caused the absence, in the one case where that thing is unambiguous: a VSCS line
+// dropped out of Transmit. AfvSectorClaimer calls ReleaseIdleVscsLineAsync for it directly, naming
+// the one sector the controller just stopped working, rather than this class guessing from a diff
+// which of MMI's omissions were deliberate.
+//
 // Ownership also flows the other way now: whenever Owned actually changes (see
 // ReconcileMmiWithOwned), MMI.SectorsControlled and the matching VSCS line are updated to match -
 // a sector gained (most notably: someone accepted a request I sent them) is added to
@@ -1182,6 +1188,130 @@ public class OzServerOwnershipTracker
         await RefreshFromServerAsync();
     }
 
+    // Gives a sector back because its own VSCS line stopped transmitting - the mirror image of
+    // AfvSectorClaimer's claim-on-transmit, and the only release not driven by the Sectors window's
+    // arrow button. It has to be called explicitly from there: the MMI-driven path
+    // (ClaimMmiControlledSectorsAsync) is claim-only on purpose, so a sector dropping out of
+    // MMI.SectorsControlled never releases anything by itself. Without this, dropping a line to
+    // Idle took the sector's infill off the scope - AfvSectorClaimer.CheckActive removing it from
+    // MMI - while OzServer went on recording it as this controller's, so it stayed in the OzServer
+    // Sectors window and stayed unavailable to everybody else.
+    //
+    // Releasing the sector by name is enough for the whole group that went with it: the backend
+    // releases the named sector plus every sector it is responsible for that this controller owns
+    // (SectorOwnershipController::releaseGroup, walking the same ResponsibleSectors relation vatSys
+    // builds Sector.SubSectors from), which is exactly the set CheckActive takes out of MMI.
+    //
+    // Kept separate from ReleaseAsync above rather than folded into it, for two reasons:
+    //
+    //  - 403 is an ordinary answer here, not a fault worth putting the Errors window over the
+    //    scope. The backend refuses a release from anyone who isn't the current owner, and a line
+    //    can legitimately be dropped to Idle for a sector OzServer never recorded as this
+    //    controller's: cover withheld on login, a claim that lost a conflict, or a sector some
+    //    other path released a moment ago. The arrow button is an explicit "give this back" and
+    //    deserves to be told when it fails; this is a side effect of a frequency press and stays
+    //    quiet.
+    //  - It deliberately does NOT check Owned first. Owned trails the server by a round trip, so a
+    //    line pressed to Transmit and back to Idle inside that window reads as "not mine yet" and
+    //    would skip the very release this exists for - leaving behind exactly the drift it is
+    //    meant to prevent. The server is the source of truth for ownership (see the class comment);
+    //    ask it and let it decide.
+    public async Task ReleaseIdleVscsLineAsync(SectorsVolumes.Sector sector)
+    {
+        // Same gates as the claim path: nothing to release while offline or on a server OzServer
+        // doesn't operate on, and an observer never owned it in the first place.
+        if (!CanSync || !IsRealAtc)
+            return;
+
+        try
+        {
+            await _api.ReleaseSectorAsync(sector.Name);
+        }
+        catch (OzServerApiException ex) when (ex.StatusCode == 403)
+        {
+            // Not this controller's to give back - nothing changed, so there is nothing to refresh
+            // either. Still recorded: "the line went Idle and OzServer already didn't have it" is
+            // the answer to why a sector did not disappear from the Sectors window.
+            ActionLog.Log("Ownership", $"VSCS line for {sector.Name} went idle, but OzServer doesn't record it as ours", new
+            {
+                action = "vscs_idle_release_not_owner",
+                sector = sector.Name,
+                own_callsign = Network.Me?.Callsign
+            });
+            return;
+        }
+        catch (Exception ex)
+        {
+            // Throttled rather than raised per press: a backend that is down answers every one of
+            // these the same way, and the controller can do nothing about it.
+            ErrorThrottle.Report("vscs-release:" + sector.Name,
+                $"Couldn't release {sector.Name} on OzServer: {ex.Message}", ex);
+            return;
+        }
+
+        ActionLog.Log("Ownership", $"Released {sector.Name} - its VSCS line is no longer transmitting", new
+        {
+            action = "vscs_idle_release",
+            sector = sector.Name,
+            own_callsign = Network.Me?.Callsign
+        });
+
+        await ReclaimOwnPositionAfterReleaseAsync(sector);
+        await RefreshFromServerAsync();
+    }
+
+    // A release hands back the named sector's *whole* covered group, and that group can contain
+    // this session's own position. A controller logged on as a bare sub-sector (say SNO) who
+    // extended into the parent group it belongs to (WOL) and then drops WOL's line is releasing a
+    // group that covers SNO itself - so the one sector they are certainly entitled to goes with the
+    // extension they meant to give up, and they are left logged on to a position OzServer no longer
+    // records as theirs by anyone's reckoning.
+    //
+    // Taken straight back rather than prevented: the alternative is refusing the release outright
+    // whenever the group happens to cover the position, which would leave exactly the drift this
+    // whole path exists to remove. The backend grants a position's own controller its group
+    // unconditionally (primary_group - see OzServerApiClient.ClaimSectorAsync), so this cannot turn
+    // into a conflict prompt about the controller's own airspace, and awaiting it before the refresh
+    // below means Owned is only ever read once the position is back - no flicker of the controller's
+    // own sector through MMI and the Sectors window.
+    //
+    // Scoped to the login sector alone, not everything held by right (DefaultSectorsForCurrentSession):
+    // claiming a sector re-creates its whole group server-side, so re-claiming the broader set would
+    // resurrect sub-sectors this controller had deliberately dropped earlier - including, when the
+    // sector just released is itself part of the position's group, the very one being released.
+    async Task ReclaimOwnPositionAfterReleaseAsync(SectorsVolumes.Sector released)
+    {
+        var ownSector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == Network.Me?.Callsign);
+        if (ownSector == null || ownSector.Equals(released))
+            return;
+
+        // CoveredBy mirrors the backend's own covered() walk, which is what releaseGroup used to
+        // decide the set it just deleted.
+        if (!PrimaryPosition.CoveredBy(released).Any(covered => covered.Equals(ownSector)))
+            return;
+
+        try
+        {
+            await ClaimWithExclusionsAsync(ownSector);
+            ActionLog.Log("Ownership",
+                $"Took {ownSector.Name} back - releasing {released.Name} covered this session's own position", new
+                {
+                    action = "vscs_idle_release_keep_own_position",
+                    sector = ownSector.Name,
+                    released = released.Name,
+                    own_callsign = Network.Me?.Callsign
+                });
+        }
+        catch (Exception ex)
+        {
+            // Worth a window of its own: unlike the release itself, this one failing means the
+            // controller is sitting on a position OzServer does not record as theirs, which no
+            // other path will notice and put right on its own.
+            Errors.Add(new Exception(
+                $"Released {released.Name}, but couldn't take {ownSector.Name} back: {ex.Message}", ex), "OzServer");
+        }
+    }
+
     public async Task AcceptRequestAsync(int requestId)
     {
         if (!Network.IsConnected)
@@ -1256,7 +1386,9 @@ public class OzServerOwnershipTracker
     //
     // Deliberately claim-only otherwise: releasing is never inferred from MMI absence (that's the
     // claim/release loop described in the class comment) - it only ever happens from an explicit
-    // action (the arrow button) or a genuine conflict, handled below.
+    // action (the arrow button, or a VSCS line dropping out of Transmit, which calls
+    // ReleaseIdleVscsLineAsync itself rather than leaving it to be guessed from here) or a genuine
+    // conflict, handled below.
     //
     // A sector already in Owned is skipped entirely, not re-claimed - claiming a primary always
     // asks the backend to recreate its *whole* responsible_sectors group unconditionally (see

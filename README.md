@@ -14,7 +14,7 @@ OzServer flows back into vatSys and onto your VSCS panel automatically.
 
 | | |
 | --- | --- |
-| **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer. A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. |
+| **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer, and a VSCS line dropping out of Transmit releases it again. A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. |
 | **Sector requests** | Ask another controller for a sector they own. Accepting the `Requested From Me` heading accepts every incoming request in one batch; accepting a row accepts just that one. A denial is reported back to whoever asked. |
 | **Conflict handling** | Claiming a primary that bundles sub-sectors someone else already holds takes everything that *isn't* contested and leaves the rest with their owner, reporting which. It never turns those into requests behind your back — asking is something you do explicitly, by staging the sector you want. |
 | **Primary inheritance** | Logging in under a position's own callsign takes that position's sectors regardless of who was holding them. Whoever had them is told, and gives them up. A primary is never kept from its own controller. |
@@ -147,9 +147,15 @@ Pressing Transmit on a VSCS line is the normal way to claim:
 - A **primary's** line (e.g. `WOL`) adds it *and its whole group*, matching what "extend" means on
   the scope. Whether each sub-sector is actually claimable is then resolved once, on OzServer.
 
-Releasing is never inferred from a sector merely disappearing from `MMI.SectorsControlled`. There are
-exactly four things that release: an applied `>>`, a genuine conflict, a position's own controller
-logging on (`PrimaryPositionWatcher`), and a deliberate disconnect (`GracefulDisconnectReleaser`).
+Dropping that line again — to **Idle**, or to **Recv**, both of which clear Transmit — gives the
+sector back: it comes off your scope *and* is released on OzServer, so it leaves the Sectors window
+and is immediately available to everyone else. Your own position is never given away this way, even
+when the group you dropped is responsible for it.
+
+Releasing is still never *inferred* from a sector merely disappearing from `MMI.SectorsControlled`.
+There are exactly five things that release: a VSCS line dropping out of Transmit, an applied `>>`, a
+genuine conflict, a position's own controller logging on (`PrimaryPositionWatcher`), and a deliberate
+disconnect (`GracefulDisconnectReleaser`).
 
 ---
 
@@ -282,13 +288,13 @@ Four rules if you touch the styling:
 | `GracefulDisconnectReleaser.cs` | Releases everything on a deliberate exit, and stays silent on a crash |
 | `VatSysContextMenu.cs` | Middle-click menu, drawn with vatSys's own `MenuRenderer` |
 | `SectorChangeRequest.cs` | One pending request, as the window renders it |
-| `AfvSectorClaimer.cs` | Turns VSCS transmit state into `MMI.SectorsControlled` changes |
+| `AfvSectorClaimer.cs` | Turns VSCS transmit state into `MMI.SectorsControlled` changes, and a line going quiet into a release |
 | `ControllerInfoUpdater.cs` | Maintains the `Extending ...` Controller Info line |
 | `FdrSync.cs` | Batches FDR and radar-track pushes, gated on currently holding and having activated the flight |
 | `TagOwnershipSync.cs` | Activates/assumes a tag when it's sitting in a subsector you own; hands it off when OzServer says you no longer own that subsector |
 | `SectorLocator.cs` | Resolves which sector, out of a given candidate list, an FDR is physically inside of right now |
 | `AtisSync.cs` | Pushes vatSys's own built-in ATIS (`vatsys.ATIS`, slot 0) on change |
-| `BadVectorsAtisSync.cs` | Same, but for [badvectors/ATISPlugin](https://github.com/badvectors/ATISPlugin)'s up-to-4 broadcasts, via reflection |
+| `BadVectorsAtisSync.cs` | Same, but for [badvectors/ATISPlugin](https://github.com/badvectors/ATISPlugin)'s up-to-4 broadcasts, via reflection — and publishes each one with `PUT /vatsim/atis/{icao}`, which is what the public map draws |
 | `OzServerSettings.cs` | Base-URL persistence and validation |
 | `ToggleGenericButton.cs` | A `GenericButton` that can be held visually depressed |
 
@@ -314,7 +320,8 @@ All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` at
 | `POST /sector-requests/{id}/accept`, `/reject`, `/cancel` | Single-request actions |
 | `POST /sector-requests/{id}/acknowledge-rejection` | Confirms a denial has been shown to the requester, which is what finally deletes it |
 | `POST /fdr`, `POST /fdr/batch` | Flight data upserts, keyed by callsign |
-| `POST /atis` | ATIS upsert, keyed by ICAO; dropped 60 minutes after the last update |
+| `POST /atis` | ATIS handover record, keyed by ICAO and server; dropped 60 minutes after the last update |
+| `PUT /vatsim/atis/{icao}` | Publishes the broadcast itself — sections, change markers, issue time — for the public map and `/vatsim/atis`. Live network only; dropped 90 minutes after the last publish |
 
 ### Timings
 

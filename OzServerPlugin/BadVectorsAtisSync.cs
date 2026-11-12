@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using vatsys;
@@ -113,6 +114,15 @@ public class BadVectorsAtisSync
         var letter = type.GetProperty("ID")?.GetValue(control) as char?;
         var lines = type.GetProperty("Lines")?.GetValue(control) as IEnumerable;
         var frequencyDisplay = type.GetProperty("FrequencyDisplay")?.GetValue(control) as string;
+        // IsZulu is the only thing that distinguishes a closed tower's free-text broadcast from a
+        // sectioned one (ATISControl.GetInfo branches on exactly this), and DateTimeUtc is the only
+        // time it keeps - set to UtcNow in Save, so it is when this letter was issued.
+        var isZulu = type.GetProperty("IsZulu")?.GetValue(control) as bool? ?? false;
+        var issued = type.GetProperty("DateTimeUtc")?.GetValue(control) as DateTime?;
+        // ATISControl.Callsign is private ($"{icao}_ATIS", set in Create), so NonPublic - and the
+        // same thing is rebuilt below if a future release renames or hides it differently.
+        var callsign = type.GetProperty("Callsign", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?.GetValue(control) as string;
 
         // Deliberately NOT gated on Broadcasting: ATISControl.Save() (source confirmed) sets
         // Broadcasting = false via BroadcastStop() *before* updating ID/Lines and firing
@@ -127,26 +137,157 @@ public class BadVectorsAtisSync
             return;
 
         var content = ReadContent(lines);
-        if (content.Count == 0)
+        var zuluText = isZulu ? ReadZulu(lines) : null;
+        // A zulu broadcast carries nothing but its own text - ReadContent skips the ZULU line the
+        // same way ATISControl.GetInfo does - so "nothing on this station" is a different question
+        // for each kind.
+        if (isZulu ? string.IsNullOrWhiteSpace(zuluText) : content.Count == 0)
             return;
 
-        var dto = new OzServerAtisUpdateDto
+        // The handover record (POST /atis), unchanged: per server, sections only, for the next
+        // controller on this station rather than for anyone reading publicly.
+        if (content.Count > 0)
+        {
+            var dto = new OzServerAtisUpdateDto
+            {
+                Icao = icao!,
+                AtisLetter = letter.Value.ToString(),
+                Content = content,
+                Frequency = ParseFsdFrequency(frequencyDisplay),
+            };
+
+            try
+            {
+                await _api.UpdateAtisAsync(dto);
+            }
+            catch (Exception ex)
+            {
+                if (!quiet)
+                    Errors.Add(new Exception($"Couldn't push ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
+            }
+        }
+
+        // And the broadcast itself (PUT /vatsim/atis/{icao}), which is what the website map and
+        // every public reader of /vatsim/atis draw from.
+        //
+        // Live only, deliberately: that record has no server of its own (an ATIS is a broadcast on
+        // the network), so publishing from a SweatBox session would put training weather on the
+        // public map for everyone. The handover push above stays per-server and still happens.
+        if (NetworkServer.Current != NetworkServer.Live)
+            return;
+
+        // MODE and TIME_CHECK are editor settings, not broadcast information - the backend drops
+        // both and refuses an ATIS with nothing else left in it. A station whose mode auto-selected
+        // on Create but which nobody has filled in yet is exactly that, and is not worth publishing
+        // (or reporting as a failure to the controller).
+        if (!isZulu && content.Keys.All(name => EditorOnlyLines.Contains(name)))
+            return;
+
+        var identity = NetworkIdentity.Current;
+        if (identity == null)
+            return;
+
+        var published = new OzServerAtisPublishDto
         {
             Icao = icao!,
+            Callsign = string.IsNullOrWhiteSpace(callsign) ? $"{icao}_ATIS" : callsign!,
             AtisLetter = letter.Value.ToString(),
-            Content = content,
-            Frequency = ParseFsdFrequency(frequencyDisplay),
+            Type = isZulu ? "zulu" : "atis",
+            Frequency = PublishableFrequency(frequencyDisplay),
+            Issued = IsoUtc(issued),
+            Content = isZulu ? zuluText! : (object)content,
+            Changed = isZulu ? new List<string>() : ReadChanged(lines),
+            Controller = new OzServerAtisControllerDto { Callsign = identity.Value.Callsign, Cid = identity.Value.Cid },
+            Client = new OzServerAtisClientDto { Name = "vatSys ATIS Plugin", Version = PluginVersion(type) },
         };
 
         try
         {
-            await _api.UpdateAtisAsync(dto);
+            await _api.PublishAtisAsync(published);
         }
         catch (Exception ex)
         {
             if (!quiet)
-                Errors.Add(new Exception($"Couldn't push ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
+                Errors.Add(new Exception($"Couldn't publish ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
         }
+    }
+
+    static readonly HashSet<string> EditorOnlyLines = new() { "MODE", "TIME_CHECK" };
+
+    // The backend takes the frequency as the text it is read out as ("126.250") and refuses
+    // anything that is not one. A station whose display string is empty or shaped oddly should
+    // still publish its ATIS - without a frequency - rather than have the whole thing rejected.
+    static readonly Regex DisplayFrequency = new(@"^\d{3}(\.\d{1,3})?$", RegexOptions.Compiled);
+
+    static string? PublishableFrequency(string? display)
+    {
+        var trimmed = display?.Trim();
+        return !string.IsNullOrEmpty(trimmed) && DisplayFrequency.IsMatch(trimmed!) ? trimmed : null;
+    }
+
+    // ATISControl.DateTimeUtc is UTC by construction (Save sets it from DateTime.UtcNow), but a
+    // value restored from a saved ATIS can come back with no Kind at all - labelled, not shifted,
+    // so a 09:14Z broadcast is never published as 09:14 local. Nothing set at all (a slot whose
+    // ATIS predates this field, say) falls back to now, which is the one time we do know.
+    static string IsoUtc(DateTime? value)
+    {
+        var moment = value == null || value.Value == default
+            ? DateTime.UtcNow
+            : value.Value.Kind == DateTimeKind.Local ? value.Value.ToUniversalTime() : DateTime.SpecifyKind(value.Value, DateTimeKind.Utc);
+        return moment.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
+    }
+
+    // ATISPlugin's own assembly version - 4.3 at the time of writing. Reported so a broadcast that
+    // arrives malformed can be tied to the build that sent it; "4.3.0.0" is noise, so the trailing
+    // zeroes come off.
+    static string PluginVersion(Type controlType)
+    {
+        var version = controlType.Assembly.GetName().Version;
+        if (version == null)
+            return "unknown";
+        return version.Revision <= 0
+            ? version.Build <= 0 ? version.ToString(2) : version.ToString(3)
+            : version.ToString(4);
+    }
+
+    // The sections this letter changed. ATISLine.Changed is the flag ATISControl.GetInfo turns into
+    // the leading "+" on a line of broadcast text ("+[RWY] 34"); it is cleared for every line at
+    // the top of Save and set again only on the ones whose value actually moved.
+    static List<string> ReadChanged(IEnumerable? lines)
+    {
+        var changed = new List<string>();
+        if (lines == null)
+            return changed;
+
+        foreach (var line in lines)
+        {
+            var type = line.GetType();
+            var name = type.GetProperty("Name")?.GetValue(line) as string;
+            var visible = type.GetProperty("Visible")?.GetValue(line) as bool? ?? false;
+            var marked = type.GetProperty("Changed")?.GetValue(line) as bool? ?? false;
+
+            if (marked && visible && !string.IsNullOrEmpty(name) && name is not ("OFCW_NOTIFY" or "ZULU"))
+                changed.Add(name!);
+        }
+
+        return changed;
+    }
+
+    // The free text a closed tower broadcasts, which ATISPlugin keeps in a pseudo-line named ZULU
+    // rather than in any field of its own.
+    static string? ReadZulu(IEnumerable? lines)
+    {
+        if (lines == null)
+            return null;
+
+        foreach (var line in lines)
+        {
+            var type = line.GetType();
+            if (type.GetProperty("Name")?.GetValue(line) as string == "ZULU")
+                return (type.GetProperty("Value")?.GetValue(line) as string)?.Trim();
+        }
+
+        return null;
     }
 
     // Same field name/value shape as vatsys.ATIS.Content (see OzServerAtisUpdateDto) - one entry per

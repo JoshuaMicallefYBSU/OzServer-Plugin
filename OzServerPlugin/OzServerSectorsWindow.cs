@@ -2776,6 +2776,43 @@ public class OzServerSectorsWindow : BaseForm
         if (owned)
             updated.Add(sector);
 
+        // A release is never just the one row. The backend gives back the named sector plus every
+        // sector it is responsible for that this controller owns (SectorOwnershipController::
+        // releaseGroup), so unpicking GUN is already unpicking KAT, BIK and SAS - and everything
+        // under SAS in turn. Leaving them sitting in Owned drew a selection Apply was never going
+        // to produce: the controller moved Gundagai across, watched its sub-sectors stay put, and
+        // only found out they had gone too after committing.
+        //
+        // The members are taken out of the list but deliberately NOT added to _stagedNames.
+        // That set is what Apply turns into release calls, and naming a member as well as its root
+        // would have the backend answer the root's release first and then refuse every member -
+        // this controller no longer owns them by that point - reporting a dozen failures for a
+        // release that actually worked. The root alone says all of it, which is also why a member
+        // staged on its own earlier drops back out of _stagedNames here.
+        var carried = CoveredSectorsReleasedWith(sector);
+
+        if (!owned)
+        {
+            updated = updated.Where(s => !carried.Any(c => c.Name == s.Name)).ToList();
+
+            foreach (var member in carried)
+                _stagedNames.Remove(member.Name);
+        }
+        else
+        {
+            // Putting the root back puts its group back with it. Nothing has been sent yet, so what
+            // OzServer still records as this controller's is exactly what was on screen before the
+            // release was staged. A member the controller moved by hand is left alone: that one is
+            // their decision, not a side effect of this row.
+            foreach (var member in carried)
+            {
+                if (_stagedNames.Contains(member.Name) || updated.Any(s => s.Name == member.Name))
+                    continue;
+
+                updated.Add(member);
+            }
+        }
+
         _sectorsSelected = updated;
 
         // Only this sector's staged-ness changes. Moving it back to whatever OzServer already
@@ -2832,6 +2869,17 @@ public class OzServerSectorsWindow : BaseForm
         UpdateArrowButton();
         UpdateApplyCancelButtons();
     }
+
+    // What a release of this sector takes with it: everything its dataset entry is responsible for,
+    // recursively - PrimaryPosition.CoveredBy walks the same ResponsibleSectors chain the backend's
+    // own covered() does, so this is the set releaseGroup will delete - restricted to what OzServer
+    // currently records as this controller's, since a release only ever removes their own
+    // ownerships. The sector itself is left out; the caller is already moving that row.
+    List<SectorsVolumes.Sector> CoveredSectorsReleasedWith(SectorsVolumes.Sector sector) =>
+        PrimaryPosition.CoveredBy(sector)
+            .Where(covered => covered.Name != sector.Name)
+            .Where(covered => _tracker.Owned.Any(owned => !owned.IsDummy && owned.Name == covered.Name))
+            .ToList();
 
     static GenericButton CreateRequestActionButton(string text) => new()
     {

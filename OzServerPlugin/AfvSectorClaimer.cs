@@ -8,23 +8,35 @@ namespace OzServerPlugin;
 
 // Drives MMI.SectorsControlled from the VSCS/AFV panel's own Transmit state - ported from
 // badvectors/VatpacPlugin's Sectors.cs (Init/CheckActive), the reference for how a working plugin
-// wires VSCS transmit to vatSys's own sector control. This class only ever touches
-// MMI.SectorsControlled, never OzServerApiClient directly - OzServer syncing (including asking
+// wires VSCS transmit to vatSys's own sector control. This class never touches OzServerApiClient
+// directly; it writes MMI.SectorsControlled and, for a release only, asks
+// OzServerOwnershipTracker to give the sector back.
+//
+// Claiming is left entirely downstream: a sector appearing in MMI.SectorsControlled is picked up
+// by OzServerOwnershipTracker's own MMI.SectorsControlledChanged subscription (including asking
 // whether to request a sub-sector that turns out to already be owned by someone else - see
-// OzServerOwnershipTracker.HandleConflictAsync) is handled entirely downstream by
-// OzServerOwnershipTracker's own MMI.SectorsControlledChanged subscription. That's what makes a
-// transmit press show up in both the built-in vatSys Sectors window (which just displays
-// MMI.SectorsControlled - nothing else needed for that one) and the OzServer window, and (as a
-// consequence of MMI.SectorsControlled being correct) is also what makes vatSys's own map display
-// an extension normally - no separate API call needed for that.
+// OzServerOwnershipTracker.HandleConflictAsync). That's what makes a transmit press show up in
+// both the built-in vatSys Sectors window (which just displays MMI.SectorsControlled - nothing
+// else needed for that one) and the OzServer window, and (as a consequence of
+// MMI.SectorsControlled being correct) is also what makes vatSys's own map display an extension
+// normally - no separate API call needed for that.
+//
+// Releasing is not symmetrical, and this is the one place that asymmetry shows. The tracker's MMI
+// handler is claim-only on purpose - inferring a release from a sector's absence in MMI is what
+// used to fight a VSCS transmit claim in a claim/release loop - so a sector dropping out of MMI
+// releases nothing by itself. CheckActive therefore calls the tracker's release path explicitly
+// when a line stops transmitting (see the end of it): dropping a frequency's line takes the
+// sector's infill off the map locally, and OzServer has to stop calling it this controller's at
+// the same moment, or it stays in the Sectors window and stays unavailable to everyone else.
 //
 // Controller Info is deliberately not touched here. This used to publish an "Extending ..."
 // line from the same Transmit state; that is another plugin's job now, and two plugins editing
 // the same free-text field would fight over it.
 public class AfvSectorClaimer
 {
-    // Read-only, and only for RecentlyResumed - see Init(). Everything else here still only ever
-    // touches MMI.SectorsControlled.
+    // Used for two things only: RecentlyResumed (read-only - see Init()) and the release a line
+    // going quiet has to make (ReleaseIdleVscsLineAsync - see CheckActive). Everything else here
+    // still only ever touches MMI.SectorsControlled and lets the tracker follow it.
     readonly OzServerOwnershipTracker _tracker;
     readonly HashSet<VSCSFrequency> _subscribed = new();
     // What Network.Me.Callsign was the last time Init() actually ran - see the
@@ -66,11 +78,23 @@ public class AfvSectorClaimer
         // sectors disappearing, until a later TransmitChanged happened to sweep them back in via
         // CheckActive()'s own full read of current Transmit state - which is why pressing transmit
         // on the new station appeared to "bring everything back").
+        //
+        // "Changed" means changed to another position, never merely unreadable. Network.Me is null
+        // for stretches of a perfectly ordinary session (it lags Connected, and it is momentarily
+        // null again around a reconnect), and a bare inequality counted that as a position change:
+        // BeginInit then started its one-second retry loop, which sat there until Me came back and
+        // promptly reset MMI.SectorsControlled to the position's bare defaults - silently taking
+        // every extension off the scope, while OzServer went on recording them as this controller's
+        // because nothing here releases anything. The sector then could not be dropped from its own
+        // VSCS line either, since by the time the line was pressed the sector was no longer in MMI
+        // for CheckActive to find (it releases that case now too - see
+        // ReleaseQuietLineMissingFromMmi - but the reset itself should not be happening).
         Audio.VSCSFrequenciesChanged += (_, _) => RunOnUiThread(() =>
         {
             ResubscribeTransmitChanged();
 
-            if (Network.Me?.Callsign != _lastPrimaryCallsign)
+            var callsign = Network.Me?.Callsign;
+            if (!string.IsNullOrEmpty(callsign) && callsign != _lastPrimaryCallsign)
                 BeginInit();
         });
         _initRetryTimer = new System.Threading.Timer(
@@ -213,6 +237,16 @@ public class AfvSectorClaimer
     //     not locally re-add MAE/MAV to vatSys's Sector Management Window before the backend gets a
     //     chance to reject them.
     //
+    // A line going the other way - to Recv or Idle, both of which clear Transmit (see
+    // VSCSControlDX's Freq_Recv/Freq_Idle clickspots) - removes that sector and its sub-sectors
+    // from MMI *and* releases it on OzServer. Dropping a line is the controller saying they are no
+    // longer working that airspace, and the two records have to say the same thing: before the
+    // release call at the end of this method the infill came off the map while OzServer went on
+    // listing the sector as owned, so nobody else could take it and it sat in the OzServer Sectors
+    // window as if it were still being worked. The one exception is this session's own primary
+    // sector, which is never dropped either locally or on OzServer - see the primarySector check
+    // below.
+    //
     // Deliberately scoped to just this one frequency rather than resweeping every VSCS line's
     // current state (an earlier version did that): every OTHER line's Transmit still reads exactly
     // what it read before this event, including any sub-sector Init() had already granted into
@@ -229,7 +263,7 @@ public class AfvSectorClaimer
     // Uses Sector.Equals throughout (Callsign-based), not == or ReferenceEquals - Sector overrides
     // Equals/GetHashCode but not the == operator, so two Sector instances for the same real sector
     // reached via different lookups compare unequal under == even though they're the same sector.
-    static void CheckActive(VSCSFrequency frequency)
+    void CheckActive(VSCSFrequency frequency)
     {
         // Same reasoning as Init() above - nothing here means anything before the network
         // connection is actually up.
@@ -253,10 +287,17 @@ public class AfvSectorClaimer
         var currentSectors = MMI.SectorsControlled.ToList();
         var currentlyControlled = currentSectors.FirstOrDefault(s => s.Callsign == frequency.Name);
 
+        // Set only by the drop branch below, and given back to OzServer after the MMI write - see
+        // the end of this method.
+        SectorsVolumes.Sector? dropped = null;
+
         if (currentlyControlled == null)
         {
             if (!frequency.Transmit)
+            {
+                ReleaseQuietLineMissingFromMmi(frequencySector, primarySector);
                 return;
+            }
 
             var withheld = new HashSet<string>(
                 PrimaryPosition.StaffedCoveredSectors(frequencySector, myCallsign),
@@ -291,15 +332,112 @@ public class AfvSectorClaimer
                 return;
 
             if (primarySector.Equals(currentlyControlled))
+            {
+                ActionLog.Log("Primary",
+                    $"VSCS line for {currentlyControlled.Name} stopped transmitting - kept, it is this session's own position",
+                    new
+                    {
+                        action = "vscs_quiet_line_kept_own_position",
+                        sector = currentlyControlled.Name,
+                        own_callsign = myCallsign
+                    });
                 return;
+            }
 
             currentSectors.Remove(currentlyControlled);
 
             foreach (var subsector in currentlyControlled.SubSectors.ToList())
+            {
+                // Never the position this session is actually logged on as, even when the group
+                // being dropped is responsible for it. A controller logged on as a bare sub-sector
+                // (SNO) who extended into its parent group (WOL) and then drops WOL's line is
+                // dropping a group whose SubSectors include SNO itself - taking their own airspace
+                // off their own scope, and (because a sector that leaves MMI.SectorsControlled
+                // entirely gets backfilled with a dummy infill VSCS can no longer reclaim - see
+                // this method's own header) not giving it back on the next transmit either. The
+                // release below sweeps the same group up server-side, where it cannot be skipped
+                // sector by sector - see OzServerOwnershipTracker's
+                // ReclaimOwnPositionAfterReleaseAsync, which takes the position straight back
+                // instead.
+                if (primarySector.Equals(subsector))
+                    continue;
+
                 currentSectors.Remove(subsector);
+            }
+
+            dropped = currentlyControlled;
         }
 
         MMI.SetControlledSectors(currentSectors);
+
+        // The sector has just come off the scope locally; this is what stops OzServer from going on
+        // saying it is still this controller's. It cannot be inferred downstream from the MMI write
+        // above the way a claim is: the tracker's MMI.SectorsControlledChanged handler is
+        // claim-only by design (see ClaimMmiControlledSectorsAsync - releasing on MMI absence is
+        // what used to fight a VSCS transmit claim in a claim/release loop), so a release has to be
+        // asked for explicitly. Without it, dropping a line took the infill off the map while the
+        // sector stayed listed as owned in the OzServer Sectors window and stayed unavailable to
+        // every other controller - which is the bug this exists to fix.
+        //
+        // Deliberately after MMI.SetControlledSectors, not before: that call is what hands the
+        // airspace back locally, and it is synchronous, so by the time the release's own refresh
+        // comes back and ReconcileMmiWithOwned diffs the result, MMI already agrees with it and
+        // there is nothing left for it to push. Released first, the refresh could land while the
+        // sector was still in MMI - and a sector in MMI that OzServer no longer records as ours is
+        // exactly what the claim path exists to put back (RetryUnclaimedMmiSectors), so the release
+        // would be undone by the next poll tick.
+        //
+        // Fire-and-forget: TransmitChanged is raised from inside vatSys's own VSCS click handling
+        // (VSCSControlDX.Execute), which cannot be made to wait on a round trip to OzServer.
+        // Nothing is lost by not awaiting - ReleaseIdleVscsLineAsync reports its own failures and
+        // re-derives Owned itself when it succeeds.
+        if (dropped != null)
+            _ = _tracker.ReleaseIdleVscsLineAsync(dropped);
+    }
+
+    // A line stopped transmitting for a sector vatSys is not listing as controlled. There is
+    // nothing to take off the scope - but OzServer can still be recording the sector as this
+    // controller's, and then dropping the line does nothing at all: the sector stays in the
+    // OzServer Sectors window and stays unavailable to everyone else, with the one control that
+    // ought to give it back now doing nothing, because the sector it would have dropped is already
+    // out of MMI.
+    //
+    // That is not a hypothetical. MMI.SectorsControlled and OzServer ownership are separate records
+    // and several paths move one without the other: a sector carried out of MMI by a *different*
+    // line's drop (the group sweep below removes the dropped sector's own sub-sectors, and a
+    // release server-side reaches further still, down the whole responsible-sectors chain), cover
+    // removed locally when a position's own controller logs on (PrimaryPositionWatcher.
+    // RemoveLocalCover, which deliberately only touches MMI), or an Owned list the Sectors window
+    // committed. Keying the release off "it was in MMI a moment ago" made the fix for dropping a
+    // line work only while those two records happened to agree.
+    //
+    // So the gesture is what counts, not the bookkeeping: the controller has taken themselves off
+    // this frequency, and whatever OzServer still has under that sector's name goes back. Gated on
+    // Owned here (unlike the in-MMI path, which asks the server outright - see
+    // OzServerOwnershipTracker.ReleaseIdleVscsLineAsync for why it cannot afford to trust a reading
+    // that trails by a round trip): without that gate every press of Idle or Recv on any line that
+    // isn't controlled - monitoring a neighbour's frequency, most of all - would fire a release the
+    // backend can only refuse.
+    void ReleaseQuietLineMissingFromMmi(SectorsVolumes.Sector frequencySector, SectorsVolumes.Sector primarySector)
+    {
+        // The position this session is logged on as is never given away by going quiet on it, the
+        // same rule the in-MMI path applies.
+        if (frequencySector.Equals(primarySector))
+            return;
+
+        if (!_tracker.IsMine(frequencySector))
+            return;
+
+        ActionLog.Log("Primary",
+            $"VSCS line for {frequencySector.Name} stopped transmitting - not in controlled sectors, but still ours on OzServer",
+            new
+            {
+                action = "vscs_quiet_line_owned_not_controlled",
+                sector = frequencySector.Name,
+                own_callsign = Network.Me?.Callsign
+            });
+
+        _ = _tracker.ReleaseIdleVscsLineAsync(frequencySector);
     }
 
     static void LogWithheldTopDownCover(
