@@ -83,6 +83,9 @@ public class Plugin : IPlugin
     {
         // First, so every decision logged below is forwarded from the outset.
         _clientLogForwarder = new ClientLogForwarder();
+        // Before anything that writes MMI.SectorsControlled, so its first snapshot is taken before
+        // this plugin has had a chance to change the list itself.
+        MmiSectorWatch.Install();
         _ownershipTracker = new OzServerOwnershipTracker();
         // After the tracker, whose RecentlyResumed its connect-time grant keeps.
         _afvSectorClaimer = new AfvSectorClaimer(_ownershipTracker);

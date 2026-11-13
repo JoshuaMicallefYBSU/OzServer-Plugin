@@ -14,7 +14,7 @@ OzServer flows back into vatSys and onto your VSCS panel automatically.
 
 | | |
 | --- | --- |
-| **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer, and a VSCS line dropping out of Transmit releases it again. A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. |
+| **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer, and a VSCS line dropping out of Transmit releases it again. A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. The two records are also reconciled on every poll tick, in both directions: controlled here but owned nowhere is claimed, owned on OzServer but not controlled here is put back on the scope. |
 | **Sector requests** | Ask another controller for a sector they own. Accepting the `Requested From Me` heading accepts every incoming request in one batch; accepting a row accepts just that one. A denial is reported back to whoever asked. |
 | **Conflict handling** | Claiming a primary that bundles sub-sectors someone else already holds takes everything that *isn't* contested and leaves the rest with their owner, reporting which. It never turns those into requests behind your back — asking is something you do explicitly, by staging the sector you want. |
 | **Primary inheritance** | Logging in under a position's own callsign takes that position's sectors regardless of who was holding them. Whoever had them is told, and gives them up. A primary is never kept from its own controller. |
@@ -152,10 +152,29 @@ sector back: it comes off your scope *and* is released on OzServer, so it leaves
 and is immediately available to everyone else. Your own position is never given away this way, even
 when the group you dropped is responsible for it.
 
+Dropping a line also gives the sector back when it has already fallen out of
+`MMI.SectorsControlled` by some other route but OzServer still records it as yours — otherwise the
+one control that should hand it back does nothing, because the sector it would have dropped is
+already gone.
+
 Releasing is still never *inferred* from a sector merely disappearing from `MMI.SectorsControlled`.
 There are exactly five things that release: a VSCS line dropping out of Transmit, an applied `>>`, a
-genuine conflict, a position's own controller logging on (`PrimaryPositionWatcher`), and a deliberate
-disconnect (`GracefulDisconnectReleaser`).
+genuine conflict, a position's own controller found already online when you connect
+(`PrimaryPositionWatcher`), and a deliberate disconnect (`GracefulDisconnectReleaser`).
+
+A controller who logs on *while you hold their position* is not handed it. Their client requests
+the whole position from you in one request, and nothing moves until you accept it — the backend no
+longer lets anyone, a position's own primary included, take a sector off a controller who is present.
+Your tags in that airspace stay tracked by you in the meantime: vatSys strips a newly-online
+controller's sectors from your list and stops tracking any tag pointed at them, so `SectorTagHandoff`
+re-points those tags at your own login sector before that happens, and hands them over properly
+when you accept.
+
+The reverse drift — owned on OzServer, missing locally — is repaired rather than released. It is the
+expensive one: the sector is held against every other controller while you have no infill, no
+jurisdiction over its tags, and no line to press that would give it back. `RestoreOwnedToMmi` puts it
+back on the next poll tick (≤3s) and writes a line to the action log saying what it restored, so the
+drift is visible rather than silent.
 
 ---
 
@@ -284,7 +303,7 @@ Four rules if you touch the styling:
 | `SectorMessageWindow.cs` | Shared chat-styled chrome for the two dialogs below it |
 | `SectorNoticeWindow.cs` | One-way notice (OK only) — position relinquished, request denied |
 | `PrimaryPosition.cs` | The one definition of which sectors a position takes when its controller logs on |
-| `PrimaryPositionWatcher.cs` | Hands those sectors back when a position's own controller appears |
+| `PrimaryPositionWatcher.cs` | Releases a position to its controller if they were already online when you connected; a later arrival has to request it |
 | `GracefulDisconnectReleaser.cs` | Releases everything on a deliberate exit, and stays silent on a crash |
 | `VatSysContextMenu.cs` | Middle-click menu, drawn with vatSys's own `MenuRenderer` |
 | `SectorChangeRequest.cs` | One pending request, as the window renders it |

@@ -16,10 +16,11 @@ namespace OzServerPlugin;
 // sectors have to go back, and OzServer's ownership record has to say so, or the new arrival's own
 // claim simply collides with the previous holder's (see OzServerOwnershipTracker.HandleConflictAsync).
 //
-// This watches Network.OnlineATCChanged for a *newly* arrived real ATC, works out which sectors
-// that position takes by default, intersects that with what this controller currently owns, and
-// releases the overlap - telling them what happened rather than asking, because the handover is not
-// theirs to refuse.
+// This watches Network.OnlineATCChanged for real ATC coming and going. A controller found already
+// online when this session joins keeps their position: the overlap with what this controller owns
+// is released. A controller who arrives *during* this session is not handed anything - they request
+// their position and this controller accepts it (see HandleArrivalAsync for why), so the airspace
+// and the aircraft in it only move when the controller working them agrees.
 //
 // Constructed unconditionally by Plugin, like AfvSectorClaimer and OzServerOwnershipTracker: a
 // controller who never opens the OzServer Sectors window still has to give a position back.
@@ -276,6 +277,34 @@ public class PrimaryPositionWatcher
 
         var owned = _tracker.Owned;
         var theirs = PrimaryPosition.DefaultSectorsFor(atc.Callsign);
+
+        // A controller arriving on a position this session holds is not handed it - they ask, and
+        // the request window here is where it is given. Releasing on arrival is what made BLA's
+        // logon take Benalla off Huon mid-session with nothing on Huon's side but a notice, and the
+        // local MMI removal that went with it dropped every aircraft Huon was working inside: vatSys
+        // stops tracking any tag whose controlling sector leaves the list (MMI.SetControlledSectors).
+        // The arriving client requests on its own (OzServerOwnershipTracker.HandleConflictAsync).
+        //
+        // Only the genuine arrival changes. Someone found already online when this session joins
+        // (notify == false) is the old pre-existing case and still enforced below: those sectors
+        // were theirs before this session existed.
+        if (notify)
+        {
+            var held = theirs.Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name)).Select(s => s.Name).ToList();
+            ActionLog.Log("Primary",
+                held.Count == 0
+                    ? $"{atc.Callsign} arrived - nothing of theirs is owned here"
+                    : $"{atc.Callsign} arrived - keeping {string.Join(", ", held)} until they request it",
+                new
+                {
+                    action = held.Count == 0 ? "arrival_no_owned_sectors" : "arrival_keep_until_requested",
+                    controller_callsign = atc.Callsign,
+                    their_group = theirs.Select(s => s.Name).ToArray(),
+                    held = held.ToArray()
+                });
+            return;
+        }
+
         var locallyRemoved = RemoveLocalCover(theirs, mine, atc.Callsign);
         var relinquishing = theirs
             .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name))
@@ -310,13 +339,6 @@ public class PrimaryPositionWatcher
                 their_group = theirs.Select(s => s.Name).ToArray(),
                 locally_removed = locallyRemoved.Select(s => s.Name).ToArray()
             });
-
-        // Shown before the releases rather than after: each one is a round trip, and the controller
-        // should see why their sectors are about to disappear as it happens rather than several
-        // seconds later. A release that then fails is reported by ReleaseAsync into the same error
-        // log everything else here uses.
-        if (notify)
-            ShowNotice(atc, relinquishing);
 
         // Re-checked before each call because the backend cascades: releaseGroup releases the named
         // sector *and* everything it covers, so releasing MAE also releases MDN, MDS, MAV and MAW.
@@ -401,38 +423,6 @@ public class PrimaryPositionWatcher
             });
 
         return removed;
-    }
-
-    static void ShowNotice(NetworkATC atc, List<SectorsVolumes.Sector> relinquishing)
-    {
-        var who = string.IsNullOrEmpty(atc.RealName) ? atc.Callsign : $"{atc.Callsign} ({atc.RealName})";
-
-        // Full description, callsign included - the same way every other list in the plugin writes a
-        // sector (SectorDescription). "ARA" on its own does not tell a controller which airspace is
-        // leaving them.
-        //
-        // No leading indent: the message pane centres its text (see SectorMessageWindow), so spaces
-        // on the left do not indent the list, they shift it off centre.
-        var list = string.Join(Environment.NewLine, relinquishing.Select(s => SectorDescription.Describe(s)));
-        var lead = relinquishing.Count == 1
-            ? "This sector belongs to that position and is being relinquished to them:"
-            : "These sectors belong to that position and are being relinquished to them:";
-
-        var message = $"{who} has logged on."
-                      + Environment.NewLine + Environment.NewLine
-                      + lead
-                      + Environment.NewLine + Environment.NewLine
-                      + list;
-
-        // Non-modal: this is a notification about something already decided, and ShowDialog would
-        // freeze the whole vatSys UI thread until the controller happened to notice and dismiss it.
-        var notice = new SectorNoticeWindow(message, "Position relinquished");
-        if (Application.OpenForms["MainForm"] is Form mainForm)
-            notice.Show(mainForm);
-        else
-            notice.Show();
-
-        notice.BringToFront();
     }
 
     // Same fire-and-forget marshaling OzServerOwnershipTracker uses: Network's events can arrive on

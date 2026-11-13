@@ -201,7 +201,14 @@ public class SectorTagHandoff
         _tracker.OwnershipChanged += (_, diff) => RunOnUiThread(() => OnOwnershipChanged(diff));
         _confirmTimer = new System.Threading.Timer(_ => RunOnUiThread(ReassertConfirmations), null, ConfirmationInterval, ConfirmationInterval);
         _deferredHandoffTimer = new System.Threading.Timer(
-            _ => RunOnUiThread(RetryDeferredHandoffs), null, DeferredHandoffCheckInterval, DeferredHandoffCheckInterval);
+            _ => RunOnUiThread(() =>
+            {
+                ProtectTagsFromArrivals();
+                RetryDeferredHandoffs();
+            }), null, DeferredHandoffCheckInterval, DeferredHandoffCheckInterval);
+        // Deliberately NOT marshalled onto the UI thread - see ProtectTagsFromArrivals for the race
+        // this has to win.
+        Network.OnlineATCChanged += (_, _) => ProtectTagsFromArrivals();
         Network.Disconnected += (_, _) =>
         {
             lock (_lock)
@@ -272,6 +279,115 @@ public class SectorTagHandoff
                 was_state = wasState.ToString(),
                 now_state = track.State.ToString()
             });
+        }
+    }
+
+    // This session's own login sector, as it sits in MMI.SectorsControlled. The one controlled
+    // sector nothing ever takes out of the list: MMI.SetControlledSectors re-inserts it whenever a
+    // caller leaves it off, and vatSys's own arrival removal keeps it explicitly. A tag whose
+    // ControllingSector is this one can therefore never be dropped by a sector leaving the list.
+    static SectorsVolumes.Sector? OwnAnchor()
+    {
+        var callsign = Network.Me?.Callsign;
+        return string.IsNullOrEmpty(callsign)
+            ? null
+            : MMI.SectorsControlled.ToList().FirstOrDefault(s => string.Equals(s.Callsign, callsign, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Keeps this controller's aircraft through another controller logging on to a sector it holds.
+    //
+    // vatSys does two things the moment a controller is confirmed ValidATC (Network
+    // VATSIM_ClientQueryResponseReceived): if their callsign names a sector in this session's
+    // controlled list, it takes that sector *and its sub-sectors* out of the list; and
+    // MMI.SetControlledSectors, as part of doing that, calls HandoffToNone - StopTracking - on every
+    // tag this session tracks whose ControllingSector just left. So BLA logging on stripped BLA, ELW,
+    // MAE and MAV off Huon's scope and dropped any aircraft Huon held in them to nobody: no handoff,
+    // no data, just an uncoupled, deactivated tag. OzServer still had Huon owning the airspace and put
+    // the sectors straight back, but the tracking was already gone.
+    //
+    // There is no stopping vatSys removing the sectors. What can be done is make the removal miss
+    // the aircraft: a tag pointed at this session's own login sector (OwnAnchor) is not in the set
+    // that leaves, so it stays tracked, stays under this controller's jurisdiction, and goes on
+    // showing its data until it is handed over for real.
+    //
+    // The timing is why this runs synchronously on whatever thread raised OnlineATCChanged instead
+    // of being marshalled to the UI thread like everything else here. AddOnlineATC sends the
+    // IsValidATC query for a new controller and *then* raises OnlineATCChanged, on the network
+    // thread; the answer that triggers the removal needs a server round trip and arrives on that
+    // same thread. Handled inline, this always runs first. BeginInvoked, it would be queued behind
+    // vatSys's own work and could easily land after the tags were already dropped.
+    //
+    // Touches nothing but FDR.ControllingSector, which vatSys itself writes from network threads,
+    // and only for tags at risk - a controller logging on somewhere unrelated changes nothing.
+    void ProtectTagsFromArrivals()
+    {
+        try
+        {
+            if (!Network.IsConnected)
+                return;
+
+            var anchor = OwnAnchor();
+            if (anchor == null)
+                return;
+
+            var others = new HashSet<string>(
+                (Network.GetOnlineATCs ?? new List<NetworkATC>())
+                    .Select(atc => atc.Callsign)
+                    .Where(callsign => !string.IsNullOrEmpty(callsign)
+                                       && !string.Equals(callsign, anchor.Callsign, StringComparison.OrdinalIgnoreCase)),
+                StringComparer.OrdinalIgnoreCase);
+
+            if (others.Count == 0)
+                return;
+
+            // Exactly the set vatSys's removal takes: the sector named by an online controller's
+            // callsign, plus its direct sub-sectors.
+            var atRisk = MMI.SectorsControlled.ToList()
+                .Where(s => !s.IsDummy && others.Contains(s.Callsign))
+                .SelectMany(s => new[] { s }.Concat(s.SubSectors))
+                .Where(s => !s.Equals(anchor))
+                .ToList();
+
+            if (atRisk.Count == 0)
+                return;
+
+            var anchored = new List<string>();
+
+            foreach (var fdr in FDP2.GetFDRs.ToList())
+            {
+                if (string.IsNullOrEmpty(fdr.Callsign) || !fdr.IsTrackedByMe || fdr.ControllingSector == null)
+                    continue;
+
+                if (!atRisk.Any(s => s.Equals(fdr.ControllingSector)))
+                    continue;
+
+                var from = fdr.ControllingSector.Name;
+                fdr.ControllingSector = anchor;
+                anchored.Add($"{fdr.Callsign} ({from})");
+
+                // ReassertConfirmations would otherwise point it straight back at the sector that
+                // is about to be removed.
+                lock (_lock)
+                    _confirming.Remove(fdr.Callsign);
+            }
+
+            if (anchored.Count > 0)
+                ActionLog.Log("Tag",
+                    $"Kept {string.Join(", ", anchored)} under {anchor.Name} - its sector belongs to a controller who is online, "
+                    + "and vatSys drops tags when it takes those sectors off this scope",
+                    new
+                    {
+                        action = "tag_anchored_own_sector",
+                        fdr_callsigns = anchored.ToArray(),
+                        anchor = anchor.Name,
+                        at_risk = atRisk.Select(s => s.Name).Distinct().ToArray()
+                    });
+        }
+        catch (Exception ex)
+        {
+            // Runs inside vatSys's own network event. Nothing here is worth breaking that for; the
+            // worst case of skipping it is the drop it exists to prevent.
+            ActionLog.Log("Tag", $"Couldn't protect tags from a controller logging on: {ex.Message}");
         }
     }
 
@@ -372,12 +488,20 @@ public class SectorTagHandoff
             // sector, it matches that cleanup and gets dropped from the network outright
             // (Network.StopTracking) - cancelling the very handoff this loop just initiated (or is
             // about to retry), before the aircraft had any real chance to reach the controller it was
-            // being given to. Reassigning it here, to the sector the receiving controller is actually
-            // working, means that later cleanup's own check no longer matches (that sector was never
-            // in this session's own list to begin with), so it leaves this aircraft alone.
-            // ProcessHandoffAccepted resolves to the same sector once the real accept arrives, so this
-            // is only ever redundant with it, never in conflict.
-            fdr.ControllingSector = toSector;
+            // being given to.
+            //
+            // Reassigned to this session's own login sector (OwnAnchor), not to the receiving
+            // controller's. That used to be toSector, on the reasoning that the receiver's sector "was
+            // never in this session's own list to begin with" - which is false exactly when it
+            // matters: when BLA's sectors moved off Huon, BLA was in Huon's list, because Huon had
+            // been working it. The very next removal of BLA (VatpacPlugin's resweep, ReconcileMmiWithOwned)
+            // matched JST215 and stopped tracking it mid-handoff - uncoupled and deactivated on
+            // Huon's scope. The own login sector is the one entry no removal ever takes out, so the
+            // cleanup cannot match it, whoever calls SetControlledSectors and in whatever order.
+            // ProcessHandoffAccepted sets ControllingSector from the accepting controller's callsign
+            // when the accept arrives, so where it points in the meantime does not change where the
+            // aircraft ends up - Huon goes on seeing it, tracked by BLA.
+            fdr.ControllingSector = OwnAnchor() ?? toSector;
 
             // Recomputes the tag's displayed state against the ControllingSector just set above,
             // rather than trusting whichever of the two branches above happened to touch it (a real
@@ -464,7 +588,12 @@ public class SectorTagHandoff
             // No longer tracked by us, or already pointed somewhere else - a later GiveAway, a
             // manual handoff, TagResumeRecovery - so this deferred entry no longer describes
             // anything real and is not this loop's to act on.
-            if (fdr == null || !fdr.IsTrackedByMe || fdr.ControllingSector?.Equals(toSector) != true)
+            // GiveAway leaves it on this session's own sector (OwnAnchor), or on toSector when there
+            // was no anchor to use - either still means "waiting on this deferred handoff".
+            var waiting = fdr?.ControllingSector != null
+                          && (fdr.ControllingSector.Equals(toSector) || fdr.ControllingSector.Equals(OwnAnchor()));
+
+            if (fdr == null || !fdr.IsTrackedByMe || !waiting)
             {
                 lock (_lock)
                     _deferred.Remove(callsign);

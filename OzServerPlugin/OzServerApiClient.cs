@@ -438,17 +438,28 @@ public class OzServerApiClient
     // carving out whichever sub-sectors turned out to already be owned by someone else rather than
     // failing the whole thing.
     //
-    // primaryGroup is this session's own position - the sectors it holds by right when logged on
-    // (PrimaryPosition.DefaultSectorsFor). The backend lets a position's own controller take those
-    // straight back from whoever extended into them, and nothing else: the rest of what a claim
-    // covers top-down is only taken when nobody present is working it. Left out when null, which an
-    // older backend ignores either way.
-    public Task ClaimSectorAsync(string sectorName, IEnumerable<string> exclude, IEnumerable<string>? primaryGroup = null) =>
-        PostAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/claim", new
+    // Answers with the sector names the claim actually granted, which is not always every one it
+    // covers, and not always even the one it names - see OzServerOwnershipTracker's _withheldUntil.
+    // Null when the body is not a list of names (an older backend), meaning "not known".
+    //
+    // The backend no longer lets anyone take a sector off a present controller, not even that
+    // position's own primary - it has to be requested. Nothing here sends primary_group any more.
+    public async Task<IReadOnlyList<string>?> ClaimSectorAsync(string sectorName, IEnumerable<string> exclude)
+    {
+        var body = await PostRawAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/claim", new
         {
-            exclude = exclude.ToArray(),
-            primary_group = primaryGroup?.ToArray()
-        });
+            exclude = exclude.ToArray()
+        }).ConfigureAwait(false);
+
+        try
+        {
+            return JsonConvert.DeserializeObject<List<string>>(body);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 
     public Task ReleaseSectorAsync(string sectorName) => PostAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/release");
 
@@ -494,15 +505,13 @@ public class OzServerApiClient
     // PrimaryPosition.StaffedCoveredSectors.
     public Task<OzServerCommitResponseDto> CommitAsync(
         IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request,
-        IEnumerable<string> exclude, IEnumerable<string>? primaryGroup = null) =>
+        IEnumerable<string> exclude) =>
         PostAsync<OzServerCommitResponseDto>("/sectors/commit", new
         {
             claim = claim.ToArray(),
             release = release.ToArray(),
             request = request.ToArray(),
             exclude = exclude.ToArray(),
-            // See ClaimSectorAsync.
-            primary_group = primaryGroup?.ToArray(),
         });
 
     public Task<OzServerSyncDto> GetSyncAsync() =>

@@ -58,6 +58,27 @@ public class AfvSectorClaimer
     readonly System.Threading.Timer _initRetryTimer;
     int _initAttemptsLeft;
 
+    // Putting the controller back on the frequencies they were working before a disconnect. The
+    // sectors come back on their own (POST /sectors/resume), the VSCS panel does not - vatSys
+    // rebuilds it Idle every session - so without this a resumed position is held on OzServer, drawn
+    // on the scope, and silently off the air.
+    //
+    // Retried rather than done once, and for longer than Init's own retries: every input arrives at
+    // its own pace after a connect. The panel's lines are rebuilt by vatSys, the network has to
+    // confirm the session as a real controller before vatSys will transmit at all (Network.ValidATC,
+    // the same gate its own Transmit button uses), and the sectors themselves only become this
+    // controller's again when the resume lands a round trip later. A single pass at connect would
+    // run before all three on most sessions.
+    static readonly TimeSpan TransmitRestoreInterval = TimeSpan.FromSeconds(1);
+    const int TransmitRestoreMaxAttempts = 45;
+    readonly System.Threading.Timer _transmitRestoreTimer;
+    // Lines still to put back, by VSCS line name. Each one is dropped the moment it is dealt with -
+    // restored, or found already transmitting - so no line is ever written twice. That is what keeps
+    // this from fighting the controller: switching a line off during the restore window is their
+    // decision, and a loop that kept re-reading the remembered list would turn it straight back on.
+    readonly HashSet<string> _transmitToRestore = new(StringComparer.OrdinalIgnoreCase);
+    int _transmitRestoreAttemptsLeft;
+
     public AfvSectorClaimer(OzServerOwnershipTracker tracker)
     {
         _tracker = tracker;
@@ -68,7 +89,15 @@ public class AfvSectorClaimer
         // its FSDSession, and a System.Threading.Timer callback is never the UI thread either).
         // RunOnUiThread is what the sibling trackers (PrimaryPositionWatcher, ObserverPositionMirror)
         // already do for the same reason.
-        Network.Connected += (_, _) => RunOnUiThread(BeginInit);
+        Network.Connected += (_, _) => RunOnUiThread(() =>
+        {
+            BeginInit();
+            BeginTransmitRestore();
+        });
+        // Nothing to put back once the session is over, and a list left over from it must not be
+        // applied to whatever position this client connects as next - the same rule
+        // TagResumeRecovery applies to its own outstanding tags.
+        Network.Disconnected += (_, _) => RunOnUiThread(StopTransmitRestore);
         // VSCSFrequenciesChanged re-baselines via Init() (not CheckActive() - see Init()'s own
         // comment for why) only when the primary callsign has actually changed since Init() last
         // ran, i.e. only for a genuine position change. Init() unconditionally resets
@@ -99,6 +128,8 @@ public class AfvSectorClaimer
         });
         _initRetryTimer = new System.Threading.Timer(
             _ => RunOnUiThread(RetryInit), null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+        _transmitRestoreTimer = new System.Threading.Timer(
+            _ => RunOnUiThread(RetryTransmitRestore), null, System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
         ResubscribeTransmitChanged();
     }
 
@@ -175,6 +206,122 @@ public class AfvSectorClaimer
     {
         if (sender is VSCSFrequency frequency)
             CheckActive(frequency);
+
+        // After CheckActive, so what is written is the state the press has actually settled into.
+        // Saved on every change rather than on disconnect - see VscsTransmitMemory for why a
+        // disconnect is the wrong moment to be writing a file.
+        VscsTransmitMemory.Remember();
+    }
+
+    // Starts putting back the frequencies this callsign was transmitting on before it dropped.
+    void BeginTransmitRestore()
+    {
+        StopTransmitRestore();
+
+        if (!Network.IsConnected || NetworkIdentity.IsObserver)
+            return;
+
+        // Read once, at connect. Re-reading it on every attempt would pick up the memory this
+        // session is itself writing (OnTransmitChanged saves on every change), turning a restore
+        // the controller then undid into a restore that keeps coming back.
+        foreach (var line in VscsTransmitMemory.Recall(Network.Me?.Callsign))
+            _transmitToRestore.Add(line);
+
+        if (_transmitToRestore.Count == 0)
+            return;
+
+        _transmitRestoreAttemptsLeft = TransmitRestoreMaxAttempts;
+        RetryTransmitRestore();
+    }
+
+    void StopTransmitRestore()
+    {
+        _transmitToRestore.Clear();
+        _transmitRestoreTimer.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+    }
+
+    void RetryTransmitRestore()
+    {
+        if (!Network.IsConnected || NetworkIdentity.IsObserver)
+        {
+            StopTransmitRestore();
+            return;
+        }
+
+        RestoreRememberedTransmits();
+
+        if (_transmitToRestore.Count == 0 || --_transmitRestoreAttemptsLeft <= 0)
+        {
+            // Whatever is left was never this controller's to take back - a sector somebody else
+            // picked up while they were away, or a line the panel no longer has. Logged rather
+            // than dropped silently: "I came back and one of my frequencies is missing" is worth
+            // being able to answer.
+            if (_transmitToRestore.Count > 0)
+                ActionLog.Log("Primary",
+                    $"Did not put back transmit on {string.Join(", ", _transmitToRestore.OrderBy(n => n))} - not owned here after reconnecting",
+                    new
+                    {
+                        action = "vscs_transmit_not_restored",
+                        lines = _transmitToRestore.OrderBy(n => n).ToArray(),
+                        own_callsign = Network.Me?.Callsign
+                    });
+
+            StopTransmitRestore();
+            return;
+        }
+
+        // One-shot reschedule rather than a repeating period, the same shape as the init retry, so
+        // a slow pass can never overlap itself.
+        _transmitRestoreTimer.Change(TransmitRestoreInterval, System.Threading.Timeout.InfiniteTimeSpan);
+    }
+
+    // One pass over the lines still to put back. Each is dropped from the set as soon as it is
+    // settled, so nothing is written twice.
+    void RestoreRememberedTransmits()
+    {
+        // The same gate vatSys's own Transmit button uses (VSCSControlDX's Freq_Trans clickspot):
+        // until the network has confirmed this session as a controller, setting Transmit puts the
+        // panel in a state AFV will not actually carry.
+        if (!Network.ValidATC)
+            return;
+
+        foreach (var name in _transmitToRestore.ToList())
+        {
+            var frequency = Audio.VSCSFrequencies.FirstOrDefault(f => f.Name == name);
+
+            // The panel is still being rebuilt - vatSys populates it over the first seconds of a
+            // session. Keep waiting rather than writing this line off.
+            if (frequency == null)
+                continue;
+
+            if (frequency.Transmit)
+            {
+                _transmitToRestore.Remove(name);
+                continue;
+            }
+
+            var sector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == name);
+
+            // Only what OzServer agrees is this controller's. A frequency is a claim on airspace,
+            // and the resume has already decided which of it came back: a sector somebody else
+            // picked up in the meantime is theirs now, and putting the controller on its frequency
+            // would both talk over them and have CheckActive claim it back out from under them.
+            // Not yet owned is not the same as not theirs, though - the resume lands a round trip
+            // after connect - so this is left in the set and asked again next second.
+            if (sector == null || !_tracker.IsMine(sector))
+                continue;
+
+            frequency.Transmit = true;
+            _transmitToRestore.Remove(name);
+
+            ActionLog.Log("Primary", $"Put transmit back on {sector.Name} after reconnecting", new
+            {
+                action = "vscs_transmit_restored",
+                sector = sector.Name,
+                line = name,
+                own_callsign = Network.Me?.Callsign
+            });
+        }
     }
 
     // Sets the initial controlled-sector set on connect (or on a genuine position change - see the

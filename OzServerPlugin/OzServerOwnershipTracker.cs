@@ -203,15 +203,25 @@ public class OzServerOwnershipTracker
     readonly object _refreshQueueGate = new();
     bool _refreshQueued;
 
-    // Sectors this session is the primary for that were already owned by someone else at the moment
-    // it logged on - see HandleConflictAsync. Keyed by sector name, valued by how many poll ticks
-    // are left to keep trying. Bounded rather than infinite: the previous holder might not be
-    // running this plugin at all, or might have crashed out still holding the position, and quietly
-    // re-POSTing a doomed claim forever is worse than stopping and leaving it to be claimed by hand.
-    const int PrimaryClaimRetryTicks = 40; // ~2 minutes at PollInterval - keep this in sync if PollInterval changes
-    readonly object _primaryClaimGate = new();
-    readonly Dictionary<string, int> _pendingPrimaryClaims = new(StringComparer.OrdinalIgnoreCase);
-    bool _primaryClaimRetryRunning;
+    // Sectors the backend answered a claim for without granting them, and when to ask again.
+    //
+    // A claim is 201 even when the sector it names is not among what it claimed: the backend
+    // *withholds* a sector whose owner is present and logged on as part of that same group, rather
+    // than calling it a conflict (claimGroup's `withheld`). The plugin never read the answer, so it
+    // took that as success - and since the sector was still in MMI and still not in Owned,
+    // RetryUnclaimedMmiSectors claimed it again on the next tick, and the next: SNO was POSTed every
+    // three seconds for five minutes straight on 13 Nov. Backing off breaks that loop without
+    // giving up on the sector for good, because whoever it was withheld for may log off.
+    static readonly TimeSpan WithheldBackoff = TimeSpan.FromSeconds(60);
+    readonly object _withheldGate = new();
+    readonly Dictionary<string, DateTime> _withheldUntil = new(StringComparer.OrdinalIgnoreCase);
+
+    // How long a release this client sent keeps RestoreOwnedToMmi from putting the sector back
+    // while Owned still lists it. Only has to outlast the release's own round trip and the refresh
+    // that follows it; anything longer just delays the repair if the release never lands.
+    static readonly TimeSpan ReleaseSettleWindow = TimeSpan.FromSeconds(10);
+    readonly object _releasedGate = new();
+    readonly Dictionary<string, DateTime> _releasedRecently = new(StringComparer.OrdinalIgnoreCase);
 
     // What the last resume handed back, for a short while afterwards - see RecentlyResumed. Long
     // enough to outlast AfvSectorClaimer's own connect-time retries (up to 20s) plus a resume that
@@ -281,8 +291,8 @@ public class OzServerOwnershipTracker
         // retried against whatever position it reconnects as.
         Network.Disconnected += (_, _) =>
         {
-            lock (_primaryClaimGate)
-                _pendingPrimaryClaims.Clear();
+            lock (_withheldGate)
+                _withheldUntil.Clear();
 
             lock (_resumedGate)
             {
@@ -296,8 +306,11 @@ public class OzServerOwnershipTracker
                 return;
 
             _ = RefreshFromServerIfIdleAsync();
-            _ = RetryPendingPrimaryClaimsAsync();
-            RunOnUiThread(RetryUnclaimedMmiSectors);
+            RunOnUiThread(() =>
+            {
+                RetryUnclaimedMmiSectors();
+                RestoreOwnedToMmi();
+            });
         }, null, PollInterval, PollInterval);
 
         // A "sectors" signal covers ownership *and* requests: RefreshFromServerIfIdleAsync reads
@@ -335,10 +348,116 @@ public class OzServerOwnershipTracker
         if (!Network.IsConnected || !IsRealAtc || !_hasBaseline)
             return;
 
-        if (!MMI.SectorsControlled.Any(s => !s.IsDummy && !_owned.Any(o => o.Equals(s))))
+        if (!MMI.SectorsControlled.Any(s => !s.IsDummy && !_owned.Any(o => o.Equals(s)) && !IsWithheld(s.Name)))
             return;
 
         OnMmiSectorsControlledChanged();
+    }
+
+    bool IsWithheld(string name)
+    {
+        lock (_withheldGate)
+            return _withheldUntil.TryGetValue(name, out var until) && DateTime.UtcNow < until;
+    }
+
+    // Logged only when a back-off starts, not on every skipped tick.
+    void MarkWithheld(SectorsVolumes.Sector sector, IReadOnlyCollection<string> claimed)
+    {
+        lock (_withheldGate)
+            _withheldUntil[sector.Name] = DateTime.UtcNow + WithheldBackoff;
+
+        ActionLog.Log("Ownership",
+            $"Claimed {sector.Name}, but OzServer withheld it - a controller logged on inside its group holds it. "
+            + $"Not asking again for {WithheldBackoff.TotalSeconds:0}s",
+            new
+            {
+                action = "claim_withheld",
+                sector = sector.Name,
+                claimed = claimed.ToArray(),
+                own_callsign = Network.Me?.Callsign
+            });
+    }
+
+    // The mirror image of RetryUnclaimedMmiSectors above, and it exists for the same reason: the
+    // two records drift, nothing says so, and the controller is the one who finds out.
+    //
+    // RetryUnclaimedMmiSectors repairs MMI -> OzServer ("controlled here, owned nowhere"). This
+    // repairs OzServer -> MMI ("owned on OzServer, not controlled here"), which is the drift that
+    // actually costs something: the sector is held against every other controller - it is in the
+    // OzServer Sectors window, nobody else can take it - while locally there is no infill, no
+    // jurisdiction over its tags, and no VSCS line to press that would give it back, because every
+    // path that gives a sector back starts from it being in MMI.SectorsControlled.
+    //
+    // Owned is meant to be a subset of MMI throughout: ReconcileMmiWithOwned pushes every gained
+    // sector into MMI, RestoreResumedToMmi does the same for a resume, and AfvSectorClaimer's own
+    // grant merges what a resume handed back. Each of those is a one-shot at the moment it happens,
+    // and each has an ordering or a readiness condition it can lose - a sector taken out of MMI by
+    // a different line's group sweep, a re-baseline landing after a resume, an MMI write made
+    // before vatSys was ready for it. One missed moment used to be permanent, because nothing ever
+    // looked again. This looks again every poll tick.
+    //
+    // Adds only, and leaves VSCS alone - the same rule ReconcileMmiWithOwned applies to a gained
+    // sector (issue #5: being handed a sector is not consent to be put on its frequency). It cannot
+    // claim anything either: a sector only gets here by already being in Owned, which is OzServer's
+    // own record of what this controller holds.
+    void RestoreOwnedToMmi()
+    {
+        if (!Network.IsConnected || !IsRealAtc || !_hasBaseline)
+            return;
+
+        var mmiSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
+        var missing = _owned
+            .Where(owned => !owned.IsDummy)
+            .Where(owned => !mmiSectors.Any(s => s.Equals(owned)))
+            // A release this client has just sent is the one case where Owned legitimately still
+            // holds a sector that is already gone from MMI - Owned catches up when the release's
+            // refresh lands. Putting it back for those few hundred milliseconds would undo the
+            // removal on screen and then undo that again a moment later.
+            .Where(owned => !WasJustReleased(owned.Name))
+            .ToList();
+
+        if (missing.Count == 0)
+            return;
+
+        mmiSectors.AddRange(missing);
+        MMI.SetControlledSectors(mmiSectors);
+
+        // Logged every time rather than silently repaired: this firing at all means something took
+        // the sector out of MMI without releasing it, and the log line is what identifies that
+        // something - when it happened, and what it took.
+        ActionLog.Log("Ownership",
+            $"Put back into vatSys: {string.Join(", ", missing.Select(s => s.Name))} - owned on OzServer but missing from the controlled sectors",
+            new
+            {
+                action = "restore_owned_to_mmi",
+                sectors = missing.Select(s => s.Name).ToArray(),
+                own_callsign = Network.Me?.Callsign
+            });
+    }
+
+    // Names this client has just asked the backend to release, and when they stop being excused -
+    // see RestoreOwnedToMmi, the only reader. Marked before the call goes out, not after it
+    // returns, so the whole in-flight window is covered.
+    void MarkReleased(IEnumerable<string> names)
+    {
+        var until = DateTime.UtcNow + ReleaseSettleWindow;
+
+        lock (_releasedGate)
+        {
+            // Pruned here rather than on a timer of its own: the set is a handful of sector names
+            // at worst, and this is the only place that grows it.
+            foreach (var expired in _releasedRecently.Where(entry => entry.Value < DateTime.UtcNow).Select(entry => entry.Key).ToList())
+                _releasedRecently.Remove(expired);
+
+            foreach (var name in names)
+                _releasedRecently[name] = until;
+        }
+    }
+
+    bool WasJustReleased(string name)
+    {
+        lock (_releasedGate)
+            return _releasedRecently.TryGetValue(name, out var until) && DateTime.UtcNow < until;
     }
 
     // Never lets more than one ClaimMmiControlledSectorsAsync run at a time. MMI.SectorsControlled
@@ -538,7 +657,8 @@ public class OzServerOwnershipTracker
     // PrimaryPositionWatcher, which runs one on a departure.
     //
     // `also` carries anything else to leave out - the contested sub-sectors from a 409 retry.
-    Task ClaimWithExclusionsAsync(SectorsVolumes.Sector sector, IEnumerable<string>? also = null)
+    // Answers with what was granted - see OzServerApiClient.ClaimSectorAsync.
+    Task<IReadOnlyList<string>?> ClaimWithExclusionsAsync(SectorsVolumes.Sector sector, IEnumerable<string>? also = null)
     {
         var exclude = PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign);
 
@@ -548,16 +668,7 @@ public class OzServerOwnershipTracker
                 exclude.Add(name);
         }
 
-        return _api.ClaimSectorAsync(sector.Name, exclude, OwnPositionGroup());
-    }
-
-    // This session's own position, by name, for the backend's "the primary takes its group back"
-    // rule - see OzServerApiClient.ClaimSectorAsync. Null when the callsign names no sector at all
-    // (nothing is held by right, so there is nothing to say), which leaves the field off the request.
-    static List<string>? OwnPositionGroup()
-    {
-        var group = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
-        return group.Count == 0 ? null : group.Select(s => s.Name).ToList();
+        return _api.ClaimSectorAsync(sector.Name, exclude);
     }
 
     // Takes back top-down cover that was withheld while somebody was logged on as it, now that they
@@ -852,6 +963,20 @@ public class OzServerOwnershipTracker
         else
             _hasBaseline = true;
 
+        // Right here as well as on the poll tick, because the tick is up to three seconds away and
+        // the gap is visible: on a reconnect the resume hands back a position's extended sectors
+        // and they are owned from that instant, but the scope has only the position's own defaults
+        // until something puts them back. Waiting for the tick showed the controller their airspace
+        // arriving several seconds late - and TagResumeRecovery, which resolves each resumed tag
+        // against MMI.SectorsControlled, spent those seconds reporting "no radar position inside a
+        // held sector" for tags that were already theirs.
+        //
+        // Runs for the baseline sync too, deliberately. The baseline is not pushed into MMI as a
+        // *change* (no gained/lost diff, no VSCS, no tag handoffs - see above), but "OzServer says
+        // this is yours" and "it is not on your scope" is drift whenever it is noticed, including
+        // on the first answer of a session, which is exactly when a resume lands.
+        RunOnUiThread(RestoreOwnedToMmi);
+
         OwnedChanged?.Invoke(this, EventArgs.Empty);
 
         // Raised after controlled, requests and owned have all been adopted. Consumers that read
@@ -1047,6 +1172,14 @@ public class OzServerOwnershipTracker
             toClaim = Array.Empty<SectorsVolumes.Sector>();
         }
 
+        // Covers both the batched commit and the per-sector fallback below, and the whole group
+        // each release takes with it - RestoreOwnedToMmi must not put a sector back on screen in
+        // the window between this Apply removing it and Owned catching up. See MarkReleased.
+        MarkReleased(toRelease
+            .SelectMany(sector => PrimaryPosition.CoveredBy(sector))
+            .Select(sector => sector.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase));
+
         // One call for the whole Apply, answering with the resulting state - so committing several
         // staged sectors costs one round trip rather than one per sector plus a refresh, and the
         // lists move on the first reply. The per-sector path below is kept as a fallback for a
@@ -1068,8 +1201,7 @@ public class OzServerOwnershipTracker
                 toClaim.Select(s => s.Name),
                 toRelease.Select(s => s.Name),
                 (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name),
-                staffed,
-                OwnPositionGroup());
+                staffed);
 
             result.Claimed.AddRange(response.Result.Claimed);
             result.Released.AddRange(response.Result.Released);
@@ -1175,6 +1307,8 @@ public class OzServerOwnershipTracker
         if (!Network.IsConnected)
             return;
 
+        MarkReleased(new[] { sector.Name });
+
         try
         {
             await _api.ReleaseSectorAsync(sector.Name);
@@ -1223,6 +1357,11 @@ public class OzServerOwnershipTracker
         if (!CanSync || !IsRealAtc)
             return;
 
+        // Before the call, so the whole round trip is covered - see MarkReleased. The sector is
+        // already out of MMI by now (CheckActive removed it), and Owned still has it until the
+        // refresh below, which is exactly the state RestoreOwnedToMmi would otherwise repair.
+        MarkReleased(new[] { sector.Name });
+
         try
         {
             await _api.ReleaseSectorAsync(sector.Name);
@@ -1269,9 +1408,8 @@ public class OzServerOwnershipTracker
     //
     // Taken straight back rather than prevented: the alternative is refusing the release outright
     // whenever the group happens to cover the position, which would leave exactly the drift this
-    // whole path exists to remove. The backend grants a position's own controller its group
-    // unconditionally (primary_group - see OzServerApiClient.ClaimSectorAsync), so this cannot turn
-    // into a conflict prompt about the controller's own airspace, and awaiting it before the refresh
+    // whole path exists to remove. The sector was released by this same controller a moment ago,
+    // so nobody else holds it and the claim is an ordinary one that cannot conflict, and awaiting it before the refresh
     // below means Owned is only ever read once the position is back - no flicker of the controller's
     // own sector through MMI and the Sectors window.
     //
@@ -1426,6 +1564,9 @@ public class OzServerOwnershipTracker
             if (target.Any(other => !other.Equals(sector) && other.SubSectors.Any(sub => sub.Equals(sector))))
                 continue;
 
+            if (IsWithheld(sector.Name))
+                continue;
+
             // Same catch-clause escape as ClaimAsync - see the comment there. Here it would have
             // aborted the whole loop partway through, silently skipping every sector after this
             // one, rather than just failing the one that conflicted.
@@ -1433,7 +1574,9 @@ public class OzServerOwnershipTracker
 
             try
             {
-                await ClaimWithExclusionsAsync(sector);
+                var claimed = await ClaimWithExclusionsAsync(sector);
+                if (claimed != null && !claimed.Contains(sector.Name, StringComparer.OrdinalIgnoreCase))
+                    MarkWithheld(sector, claimed);
             }
             catch (OzServerApiException ex) when (ex.StatusCode == 409 && ex.Conflicts.Count > 0)
             {
@@ -1462,33 +1605,37 @@ public class OzServerOwnershipTracker
     }
 
     // One or more of sector's own covered sub-sectors is already owned by someone else - e.g. GUN
-    // extending WOL while BLA already owns WOL's own sub-sector SNO (extended earlier). Asks the
-    // controller whether to formally request each contested sub-sector from its current owner, then
-    // claims sector regardless, excluding whichever sub-sectors are still contested either way:
-    // "No" just leaves them with their current owner; "Yes" does the same but also puts in a
-    // request for each one. Either way, whatever's still contested is also pulled back out of
+    // extending WOL while BLA already owns WOL's own sub-sector SNO (extended earlier). Requests
+    // what has to be requested, then claims sector regardless, excluding whichever sub-sectors are
+    // still contested either way. Whatever's still contested is also pulled back out of
     // MMI.SectorsControlled and dropped to Idle on its own VSCS line if it has one - AfvSectorClaimer's
     // CheckActive() adds a whole primary's group to MMI optimistically before any of this is known,
     // so a sub-sector that turns out not to actually be claimable has to come back out again rather
     // than sit in MMI as if this controller owns it when OzServer disagrees.
     async Task HandleConflictAsync(SectorsVolumes.Sector sector, IReadOnlyList<OzServerSectorConflictDto> conflicts)
     {
-        // A sector this session is the primary for is not something to ask about. The position is
-        // this controller's by right the moment they log on, and the controller holding it is
-        // already being told to hand it back - PrimaryPositionWatcher does exactly that on their
-        // side as soon as their client sees this logon. "Request it from them?" is the wrong
-        // question to put to someone about their own position, and answering "no" would leave them
-        // permanently locked out of it.
+        // This session's own position is requested without asking. A controller logging on to BLA
+        // while Huon holds it wants BLA; "request it from them?" is not a real question, and "no"
+        // would leave them sitting on a position they cannot work.
         //
-        // The catch is timing: this claim fires on Network.Connected, while the holder only finds
-        // out on their next OnlineATCChanged, which follows VATSIM's own update cycle a few seconds
-        // later. So these are split out of the question and retried in the background instead (see
-        // RetryPendingPrimaryClaimsAsync) until the release lands.
+        // Requested, not taken. This used to be a background re-claim that waited for the holder's
+        // client to release on its own (PrimaryPositionWatcher), and the backend let the primary
+        // override a present owner outright - so the airspace, and the aircraft in it, moved the
+        // moment BLA connected with Huon given no say at all. The controller working the airspace
+        // decides when it moves, the same as for any other sector.
+        //
+        // Also requested without asking: anything else the same controller holds that a requested
+        // sector covers. Accepting BLA hands over BLA's whole covered group (transferRequest walks it),
+        // so MAE's departures and radar sectors arrive with it whatever the answer to a question
+        // about them would have been - asking would only have pretended there was a choice.
         var myDefaults = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
         var mineByRight = conflicts.Where(c => myDefaults.Any(s => s.Name == c.Sector)).ToList();
-        var contestedByOthers = conflicts.Where(c => !mineByRight.Contains(c)).ToList();
-
-        QueuePrimaryClaimRetries(mineByRight);
+        var carriedWith = conflicts
+            .Where(c => !mineByRight.Contains(c))
+            .Where(c => mineByRight.Any(own => own.Owner?.Cid == c.Owner?.Cid && Covers(own.Sector, c.Sector)))
+            .ToList();
+        var asked = mineByRight.Concat(carriedWith).ToList();
+        var contestedByOthers = conflicts.Where(c => !asked.Contains(c)).ToList();
 
         // Laid out lead / list / question, the same shape as every other popup in the plugin, with
         // each sector written out in full (SectorDescription). This used to name sectors by bare
@@ -1509,24 +1656,9 @@ public class OzServerOwnershipTracker
                            : "Request them from their current owners?");
 
         if (contestedByOthers.Count > 0 && await AskYesNoAsync(question, "Sector already owned"))
-        {
-            foreach (var conflict in contestedByOthers)
-            {
-                var conflictSector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == conflict.Sector);
-                if (conflictSector == null)
-                    continue;
+            asked.AddRange(contestedByOthers);
 
-                try
-                {
-                    var request = await _api.RequestSectorAsync(conflictSector.Name);
-                    ActionLog.Log("Request", $"Requested {conflictSector.Name} from {request.TargetCallsign}");
-                }
-                catch (Exception ex)
-                {
-                    Errors.Add(new Exception($"Couldn't request {conflictSector.Name} on OzServer: {ex.Message}", ex), "OzServer");
-                }
-            }
-        }
+        await RequestAsOneGroupAsync(asked);
 
         try
         {
@@ -1558,103 +1690,65 @@ public class OzServerOwnershipTracker
         });
     }
 
-    // _api's calls all run their continuations off the UI thread (see OzServerApiClient's own use
-    // of ConfigureAwait(false)), and MMI.SectorsControlledChanged can itself fire off-thread too -
-    // showing a dialog has to land back on the UI thread rather than risk a cross-thread control
-    // access inside vatSys itself. Invoke (not BeginInvoke) since the caller needs the answer back
-    // before deciding what to do next - safe to block on here since the calling thread is never the
-    // UI thread itself (that's exactly the case this branch exists for).
-    void QueuePrimaryClaimRetries(IEnumerable<OzServerSectorConflictDto> conflicts)
+    static bool Covers(string root, string name)
     {
-        lock (_primaryClaimGate)
-        {
-            foreach (var conflict in conflicts)
-                _pendingPrimaryClaims[conflict.Sector] = PrimaryClaimRetryTicks;
-        }
+        var sector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == root);
+        return sector != null && PrimaryPosition.CoveredBy(sector).Any(covered => covered.Name == name);
     }
 
-    // Re-attempts the claims parked by HandleConflictAsync, once per poll tick, until the previous
-    // holder's release lands. Runs on the tracker's own existing timer rather than a delay loop of
-    // its own: the poll is already the heartbeat for "has anything changed on the server", and a
-    // claim that succeeds here reaches MMI and the VSCS panel through the same
-    // RefreshFromServerAsync -> ReconcileMmiWithOwned path every other ownership gain uses.
-    async Task RetryPendingPrimaryClaimsAsync()
+    // Every sector in one request group, so each holder is asked once about the whole thing - the
+    // same thing an Apply in the Sectors window does. These used to go one POST per sector, each its
+    // own group: BLA's logon put four separate request windows in front of Huon at once.
+    //
+    // Skips anything already asked for and still waiting. The conflict that produces these can
+    // happen again while the request is pending - another VSCS press, a re-grant into MMI from
+    // another plugin - and a second request for the same sector is refused by the backend (one per
+    // sector per requester), which would otherwise surface as an error about a request that is in
+    // fact sitting there fine.
+    async Task RequestAsOneGroupAsync(IEnumerable<OzServerSectorConflictDto> conflicts)
     {
-        List<string> names;
-        lock (_primaryClaimGate)
-        {
-            if (_primaryClaimRetryRunning || _pendingPrimaryClaims.Count == 0)
-                return;
+        var pending = new HashSet<string>(
+            MyRequests.ByMe.Where(r => r.RejectedAt == null && r.Sector != null).Select(r => r.Sector!.Name),
+            StringComparer.OrdinalIgnoreCase);
 
-            _primaryClaimRetryRunning = true;
-            names = _pendingPrimaryClaims.Keys.ToList();
-        }
+        var names = conflicts
+            .Select(c => c.Sector)
+            .Where(name => !pending.Contains(name))
+            .Where(name => SectorsVolumes.Sectors.Any(s => s.Name == name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (names.Count == 0)
+            return;
+
+        var owners = string.Join(", ", conflicts
+            .Where(c => names.Contains(c.Sector, StringComparer.OrdinalIgnoreCase))
+            .Select(c => c.Owner?.Callsign)
+            .Where(callsign => !string.IsNullOrEmpty(callsign))
+            .Distinct(StringComparer.OrdinalIgnoreCase));
 
         try
         {
-            // Re-derived every tick, not captured when the conflict happened: a position change, or
-            // someone logging in directly on one of the sub-sectors, means it is no longer this
-            // session's to take and the retry should stop rather than fight them for it.
-            var stillMine = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
-            var claimedAny = false;
+            var response = await _api.CommitAsync(
+                Array.Empty<string>(), Array.Empty<string>(), names, Array.Empty<string>());
 
-            foreach (var name in names)
-            {
-                if (!Network.IsConnected)
-                    return;
-
-                var sector = stillMine.FirstOrDefault(s => s.Name == name);
-
-                if (sector == null || _owned.Any(o => o.Name == name))
+            ActionLog.Log("Request", $"Requested {string.Join(", ", response.Result.Requested)} from {owners}"
+                                     + (response.Result.Failed.Count > 0 ? $" (couldn't request {string.Join(", ", response.Result.Failed)})" : ""),
+                new
                 {
-                    Drop(name);
-                    continue;
-                }
+                    action = "request_contested_group",
+                    requested = response.Result.Requested.ToArray(),
+                    failed = response.Result.Failed.ToArray(),
+                    owners,
+                    own_callsign = Network.Me?.Callsign
+                });
 
-                try
-                {
-                    await ClaimWithExclusionsAsync(sector);
-                    claimedAny = true;
-                    Drop(name);
-                    continue;
-                }
-                catch (OzServerApiException ex) when (ex.StatusCode == 409)
-                {
-                    // Still held - the previous holder hasn't released yet. Spend a tick.
-                }
-                catch (Exception ex)
-                {
-                    // Retried every poll tick for up to two minutes - see PrimaryClaimRetryTicks.
-                    ErrorThrottle.Report("primary-claim:" + name, $"Couldn't take {name} back for this position: {ex.Message}", ex);
-                }
-
-                lock (_primaryClaimGate)
-                {
-                    if (!_pendingPrimaryClaims.TryGetValue(name, out var ticksLeft))
-                        continue;
-
-                    if (ticksLeft <= 1)
-                        _pendingPrimaryClaims.Remove(name);
-                    else
-                        _pendingPrimaryClaims[name] = ticksLeft - 1;
-                }
-            }
-
-            // Only when something actually changed hands - this runs every tick, and the plain
-            // refresh the timer already fires covers the no-op case.
-            if (claimedAny)
-                await RefreshFromServerAsync();
+            // The sync this answered with is left to the caller's own refresh, which every path
+            // into HandleConflictAsync already ends with.
         }
-        finally
+        catch (Exception ex)
         {
-            lock (_primaryClaimGate)
-                _primaryClaimRetryRunning = false;
-        }
-
-        void Drop(string name)
-        {
-            lock (_primaryClaimGate)
-                _pendingPrimaryClaims.Remove(name);
+            Errors.Add(new Exception($"Couldn't request {string.Join(", ", names)} on OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 
