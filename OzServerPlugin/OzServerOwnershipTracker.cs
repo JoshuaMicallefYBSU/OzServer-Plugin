@@ -348,11 +348,24 @@ public class OzServerOwnershipTracker
         if (!Network.IsConnected || !IsRealAtc || !_hasBaseline)
             return;
 
-        if (!MMI.SectorsControlled.Any(s => !s.IsDummy && !_owned.Any(o => o.Equals(s)) && !IsWithheld(s.Name)))
+        // The same test the claim pass itself applies, sector for sector. This used to ask only "is
+        // anything in MMI unowned and not backed off", which is true for a sector the pass will
+        // never claim on its own - a sub-sector whose parent is in MMI too is left to the parent's
+        // claim - so one such sector had every tick start a pass that claimed nothing and then
+        // fetched /sectors/sync a second time, for as long as it sat there.
+        var target = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
+        if (!target.Any(s => NeedsClaim(s, target)))
             return;
 
         OnMmiSectorsControlledChanged();
     }
+
+    // Whether the claim pass would actually send a claim for this sector - see
+    // ClaimMmiControlledSectorsAsync for each of the three rules.
+    bool NeedsClaim(SectorsVolumes.Sector sector, List<SectorsVolumes.Sector> target) =>
+        !_owned.Any(o => o.Equals(sector))
+        && !target.Any(other => !other.Equals(sector) && other.SubSectors.Any(sub => sub.Equals(sector)))
+        && !IsWithheld(sector.Name);
 
     bool IsWithheld(string name)
     {
@@ -458,6 +471,39 @@ public class OzServerOwnershipTracker
     {
         lock (_releasedGate)
             return _releasedRecently.TryGetValue(name, out var until) && DateTime.UtcNow < until;
+    }
+
+    // Everything a release of this sector gives back: the backend's releaseGroup takes the named
+    // sector's whole covered group with it, not just the sector named.
+    //
+    // Marking only the name left the rest of the group exposed for the length of the round trip.
+    // Dropping MUN's VSCS line took MUN, GTH, OXL and YWE off the scope; Owned still listed all four
+    // until the release's refresh landed, only MUN was excused, and RestoreOwnedToMmi put the other
+    // three straight back - "Put back into vatSys: GTH, OXL, YWE" - for ReconcileMmiWithOwned to
+    // take out again a few milliseconds later. Each of those is a full MMI.SetControlledSectors,
+    // with the track-state recompute and the tag cleanup that go with it.
+    void MarkGroupReleased(SectorsVolumes.Sector sector) =>
+        MarkReleased(PrimaryPosition.CoveredBy(sector).Select(covered => covered.Name));
+
+    // For a caller about to release several sectors one after another (PrimaryPositionWatcher).
+    // Each release only excuses its own group as it goes out, so the ones still waiting their turn
+    // - already off the scope, still in Owned - were put back by the refresh that follows every
+    // release ahead of them in the queue.
+    public void ExpectReleaseOf(IEnumerable<SectorsVolumes.Sector> sectors)
+    {
+        foreach (var sector in sectors)
+            MarkGroupReleased(sector);
+    }
+
+    // Lifts the excuse again for sectors that turned out to be kept after all - see
+    // ReclaimOwnPositionAfterReleaseAsync, the one release that takes part of its own group back.
+    void UnmarkReleased(IEnumerable<string> names)
+    {
+        lock (_releasedGate)
+        {
+            foreach (var name in names)
+                _releasedRecently.Remove(name);
+        }
     }
 
     // Never lets more than one ClaimMmiControlledSectorsAsync run at a time. MMI.SectorsControlled
@@ -1307,7 +1353,7 @@ public class OzServerOwnershipTracker
         if (!Network.IsConnected)
             return;
 
-        MarkReleased(new[] { sector.Name });
+        MarkGroupReleased(sector);
 
         try
         {
@@ -1359,8 +1405,9 @@ public class OzServerOwnershipTracker
 
         // Before the call, so the whole round trip is covered - see MarkReleased. The sector is
         // already out of MMI by now (CheckActive removed it), and Owned still has it until the
-        // refresh below, which is exactly the state RestoreOwnedToMmi would otherwise repair.
-        MarkReleased(new[] { sector.Name });
+        // refresh below, which is exactly the state RestoreOwnedToMmi would otherwise repair. The
+        // whole group, because that is what both CheckActive and the backend take with it.
+        MarkGroupReleased(sector);
 
         try
         {
@@ -1431,6 +1478,10 @@ public class OzServerOwnershipTracker
         try
         {
             await ClaimWithExclusionsAsync(ownSector);
+            // Kept after all, so no longer excused: anything of the position's own group that the
+            // dropped line took off the scope should come back now rather than when the excuse
+            // (which covers the released group as a whole) happens to run out.
+            UnmarkReleased(PrimaryPosition.CoveredBy(ownSector).Select(covered => covered.Name));
             ActionLog.Log("Ownership",
                 $"Took {ownSector.Name} back - releasing {released.Name} covered this session's own position", new
                 {
@@ -1558,13 +1609,10 @@ public class OzServerOwnershipTracker
 
         foreach (var sector in target)
         {
-            if (_owned.Any(o => o.Equals(sector)))
-                continue;
-
-            if (target.Any(other => !other.Equals(sector) && other.SubSectors.Any(sub => sub.Equals(sector))))
-                continue;
-
-            if (IsWithheld(sector.Name))
+            // Already owned, covered by its own parent's claim, or backed off - see NeedsClaim,
+            // which RetryUnclaimedMmiSectors shares so the two can never disagree about whether
+            // there is anything here to do.
+            if (!NeedsClaim(sector, target))
                 continue;
 
             // Same catch-clause escape as ClaimAsync - see the comment there. Here it would have
@@ -1660,13 +1708,26 @@ public class OzServerOwnershipTracker
 
         await RequestAsOneGroupAsync(asked);
 
-        try
+        // Only when the conflict left something to take. Every claim used to be followed by this
+        // second one regardless, and now that a position's own sectors are a conflict like any
+        // other, logging on to a position somebody present holds contests all of it - so the retry
+        // excluded every sector the claim covers, the backend answered a claim for nothing with 404,
+        // and "Couldn't claim BLA on OzServer: Sector not found." went up in the Errors window over
+        // a sector that exists and had just been requested successfully.
+        var leftOut = new HashSet<string>(
+            conflicts.Select(c => c.Sector).Concat(PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign)),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (PrimaryPosition.CoveredBy(sector).Any(covered => !leftOut.Contains(covered.Name)))
         {
-            await ClaimWithExclusionsAsync(sector, conflicts.Select(c => c.Sector));
-        }
-        catch (Exception ex)
-        {
-            Errors.Add(new Exception($"Couldn't claim {sector.Name} on OzServer: {ex.Message}", ex), "OzServer");
+            try
+            {
+                await ClaimWithExclusionsAsync(sector, conflicts.Select(c => c.Sector));
+            }
+            catch (Exception ex)
+            {
+                Errors.Add(new Exception($"Couldn't claim {sector.Name} on OzServer: {ex.Message}", ex), "OzServer");
+            }
         }
 
         RunOnUiThread(() =>

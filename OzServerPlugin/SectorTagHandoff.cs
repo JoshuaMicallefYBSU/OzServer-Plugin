@@ -590,8 +590,16 @@ public class SectorTagHandoff
             // anything real and is not this loop's to act on.
             // GiveAway leaves it on this session's own sector (OwnAnchor), or on toSector when there
             // was no anchor to use - either still means "waiting on this deferred handoff".
+            //
+            // The anchor is tested for null before it is compared. vatSys's Sector.Equals reads its
+            // argument's Callsign without checking it, so Equals(null) throws rather than answering
+            // false - and OwnAnchor is null whenever the login sector is not in MMI.SectorsControlled
+            // (around a disconnect, most of all). This runs from a timer on the UI thread with
+            // nothing above it to catch that.
+            var anchor = OwnAnchor();
             var waiting = fdr?.ControllingSector != null
-                          && (fdr.ControllingSector.Equals(toSector) || fdr.ControllingSector.Equals(OwnAnchor()));
+                          && (fdr.ControllingSector.Equals(toSector)
+                              || (anchor != null && fdr.ControllingSector.Equals(anchor)));
 
             if (fdr == null || !fdr.IsTrackedByMe || !waiting)
             {

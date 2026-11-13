@@ -217,12 +217,25 @@ public class BadVectorsAtisSync
     // The backend takes the frequency as the text it is read out as ("126.250") and refuses
     // anything that is not one. A station whose display string is empty or shaped oddly should
     // still publish its ATIS - without a frequency - rather than have the whole thing rejected.
-    static readonly Regex DisplayFrequency = new(@"^\d{3}(\.\d{1,3})?$", RegexOptions.Compiled);
+    //
+    // Reformatted, not just checked. ATISControl.FrequencyDisplay is not the "126.250" this was
+    // written against: Create builds it with Normalize25KhzFrequency, which pads the number out to
+    // hertz and puts the point back after the third digit - "126.250000". Matching that against a
+    // three-decimal pattern failed for every station, so every ATIS was published with no
+    // frequency at all (YSWS on 13 Nov: 127.000 in the handover record, null in the public one).
+    // Read as a number and written back the way a frequency is displayed.
+    static readonly Regex DisplayFrequency = new(@"^\d{3}(\.\d+)?$", RegexOptions.Compiled);
 
     static string? PublishableFrequency(string? display)
     {
         var trimmed = display?.Trim();
-        return !string.IsNullOrEmpty(trimmed) && DisplayFrequency.IsMatch(trimmed!) ? trimmed : null;
+        if (string.IsNullOrEmpty(trimmed) || !DisplayFrequency.IsMatch(trimmed!))
+            return null;
+
+        // Invariant culture for the reason ParseFsdFrequency gives: the point is always ".".
+        return decimal.TryParse(trimmed, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var mhz)
+            ? mhz.ToString("000.000", CultureInfo.InvariantCulture)
+            : null;
     }
 
     // ATISControl.DateTimeUtc is UTC by construction (Save sets it from DateTime.UtcNow), but a

@@ -493,7 +493,15 @@ public class AfvSectorClaimer
 
             currentSectors.Remove(currentlyControlled);
 
-            foreach (var subsector in currentlyControlled.SubSectors.ToList())
+            // The whole covered group, not just the direct sub-sectors: the release below gives back
+            // everything the dropped sector is responsible for all the way down (the backend's
+            // releaseGroup walks the chain, and PrimaryPosition.CoveredBy mirrors it), and 19 sectors
+            // in the dataset bundle sub-sectors that bundle more of their own. One level left the
+            // deeper ones in MMI with nothing owning them on OzServer, which is exactly what the
+            // tracker's RetryUnclaimedMmiSectors exists to claim - so a tick landing before the
+            // release's refresh took them out could claim them straight back, on their own, after
+            // the controller had dropped the line that covered them.
+            foreach (var subsector in PrimaryPosition.CoveredBy(currentlyControlled).Where(s => !s.Equals(currentlyControlled)))
             {
                 // Never the position this session is actually logged on as, even when the group
                 // being dropped is responsible for it. A controller logged on as a bare sub-sector

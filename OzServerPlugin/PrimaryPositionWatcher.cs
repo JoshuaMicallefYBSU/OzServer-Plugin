@@ -345,6 +345,13 @@ public class PrimaryPositionWatcher
         // Walking the list blindly then asked to release four sectors this controller had already
         // given up, and each answered "Only the current owner may release this sector" - four
         // alarming errors for an operation that had in fact completely succeeded.
+        //
+        // All of them are excused from RestoreOwnedToMmi before the first goes out. RemoveLocalCover
+        // has already taken every one off the scope, each release is followed by a refresh, and the
+        // ones still waiting their turn are still in Owned when it lands - so they were put back on
+        // the scope, only to be taken off again when their own release came round.
+        _tracker.ExpectReleaseOf(relinquishing);
+
         foreach (var sector in relinquishing)
         {
             if (!_tracker.Owned.Any(o => o.Name == sector.Name))
