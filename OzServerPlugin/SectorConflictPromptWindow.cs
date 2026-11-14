@@ -20,16 +20,17 @@ public class SectorConflictPromptWindow : SectorMessageWindow
     // Read when the window closes. True only if Yes was pressed.
     public bool Answer { get; private set; }
 
-    public SectorConflictPromptWindow(string message, string caption) : base(message, caption)
+    public SectorConflictPromptWindow(string message, string caption, string yesText = "Yes", string noText = "No")
+        : base(message, caption)
     {
         Name = nameof(SectorConflictPromptWindow);
 
         AddButtonRow(
-            CreateButton("Yes", () =>
+            CreateButton(yesText, () =>
             {
                 Answer = true;
                 Close();
             }),
-            CreateButton("No", Close));
+            CreateButton(noText, Close));
     }
 }

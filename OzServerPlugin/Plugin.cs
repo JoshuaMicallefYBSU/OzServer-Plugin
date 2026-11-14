@@ -61,6 +61,9 @@ public class Plugin : IPlugin
     // Shares vatSys's own text areas. Nothing to switch on - a note written the normal way is
     // published, and everyone else's arrive as ordinary text areas.
     readonly SharedNotes _sharedNotes;
+    // Display levels 998-999 on FMP positions. Event-driven, so it has to exist before the first
+    // position is selected.
+    readonly FmpLevelFilter _fmpLevelFilter;
     // Timer-driven and entirely invisible - it never touches the running session, only what is on
     // disk for the next one. See its own class comment for why it can't just overwrite the DLL.
     readonly PluginUpdater _updater;
@@ -89,6 +92,12 @@ public class Plugin : IPlugin
         _ownershipTracker = new OzServerOwnershipTracker();
         // After the tracker, whose RecentlyResumed its connect-time grant keeps.
         _afvSectorClaimer = new AfvSectorClaimer(_ownershipTracker);
+        // A request sent from a VSCS transmit press opens the Sectors window on it.
+        _afvSectorClaimer.SectorRequested += sectorName =>
+        {
+            OpenSectorsWindow();
+            _sectorsWindow?.HighlightRequest(sectorName);
+        };
         _fdrSync = new FdrSync();
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
@@ -112,6 +121,7 @@ public class Plugin : IPlugin
         _mapDrawing = new MapDrawing();
         _drawModeHotkey = new DrawModeHotkey(_mapDrawing);
         _sharedNotes = new SharedNotes();
+        _fmpLevelFilter = new FmpLevelFilter();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,

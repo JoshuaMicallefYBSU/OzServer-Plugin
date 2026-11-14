@@ -246,6 +246,49 @@ public static class PrimaryPosition
             Collect(subsector, into, depth + 1);
     }
 
+    // Flow (FMP) positions hold flow sectors and nothing else. An FMP controller sets transmit on
+    // enroute and TMA lines to talk to those units, not to take their airspace - but every transmit
+    // press used to put the line's sector in MMI and claim it, so PH_FMP ended up owning AAE (with
+    // AAR and AAW), PHA and HYD on 14 Nov. The backend enforces the same rule (claimGroup's
+    // flow-only filter); this copy keeps the plugin from adding the sector or asking at all.
+    public static bool IsFlowCallsign(string? callsign) =>
+        !string.IsNullOrEmpty(callsign) && callsign!.EndsWith("_FMP", StringComparison.OrdinalIgnoreCase);
+
+    // Whether a session logged on as ownCallsign may *claim* this sector outright. Everyone may take
+    // anything except a flow position, which may only claim flow sectors. A flow position can still
+    // be given someone else's sector by asking for it - relief cover the holder approves - but never
+    // airspace nobody holds.
+    public static bool MayOwn(SectorsVolumes.Sector sector, string? ownCallsign) =>
+        !IsFlowCallsign(ownCallsign) || IsFlowCallsign(sector.Callsign);
+
+    // Tells a flow position it tried to take airspace nobody holds - the one thing it may not do.
+    public static void ReportFlowCannotAssume(IEnumerable<SectorsVolumes.Sector> sectors, string? ownCallsign)
+    {
+        var names = sectors.Select(s => s.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (names.Count == 0)
+            return;
+
+        ActionLog.Log("Primary",
+            $"Unable to assume {string.Join(", ", names)} - {ownCallsign} is FMP and nobody holds it to request it from",
+            new { action = "flow_cannot_assume_unheld", sectors = names, own_callsign = ownCallsign });
+
+        var message = $"Unable to assume sector - position {ownCallsign} is FMP."
+                      + Environment.NewLine + Environment.NewLine
+                      + string.Join(Environment.NewLine, names.Select(SectorDescription.Describe))
+                      + Environment.NewLine + Environment.NewLine
+                      + "An FMP can only provide relief cover for a sector another controller holds, by requesting it from them.";
+
+        MMI.InvokeOnGUI(() =>
+        {
+            var notice = new SectorNoticeWindow(message, "Unable to assume sector");
+            if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form mainForm)
+                notice.Show(mainForm);
+            else
+                notice.Show();
+            notice.BringToFront();
+        });
+    }
+
     // IsRealATC filters out observers and the various non-controlling connections that also appear
     // in this list, so only a genuine controller counts as covering a member sector.
     public static List<NetworkATC> OnlineRealAtcs() =>

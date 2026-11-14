@@ -2970,6 +2970,13 @@ public class OzServerSectorsWindow : BaseForm
                   + SectorDescription.Describe(name)
                 : $"{by} denied your request.";
 
+            // A flow position cannot fall back on claiming the sector some other way, so say so -
+            // see PrimaryPosition.MayOwn.
+            var own = Network.Me?.Callsign;
+            if (PrimaryPosition.IsFlowCallsign(own))
+                message += Environment.NewLine + Environment.NewLine
+                         + $"Unable to assume sector - position {own} is FMP. Relief cover is only by the controller's approval.";
+
             ShowNotice(message, "Request denied");
 
             _ = AcknowledgeRejectionAsync(dto.Id);
@@ -3063,6 +3070,45 @@ public class OzServerSectorsWindow : BaseForm
 
         UpdateRequestActionButtons();
         UpdateArrowButton();
+        TrySelectHighlightedRequest();
+    }
+
+    // Set by HighlightRequest, cleared once the request's row has been found and selected - it may
+    // only exist after the next poll brings the newly sent request back.
+    string? _highlightRequestSector;
+    DateTime _highlightRequestUntil;
+
+    // Selects this controller's own outgoing request for sector in Requested By Me, so a request
+    // raised from a VSCS transmit press opens the window on the thing just asked for.
+    public void HighlightRequest(string sectorName)
+    {
+        _highlightRequestSector = sectorName;
+        _highlightRequestUntil = DateTime.UtcNow.AddSeconds(15);
+        TrySelectHighlightedRequest();
+    }
+
+    void TrySelectHighlightedRequest()
+    {
+        if (_highlightRequestSector == null)
+            return;
+
+        if (DateTime.UtcNow > _highlightRequestUntil)
+        {
+            _highlightRequestSector = null;
+            return;
+        }
+
+        var byMe = _requestedChangesView.Nodes.Cast<TreeNode>().FirstOrDefault(n => n.Text.StartsWith(RequestedByMeName, StringComparison.Ordinal))
+                   ?? _requestedChangesView.Nodes.Cast<TreeNode>().FirstOrDefault();
+        var node = byMe?.Nodes.Cast<TreeNode>().FirstOrDefault(n =>
+            n.Tag is SectorChangeRequest request
+            && string.Equals(request.Sector.Name, _highlightRequestSector, StringComparison.OrdinalIgnoreCase));
+        if (node == null)
+            return;
+
+        _highlightRequestSector = null;
+        _requestedChangesView.SelectedNode = node;
+        node.EnsureVisible();
     }
 
     void AddRequestNodes(TreeNode parent, List<SectorChangeRequest> requests, string emptyText,
@@ -3112,6 +3158,11 @@ public class OzServerSectorsWindow : BaseForm
     TreeNode BuildRequestNode(SectorChangeRequest request, RequestListDirection direction)
     {
         var text = $"{request.Sector.Name} - {request.Sector.FullName} ({request.Controller})";
+        // A flow position only ever asks for someone else's airspace to cover it for a while - see
+        // PrimaryPosition.MayOwn. Said on the request itself so the controller deciding knows it is
+        // relief, not a handover for good.
+        if (direction == RequestListDirection.Incoming && PrimaryPosition.IsFlowCallsign(request.Controller))
+            text += " - FMP relief cover (temporary)";
         var node = new TreeNode { Tag = request, NodeFont = _requestedChangesView.Font };
 
         // See BuildOwnedSectorNode for why this is TryGetValue rather than an indexer.

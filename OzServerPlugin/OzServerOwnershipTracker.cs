@@ -365,7 +365,21 @@ public class OzServerOwnershipTracker
     bool NeedsClaim(SectorsVolumes.Sector sector, List<SectorsVolumes.Sector> target) =>
         !_owned.Any(o => o.Equals(sector))
         && !target.Any(other => !other.Equals(sector) && other.SubSectors.Any(sub => sub.Equals(sector)))
-        && !IsWithheld(sector.Name);
+        && !IsWithheld(sector.Name)
+        && !IsReliefCovered(sector)
+        && !IsHeldForTransmitPrompt(sector.Name)
+        // Something else (VatpacPlugin, on the same transmit press) can still put an enroute or TMA
+        // sector into a flow position's MMI. It is never claimed from there - see
+        // PrimaryPosition.MayOwn.
+        && PrimaryPosition.MayOwn(sector, Network.Me?.Callsign);
+
+    // An FMP is covering this sector for its controller, who agreed to it. The login sector stays in
+    // that controller's MMI (vatSys keeps it there), so without this every poll would claim it,
+    // be refused, and - it being their own position - request it straight back off the FMP the
+    // moment they had given it. It comes back once the FMP lets it go: the next poll finds it
+    // unowned and claims it like any other.
+    bool IsReliefCovered(SectorsVolumes.Sector sector) =>
+        _controlled.TryGetValue(sector.Name, out var owner) && PrimaryPosition.IsFlowCallsign(owner.Callsign);
 
     bool IsWithheld(string name)
     {
@@ -706,6 +720,11 @@ public class OzServerOwnershipTracker
     // Answers with what was granted - see OzServerApiClient.ClaimSectorAsync.
     Task<IReadOnlyList<string>?> ClaimWithExclusionsAsync(SectorsVolumes.Sector sector, IEnumerable<string>? also = null)
     {
+        // Every claim path comes through here, so this is the plugin's last word on a flow position
+        // taking enroute or TMA airspace - see PrimaryPosition.MayOwn. Nothing claimed.
+        if (!PrimaryPosition.MayOwn(sector, Network.Me?.Callsign))
+            return Task.FromResult<IReadOnlyList<string>?>(Array.Empty<string>());
+
         var exclude = PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign);
 
         foreach (var name in also ?? Enumerable.Empty<string>())
@@ -1218,6 +1237,43 @@ public class OzServerOwnershipTracker
             toClaim = Array.Empty<SectorsVolumes.Sector>();
         }
 
+        // A flow position never claims enroute or TMA airspace - see PrimaryPosition.MayOwn. What
+        // another controller holds it may ask for as relief cover, so a staged claim on one of those
+        // goes as a request instead; what nobody holds it cannot take at all. The backend enforces
+        // both; this turns the first into what the controller meant and says why for the second.
+        var ownCallsign = Network.Me?.Callsign;
+        var notFlow = toClaim.Where(s => !PrimaryPosition.MayOwn(s, ownCallsign) && !IsMine(s)).ToList();
+        if (notFlow.Count > 0)
+        {
+            var held = notFlow.Where(s => _controlled.ContainsKey(s.Name)).ToList();
+            var unheld = notFlow.Where(s => !_controlled.ContainsKey(s.Name)).ToList();
+
+            toClaim = toClaim.Where(s => !notFlow.Contains(s)).ToList();
+            if (held.Count > 0)
+                toRequest = (toRequest ?? Array.Empty<SectorsVolumes.Sector>())
+                    .Concat(held.Where(s => !(toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Any(r => r.Equals(s))))
+                    .ToList();
+
+            if (unheld.Count > 0)
+            {
+                PrimaryPosition.ReportFlowCannotAssume(unheld, ownCallsign);
+                result.Failed.AddRange(unheld.Select(s => s.Name));
+            }
+        }
+
+        // A request is only for airspace someone holds; for a flow position an unheld one would
+        // otherwise just fail without a reason.
+        if (PrimaryPosition.IsFlowCallsign(ownCallsign) && toRequest != null)
+        {
+            var unheldRequests = toRequest.Where(s => !PrimaryPosition.MayOwn(s, ownCallsign) && !_controlled.ContainsKey(s.Name)).ToList();
+            if (unheldRequests.Count > 0)
+            {
+                PrimaryPosition.ReportFlowCannotAssume(unheldRequests, ownCallsign);
+                result.Failed.AddRange(unheldRequests.Select(s => s.Name));
+                toRequest = toRequest.Where(s => !unheldRequests.Contains(s)).ToList();
+            }
+        }
+
         // Covers both the batched commit and the per-sector fallback below, and the whole group
         // each release takes with it - RestoreOwnedToMmi must not put a sector back on screen in
         // the window between this Apply removing it and Owned catching up. See MarkReleased.
@@ -1676,14 +1732,33 @@ public class OzServerOwnershipTracker
         // sector covers. Accepting BLA hands over BLA's whole covered group (transferRequest walks it),
         // so MAE's departures and radar sectors arrive with it whatever the answer to a question
         // about them would have been - asking would only have pretended there was a choice.
+        //
+        // Never anything an FMP holds: that is relief cover its controller agreed to (see
+        // IsReliefCovered), and asking for it back - automatically or by prompt - is the FMP's
+        // decision to end, not a claim's. It is still left out of the claim below like any conflict.
+        //
+        // Nor anything a transmit press is already asking about (IsHeldForTransmitPrompt) - that
+        // prompt is the one question about it.
+        var reliefCover = conflicts.Where(c => PrimaryPosition.IsFlowCallsign(c.Owner?.Callsign)
+                                               || IsHeldForTransmitPrompt(c.Sector)).ToList();
+        if (reliefCover.Count > 0)
+            ActionLog.Log("Ownership",
+                $"Left {string.Join(", ", reliefCover.Select(c => c.Sector))} with {string.Join(", ", reliefCover.Select(c => c.Owner?.Callsign).Distinct())} - FMP relief cover, or already being asked about from a transmit press",
+                new
+                {
+                    action = "conflict_left_with_flow_relief",
+                    sectors = reliefCover.Select(c => c.Sector).ToArray(),
+                    own_callsign = Network.Me?.Callsign
+                });
+
         var myDefaults = PrimaryPosition.DefaultSectorsFor(Network.Me?.Callsign);
-        var mineByRight = conflicts.Where(c => myDefaults.Any(s => s.Name == c.Sector)).ToList();
+        var mineByRight = conflicts.Where(c => !reliefCover.Contains(c) && myDefaults.Any(s => s.Name == c.Sector)).ToList();
         var carriedWith = conflicts
-            .Where(c => !mineByRight.Contains(c))
+            .Where(c => !mineByRight.Contains(c) && !reliefCover.Contains(c))
             .Where(c => mineByRight.Any(own => own.Owner?.Cid == c.Owner?.Cid && Covers(own.Sector, c.Sector)))
             .ToList();
         var asked = mineByRight.Concat(carriedWith).ToList();
-        var contestedByOthers = conflicts.Where(c => !asked.Contains(c)).ToList();
+        var contestedByOthers = conflicts.Where(c => !asked.Contains(c) && !reliefCover.Contains(c)).ToList();
 
         // Laid out lead / list / question, the same shape as every other popup in the plugin, with
         // each sector written out in full (SectorDescription). This used to name sectors by bare
@@ -1811,6 +1886,87 @@ public class OzServerOwnershipTracker
         {
             Errors.Add(new Exception($"Couldn't request {string.Join(", ", names)} on OzServer: {ex.Message}", ex), "OzServer");
         }
+    }
+
+    // Asks the holder of sector for it - from a transmit press the controller has just confirmed
+    // (AfvSectorClaimer.PromptToRequestHeldSector). The holder gets an ordinary request, marked as
+    // FMP relief cover in their Sectors window when this is a flow position; if they accept, the
+    // sector and its tags move the ordinary way. True once the request is on the server (or already
+    // was).
+    public async Task<bool> RequestHeldSectorAsync(SectorsVolumes.Sector sector)
+    {
+        if (IsMine(sector) || !_controlled.TryGetValue(sector.Name, out var owner))
+            return false;
+
+        if (HasPendingRequestFor(sector))
+            return true;
+
+        var flow = PrimaryPosition.IsFlowCallsign(Network.Me?.Callsign);
+
+        try
+        {
+            var response = await _api.CommitAsync(
+                Array.Empty<string>(), Array.Empty<string>(), new[] { sector.Name }, Array.Empty<string>());
+
+            var raised = response.Result.Requested.Contains(sector.Name, StringComparer.OrdinalIgnoreCase);
+            ActionLog.Log("Request", $"Requested {sector.Name} from {owner.Callsign}"
+                                     + (flow ? " as FMP relief cover" : "")
+                                     + (raised ? "" : " - the request could not be raised"),
+                new
+                {
+                    action = flow ? "request_flow_relief_cover" : "request_from_transmit",
+                    sector = sector.Name,
+                    owner = owner.Callsign,
+                    requested = response.Result.Requested.ToArray(),
+                    failed = response.Result.Failed.ToArray(),
+                    own_callsign = Network.Me?.Callsign
+                });
+
+            if (response.Sync != null)
+                await ApplySyncGatedAsync(response.Sync);
+            else
+                await RefreshFromServerAsync();
+
+            if (!raised)
+                Errors.Add(new Exception($"Couldn't request {sector.Name} from {owner.Callsign}."), "OzServer");
+            return raised;
+        }
+        catch (Exception ex)
+        {
+            Errors.Add(new Exception($"Couldn't request {sector.Name} from {owner.Callsign}: {ex.Message}", ex), "OzServer");
+            return false;
+        }
+    }
+
+    public bool HasPendingRequestFor(SectorsVolumes.Sector sector) =>
+        MyRequests.ByMe.Any(r => r.RejectedAt == null && r.Sector != null
+                                 && string.Equals(r.Sector.Name, sector.Name, StringComparison.OrdinalIgnoreCase));
+
+    // Sectors a transmit press is asking about (AfvSectorClaimer.PromptToRequestHeldSector). Left
+    // out of the claim pass meanwhile - the press can put them in MMI (VatpacPlugin does) before the
+    // prompt takes them out again, and claiming them would raise the tracker's own "already owned"
+    // question about the same thing. Long enough to cover the prompt and a request being answered.
+    static readonly TimeSpan TransmitPromptHold = TimeSpan.FromSeconds(120);
+    readonly Dictionary<string, DateTime> _transmitPromptHold = new(StringComparer.OrdinalIgnoreCase);
+
+    public void HoldForTransmitPrompt(IEnumerable<string> names)
+    {
+        lock (_withheldGate)
+            foreach (var name in names)
+                _transmitPromptHold[name] = DateTime.UtcNow + TransmitPromptHold;
+    }
+
+    public void ReleaseTransmitPromptHold(IEnumerable<string> names)
+    {
+        lock (_withheldGate)
+            foreach (var name in names)
+                _transmitPromptHold.Remove(name);
+    }
+
+    bool IsHeldForTransmitPrompt(string name)
+    {
+        lock (_withheldGate)
+            return _transmitPromptHold.TryGetValue(name, out var until) && DateTime.UtcNow < until;
     }
 
     // How long the conflict question waits for an answer before it withdraws itself as "no".

@@ -141,6 +141,16 @@ public class AfvSectorClaimer
             action();
     }
 
+    // Always queued, even from the UI thread - runs after whatever event is being handled right now
+    // has finished with every other subscriber.
+    static void DeferOnUiThread(Action action)
+    {
+        if (Application.OpenForms["MainForm"] is Control { IsHandleCreated: true } mainForm)
+            mainForm.BeginInvoke(action);
+        else
+            action();
+    }
+
     void BeginInit()
     {
         _initAttemptsLeft = InitMaxAttempts;
@@ -431,6 +441,19 @@ public class AfvSectorClaimer
         if (frequencySector == null)
             return;
 
+        // Transmitting on a sector another controller holds asks whether to request it - see
+        // PromptToRequestHeldSector. Checked before anything touches MMI, and whether or not
+        // something else (VatpacPlugin, on this same press) has already put it there. This
+        // session's own position is left to the logon path, which requests it on its own.
+        if (frequency.Transmit
+            && !primarySector.Equals(frequencySector)
+            && !_tracker.IsMine(frequencySector)
+            && _tracker.ControlledByOthers.ContainsKey(frequencySector.Name))
+        {
+            PromptToRequestHeldSector(frequency, frequencySector, myCallsign!);
+            return;
+        }
+
         var currentSectors = MMI.SectorsControlled.ToList();
         var currentlyControlled = currentSectors.FirstOrDefault(s => s.Callsign == frequency.Name);
 
@@ -443,6 +466,16 @@ public class AfvSectorClaimer
             if (!frequency.Transmit)
             {
                 ReleaseQuietLineMissingFromMmi(frequencySector, primarySector);
+                return;
+            }
+
+            // A flow position never takes enroute or TMA airspace nobody holds - see
+            // PrimaryPosition.MayOwn. (Airspace someone does hold was handled above: it is asked
+            // for, as relief cover.) Already given to this session, by an accepted request, it goes
+            // back on the scope like any other sector of ours.
+            if (!PrimaryPosition.MayOwn(frequencySector, myCallsign) && !_tracker.IsMine(frequencySector))
+            {
+                PrimaryPosition.ReportFlowCannotAssume(new[] { frequencySector }, myCallsign);
                 return;
             }
 
@@ -548,6 +581,147 @@ public class AfvSectorClaimer
         // re-derives Owned itself when it succeeds.
         if (dropped != null)
             _ = _tracker.ReleaseIdleVscsLineAsync(dropped);
+    }
+
+    // Raised (on the UI thread) once a request has been sent from a transmit press, with the
+    // requested sector's name - Plugin opens the Sectors window on it.
+    public event Action<string>? SectorRequested;
+
+    // Sectors with a transmit prompt currently open, so pressing again does not stack a second one.
+    readonly HashSet<string> _promptOpen = new(StringComparer.OrdinalIgnoreCase);
+
+    static readonly TimeSpan RequestPromptTimeout = TimeSpan.FromSeconds(60);
+
+    const string FlowReliefNote =
+        "You are requesting to take ownership of airspace as FMP. This is a temporary operation for "
+        + "relieving ATC during bathroom breaks etc. FMP should not control ENR/TMA Airspace for "
+        + "extended periods of time.";
+
+    // Transmit was pressed on a sector someone else holds. Pressing transmit is how a controller
+    // takes airspace, but this airspace is somebody's: so rather than claiming it (which the backend
+    // refuses) or silently asking for it, the controller is asked whether to request it, shown
+    // everything that would come with it.
+    //
+    //   Accept - the request goes to the holder, and the Sectors window opens on it.
+    //   Reject - (also closing the prompt, or leaving it for a minute) the line goes back to
+    //            Receive, since the controller has decided not to work this airspace.
+    //
+    // Nothing is put on the scope either way until the holder accepts; then the sector and its tags
+    // arrive the ordinary way. A flow position sees an extra note - it may only ever take airspace
+    // this way, as temporary relief.
+    void PromptToRequestHeldSector(VSCSFrequency frequency, SectorsVolumes.Sector sector, string myCallsign)
+    {
+        if (!_tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner))
+            return;
+
+        // Kept out of the claim path while this is being decided, so the tracker does not also try
+        // to claim it and ask its own "already owned" question about the same press.
+        _tracker.HoldForTransmitPrompt(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));
+
+        // After every TransmitChanged handler has run - VatpacPlugin's included, which can add the
+        // sector's whole group to MMI on this same press. None of it is ours.
+        DeferOnUiThread(() => RemoveHeldFromMmi(sector, owner.Cid));
+
+        if (_tracker.HasPendingRequestFor(sector))
+        {
+            ActionLog.Log("Request", $"Transmit on {sector.Name} - already requested from {owner.Callsign}",
+                new { action = "transmit_held_already_requested", sector = sector.Name, owner = owner.Callsign, own_callsign = myCallsign });
+            RunOnUiThread(() => SectorRequested?.Invoke(sector.Name));
+            return;
+        }
+
+        if (!_promptOpen.Add(sector.Name))
+            return;
+
+        // What the holder would actually hand over: the sector and everything under it that they
+        // hold themselves (the backend's transferRequest gives exactly that).
+        var group = PrimaryPosition.CoveredBy(sector)
+            .Where(s => s.Equals(sector)
+                        || (_tracker.ControlledByOthers.TryGetValue(s.Name, out var o) && o.Cid == owner.Cid))
+            .ToList();
+
+        var message = $"{owner.Callsign} currently owns:"
+                      + Environment.NewLine + Environment.NewLine
+                      + string.Join(Environment.NewLine, group.Select(s => SectorDescription.Describe(s)))
+                      + Environment.NewLine + Environment.NewLine
+                      + $"Request {(group.Count == 1 ? "this sector" : "these sectors")} from {owner.Callsign}?";
+        if (PrimaryPosition.IsFlowCallsign(myCallsign))
+            message += Environment.NewLine + Environment.NewLine + FlowReliefNote;
+
+        ActionLog.Log("Request", $"Transmit on {sector.Name}, held by {owner.Callsign} - asking whether to request it",
+            new { action = "transmit_held_prompt", sector = sector.Name, sectors = group.Select(s => s.Name).ToArray(), owner = owner.Callsign, own_callsign = myCallsign });
+
+        DeferOnUiThread(() =>
+        {
+            var prompt = new SectorConflictPromptWindow(message, "Request sector", "Accept", "Reject");
+            var timeout = new System.Windows.Forms.Timer { Interval = (int)RequestPromptTimeout.TotalMilliseconds };
+            timeout.Tick += (_, _) =>
+            {
+                timeout.Stop();
+                if (!prompt.IsDisposed)
+                    prompt.Close();
+            };
+
+            prompt.FormClosed += (_, _) =>
+            {
+                timeout.Stop();
+                timeout.Dispose();
+                _promptOpen.Remove(sector.Name);
+
+                if (prompt.Answer)
+                    _ = RequestFromTransmitAsync(sector);
+                else
+                    BackToReceive(frequency, sector);
+            };
+
+            if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form mainForm)
+                prompt.Show(mainForm);
+            else
+                prompt.Show();
+            prompt.BringToFront();
+            timeout.Start();
+        });
+    }
+
+    async System.Threading.Tasks.Task RequestFromTransmitAsync(SectorsVolumes.Sector sector)
+    {
+        if (await _tracker.RequestHeldSectorAsync(sector))
+            RunOnUiThread(() => SectorRequested?.Invoke(sector.Name));
+    }
+
+    // Declined: off Transmit, onto Receive - what vatSys's own Receive button does. Taken out of MMI
+    // already (RemoveHeldFromMmi), so the TransmitChanged this raises finds nothing to drop or
+    // release, and nothing of anyone else's is touched.
+    void BackToReceive(VSCSFrequency frequency, SectorsVolumes.Sector sector)
+    {
+        _tracker.ReleaseTransmitPromptHold(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));
+        RemoveHeldFromMmi(sector, _tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner) ? owner.Cid : (int?)null);
+
+        ActionLog.Log("Request", $"Did not request {sector.Name} - its VSCS line is back on Receive",
+            new { action = "transmit_held_declined", sector = sector.Name, own_callsign = Network.Me?.Callsign });
+
+        if (frequency.Transmit)
+            frequency.Transmit = false;
+        frequency.Receive = true;
+    }
+
+    // Takes the sector, and whatever under it is not ours, back out of MMI - never this session's own
+    // position or anything it owns.
+    void RemoveHeldFromMmi(SectorsVolumes.Sector sector, int? ownerCid)
+    {
+        var own = Network.Me?.Callsign;
+        var current = MMI.SectorsControlled.ToList();
+        var remove = PrimaryPosition.CoveredBy(sector)
+            .Where(s => s.Callsign != own && !_tracker.IsMine(s))
+            .Where(s => s.Equals(sector) || ownerCid == null
+                        || (_tracker.ControlledByOthers.TryGetValue(s.Name, out var o) && o.Cid == ownerCid))
+            .Where(s => current.Any(c => c.Equals(s)))
+            .ToList();
+
+        if (remove.Count == 0)
+            return;
+
+        MMI.SetControlledSectors(current.Where(c => !remove.Any(r => r.Equals(c))).ToList());
     }
 
     // A line stopped transmitting for a sector vatSys is not listing as controlled. There is
