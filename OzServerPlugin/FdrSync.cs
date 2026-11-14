@@ -11,7 +11,9 @@ namespace OzServerPlugin;
 // Pushes FDR/position updates vatSys hands the plugin (Plugin.OnFDRUpdate, Plugin.OnRadarTrackUpdate
 // - both fire per flight, for every flight vatSys is tracking, not just this controller's own
 // traffic) to OzServer's /fdr/batch endpoint - but only for a flight this controller currently holds
-// and has activated: fdr.IsTrackedByMe && fdr.ESTed, checked fresh on every update (see ShouldPush).
+// and has activated: fdr.IsTrackedByMe && fdr.ESTed, checked fresh on every update (see ShouldPush) -
+// or, for an activated/completed FDR nobody tracks, when this controller holds its data authority
+// (ShouldPush's second rule; those are reported with no tag owner, see FillAuthority).
 // No grace period, no "used to own it" carve-out: the moment either goes false, nothing more is
 // pushed for that flight until (if ever) this controller holds it again. IsTrackedByMe is now
 // whatever vatSys itself says it is - nothing in this plugin moves tags between controllers any
@@ -140,18 +142,89 @@ public class FdrSync
             State = fdr.State.ToString()
         };
         FillPosition(dto, track);
-        FillAuthority(dto);
+        FillAuthority(dto, fdr);
         FillCurrentSector(dto, fdr);
 
         Merge(dto);
     }
 
-    // Gates every push on this session's own relationship to the flight, checked fresh every time -
-    // see the class comment.
+    // Gates every push on this session's own relationship to the flight, checked fresh every time.
+    // Two ways to qualify:
+    //
+    //  - this controller tracks it and it is activated (the original rule - see the class comment);
+    //  - nobody tracks it, and this controller holds its data authority: the sector vatSys names as
+    //    the FDR's ControllingSector is one of this session's controlled sectors. That is vatSys's
+    //    own rule for who may edit an untracked FDR (FDR.HavePermission), so exactly one online
+    //    controller answers for each such FDR - an activated tag still on the ground at YBBN is kept
+    //    up to date by whoever holds the sector its data authority sits in, and a completed one by
+    //    whoever holds it at the destination. Only activated (ESTed) or completed (STATE_FINISHED)
+    //    FDRs: a pre-active plan is not traffic yet.
     //
     // Connected as well: vatSys keeps delivering updates for a while after a disconnect, and what is
     // queued then would be sent first on the next session - see the Disconnected handler above.
-    static bool ShouldPush(FDP2.FDR fdr) => Network.IsConnected && fdr.IsTrackedByMe && fdr.ESTed;
+    static bool ShouldPush(FDP2.FDR fdr)
+    {
+        if (!Network.IsConnected)
+            return false;
+
+        if (fdr.IsTrackedByMe)
+            return fdr.ESTed;
+
+        return HoldsDataAuthority(fdr);
+    }
+
+    static bool HoldsDataAuthority(FDP2.FDR fdr)
+    {
+        if (fdr.IsTracked || fdr.ControllingSector == null)
+            return false;
+
+        if (!fdr.ESTed && fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED)
+            return false;
+
+        try
+        {
+            // vatSys's live list, mutated on its own thread - read a copy.
+            return MMI.SectorsControlled.ToList().Contains(fdr.ControllingSector);
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    // Every SweepEvery-th flush, every FDR this session answers for is queued again in full. An
+    // untracked FDR parked at the gate, or one already completed, raises no FDR or radar events of
+    // its own, so without this it would age out of the backend (FDR_RETAIN_MINUTES) while still
+    // very much there - and an FDR whose data authority only just became ours (a sector claimed or
+    // handed over) would not appear until something about it happened to change.
+    const int SweepEvery = 12; // x FlushInterval = once a minute
+    int _flushCount;
+
+    void SweepAuthorityFdrs()
+    {
+        List<FDP2.FDR> fdrs;
+        try
+        {
+            fdrs = FDP2.GetFDRs.ToList();
+        }
+        catch (Exception)
+        {
+            return; // modified mid-copy; the next sweep gets it
+        }
+
+        foreach (var fdr in fdrs)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(fdr.Callsign) && ShouldPush(fdr))
+                    Merge(BuildFdrDto(fdr));
+            }
+            catch (Exception ex)
+            {
+                ErrorThrottle.Report("fdr-sweep", $"Couldn't read FDR {fdr.Callsign} for OzServer: {ex.Message}", ex);
+            }
+        }
+    }
 
 
     void Merge(OzServerFdrUpdateDto dto)
@@ -180,6 +253,9 @@ public class FdrSync
 
         try
         {
+            if (++_flushCount % SweepEvery == 0)
+                SweepAuthorityFdrs();
+
             List<OzServerFdrUpdateDto> batch;
 
             lock (_lock)
@@ -245,11 +321,27 @@ public class FdrSync
             Remarks = NullIfEmpty(fdr.Remarks),
         };
 
-        FillAuthority(dto);
+        FillAuthority(dto, fdr);
         FillPredictedPosition(dto, fdr);
         FillCurrentSector(dto, fdr);
+        FillAerodromes(dto, fdr);
 
         return dto;
+    }
+
+    static void FillAerodromes(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
+    {
+        if (!string.IsNullOrEmpty(fdr.DepAirport) && Airspace2.GetAirport(fdr.DepAirport) is { LatLong: { } dep })
+        {
+            dto.DepLat = dep.Latitude;
+            dto.DepLon = dep.Longitude;
+        }
+
+        if (!string.IsNullOrEmpty(fdr.DesAirport) && Airspace2.GetAirport(fdr.DesAirport) is { LatLong: { } des })
+        {
+            dto.DesLat = des.Latitude;
+            dto.DesLon = des.Longitude;
+        }
     }
 
     // The geographic subsector fdr is physically inside of right now - a different question from
@@ -284,10 +376,21 @@ public class FdrSync
         dto.Lon = location.Longitude;
     }
 
-    // Called only once ShouldPush(fdr) has already passed for this push - i.e. fdr.IsTrackedByMe is
-    // true - so the datalink authority a push reports is always this session's own identity.
-    static void FillAuthority(OzServerFdrUpdateDto dto)
+    // Called only once ShouldPush(fdr) has passed. A tracked push names this session; an untracked
+    // one (pushed because this session holds the data authority) names nobody, since nobody tracks
+    // it - null is what the backend and the map read as "no tag owner". Either way the data
+    // authority sector goes with it, which is what lets the backend accept the untracked report.
+    static void FillAuthority(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
     {
+        dto.AuthoritySector = fdr.ControllingSector?.Name;
+
+        if (!fdr.IsTrackedByMe)
+        {
+            dto.ControllingCid = null;
+            dto.ControllingCallsign = null;
+            return;
+        }
+
         // Left null when there is no identity yet rather than defaulted, because null is meaningful
         // on this field: it is what the backend reads as "no datalink authority".
         var me = NetworkIdentity.Current;

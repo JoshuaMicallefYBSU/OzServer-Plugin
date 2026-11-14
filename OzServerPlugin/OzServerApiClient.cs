@@ -204,10 +204,9 @@ class OzServerErrorDto
 // Mirrors UpdateFlightDataRecordRequest's validation rules (app/Http/Requests on the backend) field
 // for field. controlling_cid/controlling_callsign are the flight's datalink authority, deliberately
 // separate from this session's own identity (attached automatically by PostRawAsync, same as every
-// other endpoint) even though, now, they're always this session's own cid/callsign: FdrSync only
-// ever pushes while fdr.IsTrackedByMe is true (see FdrSync.ShouldPush) - a flight merely observed,
-// handed off elsewhere, or not yet activated is never pushed for at all, so there's no "someone
-// else's callsign" or "free/null" authority left to report. Every field besides Callsign is
+// other endpoint): this session's own cid/callsign when it tracks the flight, and null when it is
+// pushing an untracked FDR it holds the data authority for (see FdrSync.ShouldPush) - which is
+// exactly the "nobody tracks this tag" the backend and the map read null as. Every field besides Callsign is
 // nullable so a partial or position-only push doesn't have to fabricate values for whatever FdrSync
 // couldn't read off the FDR.
 public class OzServerFdrUpdateDto
@@ -282,6 +281,20 @@ public class OzServerFdrUpdateDto
     // above). Null when the aircraft isn't inside any known sector volume at its current
     // position/level, or when neither a live nor a predicted position is available yet.
     [JsonProperty("current_sector")] public string? CurrentSector { get; set; }
+
+    // vatSys's own data authority for the FDR - fdr.ControllingSector, the sector whose controller
+    // may edit an untracked FDR (vatSys's FDR.HavePermission). For an activated FDR nobody tracks
+    // (still on the ground, say), the plugin holding this sector is the one pushing it, and the
+    // backend uses it to recognise that push - see FdrSync.ShouldPush.
+    [JsonProperty("authority_sector")] public string? AuthoritySector { get; set; }
+
+    // The aerodromes' own positions, from vatSys's airport data. The map draws an FDR that has not
+    // departed yet at its departure aerodrome, and a completed one at its destination - neither
+    // necessarily has a live position of its own.
+    [JsonProperty("dep_lat")] public double? DepLat { get; set; }
+    [JsonProperty("dep_lon")] public double? DepLon { get; set; }
+    [JsonProperty("des_lat")] public double? DesLat { get; set; }
+    [JsonProperty("des_lon")] public double? DesLon { get; set; }
 }
 
 // AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
