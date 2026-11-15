@@ -49,14 +49,14 @@ public sealed class OzServerEventStream : IDisposable
     // What subscribers are told to re-read the moment a connection comes up. Whatever was signalled
     // while there was no stream was never seen, so "connected" has to mean "assume everything
     // changed" - once - rather than "nothing has happened yet".
-    static readonly string[] CatchUpEvents = { "sectors", "annotations" };
+    static readonly string[] CatchUpEvents = { "sectors" };
 
-    // One connection for the whole plugin. Several components care about the same stream
-    // (ownership, drawing, notes) and opening a socket per subscriber would multiply long-lived
+    // One connection for the whole plugin. Several components could care about the same stream
+    // and opening a socket per subscriber would multiply long-lived
     // connections per controller for no benefit - the server fans out to all of them identically.
     public static OzServerEventStream Shared { get; } = new OzServerEventStream();
 
-    // Carries the event name only ("sectors", "fdr", "atis", "annotations") - see the class comment
+    // Carries the event name only ("sectors", "fdr", "atis") - see the class comment
     // on why there is deliberately no payload to hand out.
     public event Action<string>? EventReceived;
 

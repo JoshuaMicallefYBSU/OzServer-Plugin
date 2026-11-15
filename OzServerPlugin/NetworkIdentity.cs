@@ -47,23 +47,4 @@ static class NetworkIdentity
     // 0 when not connected. Only for callers where "not me" is the right reading of an absent
     // identity - never for attributing ownership, where 0 would be a real controller id.
     public static int CidOrZero => Current?.Cid ?? 0;
-
-    // Whether this session may put shared markup - drawings, notes - on every other controller's
-    // scope. Reading it is unrestricted: an observer watching a position should see what that
-    // controller has marked up, the same way ObserverPositionMirror shows them the airspace. Writing
-    // is not, because an observer is not working traffic and shared markup is an operational
-    // statement made to everyone connected.
-    //
-    // Deliberately IsObserver (Position/Rating) rather than Network.Me.IsRealATC - see above for why
-    // that flag would silently drop the opening markup of a genuine session.
-    //
-    // The plugin being well behaved, not a security boundary: the API takes the caller's word for
-    // who they are, so it cannot tell an observer from anyone else.
-    //
-    // Gated on IsConnected as well, because Current is not: vatSys keeps the callsign and CID after
-    // a disconnect (which GracefulDisconnectReleaser relies on), so without it this stayed true once
-    // the session had ended. SharedNotes forgets its own notes on disconnect, found them again on the
-    // next poll, and published every one of them a second time while disconnected - a duplicate of
-    // each on every other controller's scope.
-    public static bool CanPublishMarkup => Network.IsConnected && Current != null && !IsObserver;
 }

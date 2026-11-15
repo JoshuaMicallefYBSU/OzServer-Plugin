@@ -57,14 +57,6 @@ public class Plugin : IPlugin
     readonly GracefulDisconnectReleaser _gracefulDisconnectReleaser;
     readonly ObserverPositionMirror _observerPositionMirror;
     readonly RequestedSectorOverlay _requestedSectorOverlay;
-    // Freehand markup on the scope, and the bare D that toggles it. Both are alive from plugin load
-    // so the key works before any OzServer window has been opened - though the tool itself hooks
-    // nothing until it is switched on.
-    readonly MapDrawing _mapDrawing;
-    readonly DrawModeHotkey _drawModeHotkey;
-    // Shares vatSys's own text areas. Nothing to switch on - a note written the normal way is
-    // published, and everyone else's arrive as ordinary text areas.
-    readonly SharedNotes _sharedNotes;
     // Display levels 998-999 on FMP positions. Event-driven, so it has to exist before the first
     // position is selected.
     readonly FmpLevelFilter _fmpLevelFilter;
@@ -132,9 +124,6 @@ public class Plugin : IPlugin
         // assembly, so it has no ordering relationship with anything above it.
         _updater = new PluginUpdater();
 
-        _mapDrawing = new MapDrawing();
-        _drawModeHotkey = new DrawModeHotkey(_mapDrawing);
-        _sharedNotes = new SharedNotes();
         _fmpLevelFilter = new FmpLevelFilter();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
@@ -143,8 +132,6 @@ public class Plugin : IPlugin
             new ToolStripMenuItem("OzServer Sectors"));
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
-
-        AddDrawingMenu();
 
         // An incoming request is surfaced the same way vatSys's own "Messages" menu surfaces an
         // unread one: the Settings header flashes (a solid colour flip, on vatSys's own menu-bar
@@ -436,53 +423,6 @@ public class Plugin : IPlugin
             _settingsMenuHeader.Checked = pending;
     }
 
-    // Drawing goes on the menu bar itself rather than under Settings, because it is a tool that gets
-    // switched on and off mid-session rather than something configured once.
-    //
-    // Category.Custom with a CustomCategoryName is what puts it there: MainForm.LoadPluginMenuItem
-    // takes that name, finds or creates a top-level "<name>MenuItem" on the main MenuStrip, and adds
-    // the item beneath it - so this string is the header text. A bare clickable header is not on
-    // offer, since every plugin entry lands inside a dropdown.
-    //
-    // Named for the tool rather than for the plugin: on a menu bar sitting beside Maps, Tools and
-    // Windows, what a controller is looking for is the drawing, not who wrote it.
-    const string DrawingMenuName = "Drawing";
-
-    void AddDrawingMenu()
-    {
-        // CheckOnClick is deliberately off. If the item toggled its own check, pressing D would
-        // leave the menu showing the opposite of the truth - the check has to follow the tool, not
-        // the click, because the tool has two ways in.
-        var drawItem = new ToolStripMenuItem("Draw on Map")
-        {
-            CheckOnClick = false,
-            // Seeded from the tool rather than assumed false, so the item is right from the first
-            // time the menu is opened however the tool got into that state.
-            Checked = _mapDrawing.Enabled
-        };
-
-        // The one place the check is set. MenuRenderer.OnRenderItemText reads CheckState to pick the
-        // item's colour, so this is what actually highlights it - and it is driven by the tool's own
-        // state change, which both the D key and this item's Click go through.
-        _mapDrawing.EnabledChanged += (_, _) => drawItem.Checked = _mapDrawing.Enabled;
-        drawItem.Click += (_, _) => _mapDrawing.Toggle();
-
-        var undoItem = new ToolStripMenuItem("Undo Last Stroke");
-        undoItem.Click += (_, _) => _mapDrawing.UndoLast();
-
-        // No clear-everything entries for either drawing or notes: middle click removes one at a
-        // time, and that is the whole vocabulary. Yours goes for everyone, somebody else's is hidden
-        // for you - see MapDrawing.RemoveAt and SharedNotes.
-        foreach (var item in new[] { drawItem, undoItem })
-        {
-            _ozServerMenuItems.Add(item);
-            MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
-                CustomToolStripMenuItemWindowType.Main,
-                CustomToolStripMenuItemCategory.Custom,
-                item) { CustomCategoryName = DrawingMenuName });
-        }
-    }
-
     // Settings > Disable OzServer. One-way for the session (see OzServerMode), so it asks first.
     void ConfirmDisable()
     {
@@ -533,7 +473,6 @@ public class Plugin : IPlugin
         Isolate("Disable", () => _requestedSectorOverlay.Clear());
         Isolate("Disable", () => _pendingSectorGhosts.Reassert());   // releases painted ghosts
         Isolate("Disable", () => _fmpLevelFilter.Shutdown());
-        Isolate("Disable", () => _sharedNotes.Shutdown());
 
         // The menu: vatSys's own Sectors entry back, the OzServer ones gone, and this one saying so.
         foreach (var item in _ozServerMenuItems)
@@ -554,8 +493,7 @@ public class Plugin : IPlugin
     }
 
     // The last calls OzServer gets from this session: this controller's sectors released, so nobody
-    // else is left blocked by a controller who has stopped reporting, their drawings withdrawn, and
-    // the log sent. Inside AllowFinalCalls, which is what lets them through.
+    // else is left blocked by a controller who has stopped reporting, and the log sent. Inside AllowFinalCalls, which is what lets them through.
     async System.Threading.Tasks.Task FinishDisablingAsync()
     {
         var released = false;
@@ -563,7 +501,6 @@ public class Plugin : IPlugin
         {
             try
             {
-                _mapDrawing.Shutdown();
                 if (Network.IsConnected && NetworkServer.Current != null)
                 {
                     await new OzServerApiClient().ReleaseAllSectorsAsync();

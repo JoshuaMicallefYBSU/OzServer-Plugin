@@ -664,11 +664,12 @@ public class AfvSectorClaimer
                         || (_tracker.ControlledByOthers.TryGetValue(s.Name, out var o) && o.Cid == owner.Cid))
             .ToList();
 
-        var message = $"{owner.Callsign} currently owns:"
+        var message = $"{SectorDescription.Describe(sector)} is owned by another controller."
                       + Environment.NewLine + Environment.NewLine
+                      + $"Owned by {owner.Callsign}:" + Environment.NewLine
                       + string.Join(Environment.NewLine, group.Select(s => SectorDescription.Describe(s)))
                       + Environment.NewLine + Environment.NewLine
-                      + $"Request {(group.Count == 1 ? "this sector" : "these sectors")} from {owner.Callsign}?";
+                      + $"Send a request for {(group.Count == 1 ? "this sector" : "these sectors")} to {owner.Callsign}?";
         if (PrimaryPosition.IsFlowCallsign(myCallsign))
             message += Environment.NewLine + Environment.NewLine + FlowReliefNote;
 

@@ -96,8 +96,7 @@ public sealed class AsdMapLayer
         RunOnUiThread(ApplyNow);
     }
 
-    // The fast path, and it has to be fast: freehand drawing calls this on every captured point, so
-    // tens of times a second during a drag. Only the points are swapped and a repaint asked for.
+    // The fast path: only the points are swapped and a repaint asked for.
     //
     // Creating the map and asserting its visibility are deliberately left to the timer - the first
     // walks every loaded map, the second walks every open form and does reflection per scope, and

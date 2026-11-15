@@ -1863,19 +1863,37 @@ public class OzServerOwnershipTracker
         // each sector written out in full (SectorDescription). This used to name sectors by bare
         // code - "STR is already owned by BN-TRT_CTR" - and run several of them together inline,
         // which asked a controller to answer for airspace it never actually identified.
+        //
+        // The question explains the whole of the sector's status, not only the contested part: a
+        // VSCS transmit press on a primary whose group is partly held reads as "nothing happened"
+        // or "I got all of it" unless the controller is told which half is which. Shown only when
+        // something is actually owned by someone else - an unowned sector never reaches here (the
+        // claim succeeds without a 409), so a plain claim stays silent.
         var described = contestedByOthers
             .Select(conflict => SectorDescription.DescribeWithOwner(conflict.Sector, conflict.Owner?.Callsign))
             .ToList();
 
-        var question = (described.Count == 1
-                           ? "This sector is already owned by another controller:"
-                           : "These sectors are already owned by other controllers:")
-                       + Environment.NewLine + Environment.NewLine
-                       + string.Join(Environment.NewLine, described)
-                       + Environment.NewLine + Environment.NewLine
+        var contestedNames = new HashSet<string>(conflicts.Select(c => c.Sector), StringComparer.OrdinalIgnoreCase);
+        var staffed = new HashSet<string>(
+            PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign), StringComparer.OrdinalIgnoreCase);
+        var taking = PrimaryPosition.CoveredBy(sector)
+            .Where(s => !contestedNames.Contains(s.Name) && !staffed.Contains(s.Name) && !IsMine(s))
+            .Select(s => SectorDescription.Describe(s))
+            .ToList();
+
+        var nl = Environment.NewLine;
+        var question = (taking.Count > 0
+                           ? $"{SectorDescription.Describe(sector)} is partly owned by another controller."
+                           : $"{SectorDescription.Describe(sector)} is owned by another controller.")
+                       + nl + nl
+                       + "Owned:" + nl + string.Join(nl, described)
+                       + (taking.Count > 0
+                           ? nl + nl + "Available - taken by you now:" + nl + string.Join(nl, taking)
+                           : "")
+                       + nl + nl
                        + (described.Count == 1
-                           ? "Request it from them?"
-                           : "Request them from their current owners?");
+                           ? "Send a request for the owned sector?"
+                           : "Send a request for the owned sectors?");
 
         if (contestedByOthers.Count > 0 && await AskYesNoAsync(question, "Sector already owned"))
             asked.AddRange(contestedByOthers);
@@ -2090,7 +2108,7 @@ public class OzServerOwnershipTracker
         {
             try
             {
-                var prompt = new SectorConflictPromptWindow(message, caption);
+                var prompt = new SectorConflictPromptWindow(message, caption, "Accept", "Reject");
                 var timeout = new System.Windows.Forms.Timer { Interval = (int)ConflictPromptTimeout.TotalMilliseconds };
 
                 timeout.Tick += (_, _) =>
