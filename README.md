@@ -14,7 +14,7 @@ OzServer flows back into vatSys and onto your VSCS panel automatically.
 
 | | |
 | --- | --- |
-| **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer, and a VSCS line dropping out of Transmit releases it again. A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. The two records are also reconciled on every poll tick, in both directions: controlled here but owned nowhere is claimed, owned on OzServer but not controlled here is put back on the scope. |
+| **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer, and a VSCS line going to Idle releases it again (Receive keeps it). A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. The two records are also reconciled on every poll tick, in both directions: controlled here but owned nowhere is claimed, owned on OzServer but not controlled here is put back on the scope. |
 | **Sector requests** | Ask another controller for a sector they own. **Accept** / **Reject** act on the selected row, or on every incoming request at once when the `Requested From Me` heading is selected. A denial is reported back to whoever asked. |
 | **Conflict handling** | Transmitting on (or claiming) a sector another controller owns, wholly or in part, opens a popup showing what is owned and by whom, what you are taking now, and asking whether to send a request (**Accept** / **Reject**). The uncontested part is taken either way; nothing is ever requested without that answer. An unowned sector claims silently. |
 | **Primary positions** | A position's controller who is already online when you connect gets the overlap back. One who logs on *while you hold their position* is not handed it: their client sends you one request for the whole position, and nothing moves until you accept. |
@@ -158,10 +158,16 @@ Pressing Transmit on a VSCS line is the normal way to claim:
 - A **primary's** line (e.g. `WOL`) adds it *and its whole group*, matching what "extend" means on
   the scope. Whether each sub-sector is actually claimable is then resolved once, on OzServer.
 
-Dropping that line again — to **Idle**, or to **Recv**, both of which clear Transmit — gives the
-sector back: it comes off your scope *and* is released on OzServer, so it leaves the Sectors window
-and is immediately available to everyone else. Your own position is never given away this way, even
-when the group you dropped is responsible for it.
+Dropping that line to **Idle** gives the sector back: it comes off your scope *and* is released on
+OzServer, so it leaves the Sectors window and is immediately available to everyone else. Your own
+position is never given away this way, even when the group you dropped is responsible for it.
+
+**Receive** keeps the sector. You are still listening on the frequency, so the airspace and its tags
+stay yours, and going back to Transmit changes nothing. vatSys clears Transmit before it sets Receive
+for both buttons, so the two are told apart on `ReceiveChanged`, not `TransmitChanged`.
+
+Transmit → Idle → Transmit, however quickly, ends with the sector owned again: if the line is back on
+Transmit by the time the release (and its refresh) lands, the sector is claimed straight back.
 
 Dropping a line also gives the sector back when it has already fallen out of
 `MMI.SectorsControlled` by some other route but OzServer still records it as yours — otherwise the
@@ -169,7 +175,7 @@ one control that should hand it back does nothing, because the sector it would h
 already gone.
 
 Releasing is still never *inferred* from a sector merely disappearing from `MMI.SectorsControlled`.
-There are exactly five things that release: a VSCS line dropping out of Transmit, an applied `>>`, a
+There are exactly five things that release: a VSCS line going to Idle, an applied `>>`, a
 genuine conflict, a position's own controller found already online when you connect
 (`PrimaryPositionWatcher`), and a deliberate disconnect (`GracefulDisconnectReleaser`).
 

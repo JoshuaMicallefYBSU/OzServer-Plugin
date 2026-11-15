@@ -1840,12 +1840,20 @@ public class OzServerSectorsWindow : BaseForm
                 // pane simultaneously, and correctly, showed its new owner: vatSys had already
                 // taken the airspace away, so this window was the only thing still disagreeing.
                 //
-                // OwnerOf returns a synthetic "me" for anything in Owned, so the IsMine test is
-                // what stops our own sub-sectors being filtered out here. A child nobody owns
-                // returns null and is still drawn, which is correct - claiming the group covers it.
+                // Nor, under a group we actually own, a sub-sector nobody owns. OzServer keeps one
+                // ownership record per sub-sector, so once the group is ours the children that are
+                // ours are exactly the ones in Owned - a child missing from it was released (or
+                // never granted), and drawing it anyway put a sector the controller had just given
+                // back on their Owned list: SNO released SAS from under GUN, and SAS sat there under
+                // GUN until somebody else happened to claim it.
+                //
+                // Only a group that is staged rather than owned still shows its unowned children,
+                // because there they are the point: they are what Apply would claim along with it.
+                //
                 // The self-reference case (a grouping sector listing itself, see above) is exempt,
                 // since that node is the sector already being drawn.
-                if (!ReferenceEquals(child, sector) && !_tracker.IsMine(child) && _tracker.OwnerOf(child) != null)
+                if (!ReferenceEquals(child, sector) && !_tracker.IsMine(child)
+                    && (_tracker.IsMine(sector) || _tracker.OwnerOf(child) != null))
                     continue;
 
                 node.Nodes.Add(ReferenceEquals(child, sector)

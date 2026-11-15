@@ -207,18 +207,41 @@ public class AfvSectorClaimer
 
         foreach (var freq in _subscribed.Except(current).ToList())
         {
-            freq.TransmitChanged -= OnTransmitChanged;
+            freq.TransmitChanged -= OnLineStateChanged;
+            freq.ReceiveChanged -= OnReceiveChanged;
             _subscribed.Remove(freq);
         }
 
         foreach (var freq in current.Except(_subscribed))
         {
-            freq.TransmitChanged += OnTransmitChanged;
+            freq.TransmitChanged += OnLineStateChanged;
+            freq.ReceiveChanged += OnReceiveChanged;
             _subscribed.Add(freq);
         }
     }
 
-    void OnTransmitChanged(object? sender, EventArgs e)
+    // ReceiveChanged matters only for the line going idle - see OnLineStateChanged. A Transmit press
+    // raises it too, straight after TransmitChanged has already handled the press, and running the
+    // claim a second time for the same press would repeat anything it shows (a transmit prompt is
+    // de-duplicated, the FMP "cannot assume" notice is not).
+    void OnReceiveChanged(object? sender, EventArgs e)
+    {
+        if (sender is VSCSFrequency { Transmit: false, Receive: false })
+            OnLineStateChanged(sender, e);
+    }
+
+    // Both events, because Idle and Receive cannot be told apart from TransmitChanged alone. vatSys's
+    // VSCS buttons (VSCSControlDX, VSCS_Button_Freq_*) set the two flags in a fixed order:
+    //
+    //   Transmit  Transmit = true,  then Receive = true
+    //   Receive   Transmit = false, then Receive = true
+    //   Idle      Transmit = false, then Receive = false
+    //
+    // so when TransmitChanged fires for Receive *or* Idle, Receive still reads true from the
+    // transmitting state it is leaving. Only ReceiveChanged, which comes second, shows which button it
+    // was. Both setters raise their event on every write, changed or not, so pressing Idle on a line
+    // already on Receive still arrives here as a ReceiveChanged with both flags off.
+    void OnLineStateChanged(object? sender, EventArgs e)
     {
         if (OzServerMode.Disabled)
             return;
@@ -412,10 +435,12 @@ public class AfvSectorClaimer
     //     not locally re-add MAE/MAV to vatSys's Sector Management Window before the backend gets a
     //     chance to reject them.
     //
-    // A line going the other way - to Recv or Idle, both of which clear Transmit (see
-    // VSCSControlDX's Freq_Recv/Freq_Idle clickspots) - removes that sector and its sub-sectors
-    // from MMI *and* releases it on OzServer. Dropping a line is the controller saying they are no
-    // longer working that airspace, and the two records have to say the same thing: before the
+    // A line going Idle (Transmit and Receive both off) removes that sector and its sub-sectors from
+    // MMI *and* releases it on OzServer. Receive does not: it is the controller listening on the
+    // frequency, still holding the airspace and its tags, and dropping both on a Receive press took
+    // the sector off the scope and every tag in it with it. Only Idle is the controller saying they
+    // are no longer working that airspace (see OnLineStateChanged for how the two are told apart),
+    // and then the two records have to say the same thing: before the
     // release call at the end of this method the infill came off the map while OzServer went on
     // listing the sector as owned, so nobody else could take it and it sat in the OzServer Sectors
     // window as if it were still being worked. The one exception is this session's own primary
@@ -475,6 +500,14 @@ public class AfvSectorClaimer
             return;
         }
 
+        // Neither transmitting nor idle: the line is on Receive, or is part-way into a Receive/Idle
+        // press (see OnLineStateChanged - Transmit clears before Receive is set). Receive keeps the
+        // sector, so there is nothing to do; an Idle press finishes with a ReceiveChanged that
+        // arrives back here with both flags off.
+        var idle = !frequency.Transmit && !frequency.Receive;
+        if (!frequency.Transmit && !idle)
+            return;
+
         var currentSectors = MMI.SectorsControlled.ToList();
         var currentlyControlled = currentSectors.FirstOrDefault(s => s.Callsign == frequency.Name);
 
@@ -484,9 +517,9 @@ public class AfvSectorClaimer
 
         if (currentlyControlled == null)
         {
-            if (!frequency.Transmit)
+            if (idle)
             {
-                ReleaseQuietLineMissingFromMmi(frequencySector, primarySector);
+                ReleaseQuietLineMissingFromMmi(frequency, frequencySector, primarySector);
                 return;
             }
 
@@ -601,7 +634,33 @@ public class AfvSectorClaimer
         // Nothing is lost by not awaiting - ReleaseIdleVscsLineAsync reports its own failures and
         // re-derives Owned itself when it succeeds.
         if (dropped != null)
-            _ = _tracker.ReleaseIdleVscsLineAsync(dropped);
+            _ = ReleaseThenRetakeIfTransmittingAsync(frequency, dropped);
+    }
+
+    // Releases an idled line's sector, then takes it straight back if the line went back to Transmit
+    // while the release was still in flight.
+    //
+    // Transmit > Idle > Transmit inside one round trip used to end with the controller on the
+    // frequency and owning nothing. The second Transmit put the sector back into MMI, but the claim
+    // pass skipped it - Owned still listed it, the release not having landed yet - and when the
+    // release's refresh did land, ReconcileMmiWithOwned saw the sector lost and took it back out of
+    // MMI. Nothing claimed it after that: the line was transmitting, so no further press was coming.
+    //
+    // Re-run once the release and its refresh are done, so it starts from what OzServer now says -
+    // not owned, not in MMI - which is exactly the state an ordinary Transmit press claims from.
+    async System.Threading.Tasks.Task ReleaseThenRetakeIfTransmittingAsync(VSCSFrequency frequency, SectorsVolumes.Sector sector)
+    {
+        await _tracker.ReleaseIdleVscsLineAsync(sector);
+
+        RunOnUiThread(() =>
+        {
+            if (OzServerMode.Disabled || !frequency.Transmit)
+                return;
+
+            ActionLog.Log("Primary", $"VSCS line for {sector.Name} is transmitting again after its release - taking it back",
+                new { action = "vscs_retake_after_release", sector = sector.Name, own_callsign = Network.Me?.Callsign });
+            CheckActive(frequency);
+        });
     }
 
     // Raised (on the UI thread) once a request has been sent from a transmit press, with the
@@ -778,7 +837,7 @@ public class AfvSectorClaimer
     // that trails by a round trip): without that gate every press of Idle or Recv on any line that
     // isn't controlled - monitoring a neighbour's frequency, most of all - would fire a release the
     // backend can only refuse.
-    void ReleaseQuietLineMissingFromMmi(SectorsVolumes.Sector frequencySector, SectorsVolumes.Sector primarySector)
+    void ReleaseQuietLineMissingFromMmi(VSCSFrequency frequency, SectorsVolumes.Sector frequencySector, SectorsVolumes.Sector primarySector)
     {
         if (OzServerMode.Disabled)
             return;
@@ -792,7 +851,7 @@ public class AfvSectorClaimer
             return;
 
         ActionLog.Log("Primary",
-            $"VSCS line for {frequencySector.Name} stopped transmitting - not in controlled sectors, but still ours on OzServer",
+            $"VSCS line for {frequencySector.Name} went idle - not in controlled sectors, but still ours on OzServer",
             new
             {
                 action = "vscs_quiet_line_owned_not_controlled",
@@ -800,7 +859,7 @@ public class AfvSectorClaimer
                 own_callsign = Network.Me?.Callsign
             });
 
-        _ = _tracker.ReleaseIdleVscsLineAsync(frequencySector);
+        _ = ReleaseThenRetakeIfTransmittingAsync(frequency, frequencySector);
     }
 
     static void LogWithheldTopDownCover(
