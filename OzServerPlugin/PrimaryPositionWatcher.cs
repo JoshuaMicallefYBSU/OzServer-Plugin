@@ -88,6 +88,9 @@ public class PrimaryPositionWatcher
 
     void OnOnlineAtcChanged()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected)
         {
             ResetBaseline();
@@ -204,6 +207,9 @@ public class PrimaryPositionWatcher
     // groups, which the tracker works out.
     void TakeBackCoverFrom(List<string> departed)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var freed = _tracker.Owned
             .SelectMany(PrimaryPosition.CoveredBy)
             .Where(covered => departed.Any(callsign =>
@@ -229,6 +235,9 @@ public class PrimaryPositionWatcher
 
     async Task RunHandoverLoopAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             while (true)
@@ -263,6 +272,9 @@ public class PrimaryPositionWatcher
 
     async Task HandleArrivalAsync(NetworkATC atc, bool notify = true)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected)
             return;
 
@@ -375,6 +387,9 @@ public class PrimaryPositionWatcher
 
     void EnforceAlreadyOnline(List<NetworkATC> atcs)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (atcs.Count == 0)
             return;
 

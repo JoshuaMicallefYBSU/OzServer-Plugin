@@ -39,6 +39,9 @@ public class CoupleAssist
 
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected || track.CoupledFDR != null || track.GroundSpeed < MinGroundSpeed)
             return;
 
@@ -71,6 +74,9 @@ public class CoupleAssist
 
     static void TryCouple(RDP.RadarTrack track, string callsign)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (track.CoupledFDR != null)
             return;
 
@@ -78,16 +84,96 @@ public class CoupleAssist
         if (fdr == null
             || fdr.CoupledTrack != null
             || !fdr.ESTed                                   // not activated: not traffic yet
-            || fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED
-            || fdr.InhibitAutoCouple)                       // a controller or vatSys turned it off deliberately
+            || fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
             return;
 
+        // A controller or vatSys turned auto-couple off for this flight on purpose - never overridden,
+        // but said once, so a flight that stays uncoupled for this reason is not a mystery in the log.
+        if (fdr.InhibitAutoCouple)
+        {
+            if (_inhibitLogged.Add(callsign))
+                ActionLog.Log("Couple", $"Not coupling {callsign} - auto-couple is turned off for it", new { action = "couple_assist_inhibited", fdr_callsign = callsign });
+            return;
+        }
+
+        Couple(fdr, track, "vatSys's auto-couple had not");
+    }
+
+    static readonly HashSet<string> _inhibitLogged = new(StringComparer.OrdinalIgnoreCase);
+
+    // The activation path. A flight plan activated by hand for an aircraft already in the air gets an
+    // ETD of "now + 10 minutes", which puts vatSys's flight plan track back at the departure end of
+    // the route - so vatSys's own auto-couple, which only takes a return close to where the plan
+    // expects it, never couples it. Activating it is the controller saying "this is that aircraft":
+    // one radar cycle after activation (vatSys's own chance first), an FDR still uncoupled is coupled
+    // to the moving return carrying its callsign, and vatSys's position report moves the plan there.
+    static readonly TimeSpan AfterActivation = TimeSpan.FromSeconds(6);
+    readonly HashSet<FDP2.FDR> _activationHandled = new();
+
+    public void OnFdrUpdate(FDP2.FDR fdr)
+    {
+        if (OzServerMode.Disabled || !Network.IsConnected || string.IsNullOrEmpty(fdr.Callsign))
+            return;
+
+        lock (_activationHandled)
+        {
+            // Back to pre-active (or finished): a later activation is a new one.
+            if (!fdr.ESTed)
+            {
+                _activationHandled.Remove(fdr);
+                return;
+            }
+            if (fdr.CoupledTrack != null || fdr.InhibitAutoCouple || !_activationHandled.Add(fdr))
+                return;
+        }
+
+        System.Threading.Timer? once = null;
+        once = new System.Threading.Timer(_ =>
+        {
+            once?.Dispose();
+            RunOnUiThread(() => CoupleAfterActivation(fdr));
+        }, null, AfterActivation, System.Threading.Timeout.InfiniteTimeSpan);
+    }
+
+    static void CoupleAfterActivation(FDP2.FDR fdr)
+    {
+        if (OzServerMode.Disabled || !fdr.ESTed || fdr.CoupledTrack != null || fdr.InhibitAutoCouple
+            || fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
+            return;
+
+        RDP.RadarTrack? match = null;
+        try
+        {
+            foreach (var track in RDP.RadarTracks)
+            {
+                if (track?.CoupledFDR == null
+                    && string.Equals(track?.ActualAircraft?.Callsign, fdr.Callsign, StringComparison.OrdinalIgnoreCase)
+                    && track!.GroundSpeed >= MinGroundSpeed)
+                {
+                    match = track;
+                    break;
+                }
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            return; // radar list changed mid-scan; the radar-update path still has it
+        }
+
+        if (match != null)
+            Couple(fdr, match, "on activation");
+    }
+
+    static void Couple(FDP2.FDR fdr, RDP.RadarTrack track, string why)
+    {
+        var callsign = fdr.Callsign;
         try
         {
             RDP.Couple(fdr, track);
-            ActionLog.Log("Couple", $"Coupled {callsign} to its radar track - vatSys's auto-couple had not", new
+            ActionLog.Log("Couple", $"Coupled {callsign} to its radar track - {why}", new
             {
                 action = "couple_assist",
+                reason = why,
                 fdr_callsign = callsign,
                 state = fdr.State.ToString(),
                 atd = fdr.ATD == DateTime.MaxValue ? null : (DateTime?)fdr.ATD,

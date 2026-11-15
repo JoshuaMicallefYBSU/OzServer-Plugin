@@ -85,11 +85,15 @@ public class FdrSync
                 // A new session starts with nothing sent: every route goes out again.
                 _sentRouteKeys.Clear();
             }
+            Landed.Clear();
         };
     }
 
     public void OnFdrUpdate(FDP2.FDR fdr)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (string.IsNullOrEmpty(fdr.Callsign))
             return;
 
@@ -114,6 +118,9 @@ public class FdrSync
     // than the old behaviour, and the common case sends at once.
     public void PushNow(FDP2.FDR fdr)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (string.IsNullOrEmpty(fdr.Callsign))
             return;
 
@@ -136,6 +143,11 @@ public class FdrSync
 
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
+        if (OzServerMode.Disabled)
+            return;
+
+        CheckLanded(track);
+
         // Coupled flight plans only. A floating FDR (no coupled track) is reported where its flight
         // plan track is - see FloatingSweep - not where some uncoupled return with the same callsign
         // happens to be; CoupleAssist couples the two when they really are the same aircraft.
@@ -191,6 +203,11 @@ public class FdrSync
         if (fdr.IsTrackedByMe)
             return fdr.ESTed;
 
+        // Tracked by another OzServer controller: theirs to report. Tracked by someone who is not on
+        // OzServer at all (WAAF_CTR, say) is nobody's - so it is treated exactly like untracked below.
+        if (fdr.IsTracked && !TrackedOutsideOzServer(fdr))
+            return false;
+
         // vatSys finishes an untracked FDR the moment its pilot drops off this client's picture - it
         // cannot tell "left my visibility range" from "disconnected" (Network.ProcessRemovedPilot ->
         // FDP2.CancelFDR). JST946 was finished at FL360 when CS1 cut its range to 10 nm, and CS_APP
@@ -210,7 +227,124 @@ public class FdrSync
             return false;
         }
 
+        // An untracked FDR is only ever reported from a radar return: coupled to its track. A floating
+        // one - no coupled track - is the tracking controller's to report or nobody's; its flight plan
+        // position is a prediction, and the server's record of an untracked aircraft has to be where
+        // it really is. (A finish passed above came from the radar return too: seen landing.)
+        if (fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED && fdr.CoupledTrack == null)
+            return false;
+
         return ResponsibleSectorForUntracked(fdr, out _);
+    }
+
+    // Landing seen on radar, reported to OzServer as completed.
+    //
+    // vatSys finishes an FDR on landing only at the instant it uncouples the track, and only if the
+    // aircraft is below 50 kt, within 2 nm of an assigned arrival runway's threshold and on the ground
+    // (RDP.TryAutoDeCouple -> TryAutoFinishFDR). Miss any of that - uncoupled still rolling out at
+    // 55 kt, no arrival runway set, a long runway - and it never looks again: QFA597 landed at YSSY
+    // and sat UNCONTROLLED at the aerodrome, on the map as if still flying, until it aged out.
+    //
+    // So the plugin watches the radar return itself: an activated, departed FDR whose aircraft is on
+    // the ground (within 200 ft of aerodrome elevation, or flagged on ground with no Mode C) below
+    // 50 kt within 4 nm of its destination is reported FINISHED, and from then on always reported
+    // that way (see Merge). vatSys's own FDR is left alone - the tower may still be working the taxi,
+    // and finishing it here would take the tag off their scope. Reported by whoever sees it and holds
+    // a sector (or tracks it); a finish is the same from anyone, so two reporting is harmless.
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> Landed =
+        new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, DateTime> _landingChecked = new(StringComparer.OrdinalIgnoreCase);
+
+    void CheckLanded(RDP.RadarTrack track)
+    {
+        var callsign = track.ActualAircraft?.Callsign;
+        if (string.IsNullOrEmpty(callsign) || track.LatLong == null || track.GroundSpeed >= 50 || Landed.ContainsKey(callsign!))
+            return;
+
+        // Slow tracks are mostly aircraft sitting at gates; one look per callsign every 15 s.
+        lock (_landingChecked)
+        {
+            if (_landingChecked.TryGetValue(callsign!, out var last) && DateTime.UtcNow - last < TimeSpan.FromSeconds(15))
+                return;
+            _landingChecked[callsign!] = DateTime.UtcNow;
+        }
+
+        FDP2.FDR? fdr = track.CoupledFDR;
+        if (fdr == null)
+        {
+            try
+            {
+                fdr = FDP2.GetFDRs.FirstOrDefault(f => string.Equals(f.Callsign, callsign, StringComparison.OrdinalIgnoreCase));
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+        }
+
+        if (fdr == null || !fdr.ESTed || fdr.ATD == DateTime.MaxValue || string.IsNullOrEmpty(fdr.DesAirport))
+            return;
+        // Someone else is tracking it: their client reports it.
+        if (fdr.IsTracked && !fdr.IsTrackedByMe && !TrackedOutsideOzServer(fdr))
+            return;
+        if (!fdr.IsTrackedByMe && _tracker.Owned.Count == 0)
+            return;
+        if (Airspace2.GetAirport(fdr.DesAirport) is not { LatLong: { } destination } airport)
+            return;
+        if (Conversions.CalculateDistance(track.LatLong, destination) > 4)
+            return;
+
+        var elevation = airport.Elevation > 0 ? airport.Elevation : 0;
+        var onGround = track.CorrectedAltitude != -1 ? track.CorrectedAltitude < elevation + 200 : track.OnGround;
+        if (!onGround)
+            return;
+
+        Landed[callsign!] = DateTime.UtcNow;
+
+        var dto = new OzServerFdrUpdateDto
+        {
+            Callsign = fdr.Callsign,
+            State = nameof(FDP2.FDR.FDRStates.STATE_FINISHED),
+            Coupled = fdr.CoupledTrack == track
+        };
+        FillPosition(dto, track);
+        FillAuthority(dto, fdr);
+        // An untracked report has to name a sector this session holds - the nearest of them.
+        if (!fdr.IsTrackedByMe)
+        {
+            var mine = _tracker.Owned.Where(s => !s.IsDummy).ToList();
+            if (mine.Count > 0)
+                dto.AuthoritySector = Choose(fdr, mine.Select(s => (Sector: s, Mine: true)).ToList(), track.LatLong).Sector.Name;
+        }
+        Merge(dto);
+
+        ActionLog.Log("FDR", $"{fdr.Callsign} landed at {fdr.DesAirport} - reported completed", new
+        {
+            action = "fdr_landed",
+            fdr_callsign = fdr.Callsign,
+            destination = fdr.DesAirport,
+            altitude = track.CorrectedAltitude,
+            ground_speed = track.GroundSpeed,
+            vatsys_state = fdr.State.ToString()
+        });
+    }
+
+    // Tracked by a controller who is not on OzServer - a neighbouring FIR's (WAAF_CTR), or anyone
+    // without the plugin. They will never report it, so for reporting it is as good as untracked: the
+    // OzServer controller responsible for it by the untracked rules keeps the record current. "Not on
+    // OzServer" is: they hold no OzServer sector, and no OzServer client is reporting itself as the
+    // flight's controller - the second so that an OzServer user holding nothing yet is not mistaken
+    // for an outsider.
+    bool TrackedOutsideOzServer(FDP2.FDR fdr)
+    {
+        var tracker = fdr.ControllerTracking?.Callsign;
+        if (!fdr.IsTracked || fdr.IsTrackedByMe || string.IsNullOrEmpty(tracker))
+            return false;
+        if (_tracker.ControlledByOthers.Values.Any(o => string.Equals(o.Callsign, tracker, StringComparison.OrdinalIgnoreCase)))
+            return false;
+        if (!string.IsNullOrEmpty(fdr.Callsign) && ServerFdrSnapshot.TryGet(fdr.Callsign, out var entry) && entry.ControllingCid != null)
+            return false;
+        return true;
     }
 
     // FDRs vatSys finished because they went out of view here (see ShouldPush). FdrResumeActivation
@@ -259,18 +393,17 @@ public class FdrSync
     bool ResponsibleSectorForUntracked(FDP2.FDR fdr, out string? sectorName)
     {
         sectorName = null;
-        if (fdr.IsTracked)
+        if (fdr.IsTracked && !TrackedOutsideOzServer(fdr))
             return false;
         if (!fdr.ESTed && fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED)
             return false;
 
         // Not visible here: never ours, whatever anyone else can see.
-        // Where the aircraft is: this client's radar return if it has one, otherwise where the flight
-        // plan track is (what vatSys draws as the box).
+        // Where the aircraft is, by this client's own radar. No return here, never ours.
         var seen = SectorLocator.LivePosition(fdr);
-        var position = seen ?? SectorLocator.ApproximatePosition(fdr);
-        if (position == null)
+        if (seen == null)
             return false;
+        var position = seen;
 
         var myCid = NetworkIdentity.Current?.Cid;
         var onlineAtc = (Network.GetOnlineATCs ?? new List<NetworkATC>())
@@ -290,48 +423,125 @@ public class FdrSync
             .ToList();
         bool online(string callsign) => onlineAtc.ContainsKey(callsign);
 
-        // Controllers who can see the aircraft come first: their report is the real position.
-        var seeing = (seen != null ? mine.Select(s => (Sector: s, Mine: true)) : Enumerable.Empty<(SectorsVolumes.Sector Sector, bool Mine)>())
+        // Only controllers who can see the aircraft count - this session (it has the return) and any
+        // other online holder whose visibility range reaches it.
+        var candidates = mine.Select(s => (Sector: s, Mine: true))
             .Concat(othersHeld.Where(s => CanSee(others[s.Name].Callsign)).Select(s => (Sector: s, Mine: false)))
             .ToList();
-
-        // Nobody holding a sector can see it - a floating FDR, out of everyone's radar. Every client
-        // has the flight plan, so its track's position is the same everywhere: the controller whose
-        // airspace that is (or the nearest held) reports it from there, until someone can see it.
-        var candidates = seeing.Count > 0
-            ? seeing
-            : mine.Select(s => (Sector: s, Mine: true)).Concat(othersHeld.Select(s => (Sector: s, Mine: false))).ToList();
         if (candidates.Count == 0)
             return false;
 
-        // 1. In one of those sectors, level and all (a live return is needed to know the level).
-        var here = seen != null
-            ? SectorLocator.Resolve(fdr, candidates.Select(h => h.Sector))
-            : candidates.Select(h => h.Sector).FirstOrDefault(s => s.IsInSector(position, fdr.PRL > 0 ? fdr.PRL : -1));
-        if (here != null)
+        var chosen = Choose(fdr, candidates, position);
+        if (chosen.Mine)
         {
-            sectorName = here.Name;
-            return candidates.First(h => h.Sector.Equals(here)).Mine;
+            sectorName = chosen.Sector.Name;
+            StoppedStandingIn(fdr.Callsign);
+            return true;
         }
 
-        // 2. The nearest of them.
+        // Somebody else's - as far as this client can tell. See TakeOverIfStale for when that is not
+        // the end of it.
+        return TakeOverIfStale(fdr, mine, position, chosen.Sector.Name, out sectorName);
+    }
+
+    // 1. the candidate sector the aircraft is in, level and all; 2. otherwise the nearest one.
+    static (SectorsVolumes.Sector Sector, bool Mine) Choose(FDP2.FDR fdr, List<(SectorsVolumes.Sector Sector, bool Mine)> candidates, Coordinate position)
+    {
+        var here = SectorLocator.Resolve(fdr, candidates.Select(h => h.Sector));
+        if (here != null)
+            return candidates.First(h => h.Sector.Equals(here));
+
         var nearest = candidates
             .Select(h => (h.Sector, h.Mine, Distance: SectorLocator.DistanceNm(h.Sector, position)))
             .OrderBy(h => h.Distance)
             .ThenBy(h => h.Sector.Name, StringComparer.Ordinal)
             .First();
-        sectorName = nearest.Sector.Name;
-        return nearest.Mine;
+        return (nearest.Sector, nearest.Mine);
     }
 
-    // Floating FDRs - activated, no coupled radar track - are reported where vatSys draws their
-    // flight plan track, which moves along the route by itself and raises no FDR event as it does.
-    // Every FloatingEvery-th flush they are queued again with that position, so the map's box
-    // moves with vatSys's.
+    // The watchdog. Choosing who reports an untracked aircraft is done from what this client can
+    // estimate about everyone else, and some of it can only be known on the other client: whether
+    // their vatSys has the aircraft coupled (they will not report an uncoupled one), whether their
+    // real coverage reaches it, whether their plugin can reach OzServer at all, and their own view of
+    // who holds what in the seconds after a change. Any of those can leave every client that sees the
+    // aircraft deferring to one that is not reporting it.
+    //
+    // So what the server actually received decides it. A client that can report the aircraft itself
+    // (it sees it, has it coupled, holds a sector) but was not chosen takes over when OzServer's
+    // record has not been updated for StaleAfter - or has no record at all - and keeps going while
+    // the record's last update came from one of its own sectors (authority_sector). The moment the
+    // chosen controller does report, its sector is on the record and this one stops. At worst that is
+    // two clients reporting for one scan interval, which the server merges.
+    static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(30);
+    // Older than this and the snapshot says nothing about now - no takeover on its strength.
+    static readonly TimeSpan SnapshotUsableFor = TimeSpan.FromSeconds(60);
+    readonly HashSet<string> _standingIn = new(StringComparer.OrdinalIgnoreCase);
+
+    bool TakeOverIfStale(FDP2.FDR fdr, List<SectorsVolumes.Sector> mine, Coordinate position, string chosenSector, out string? sectorName)
+    {
+        sectorName = null;
+        if (mine.Count == 0 || string.IsNullOrEmpty(fdr.Callsign) || ServerFdrSnapshot.Age > SnapshotUsableFor)
+        {
+            StoppedStandingIn(fdr.Callsign);
+            return false;
+        }
+
+        string reason;
+        if (!ServerFdrSnapshot.TryGet(fdr.Callsign, out var entry))
+            reason = "no record on OzServer";
+        else if (!string.IsNullOrEmpty(entry.AuthoritySector) && mine.Any(s => string.Equals(s.Name, entry.AuthoritySector, StringComparison.OrdinalIgnoreCase)))
+            reason = "still reporting it";
+        else if (entry.LastSeenAt == null || DateTimeOffset.UtcNow - entry.LastSeenAt.Value > StaleAfter)
+            reason = $"not updated for {(entry.LastSeenAt == null ? "ever" : $"{(DateTimeOffset.UtcNow - entry.LastSeenAt.Value).TotalSeconds:0}s")}";
+        else
+        {
+            StoppedStandingIn(fdr.Callsign);
+            return false;
+        }
+
+        // Reported as from the nearest of this session's own sectors, which is what the backend checks.
+        sectorName = Choose(fdr, mine.Select(s => (Sector: s, Mine: true)).ToList(), position).Sector.Name;
+
+        bool started;
+        lock (_standingIn)
+            started = _standingIn.Add(fdr.Callsign);
+        if (started)
+        {
+            ActionLog.Log("FDR", $"Reporting {fdr.Callsign} in place of {chosenSector}'s controller - {reason}", new
+            {
+                action = "fdr_standing_in",
+                fdr_callsign = fdr.Callsign,
+                chosen_sector = chosenSector,
+                own_sector = sectorName,
+                reason
+            });
+        }
+        return true;
+    }
+
+    void StoppedStandingIn(string? callsign)
+    {
+        if (string.IsNullOrEmpty(callsign))
+            return;
+        bool stopped;
+        lock (_standingIn)
+            stopped = _standingIn.Remove(callsign!);
+        if (stopped)
+            ActionLog.Log("FDR", $"Stopped reporting {callsign} - the chosen controller has it", new { action = "fdr_standing_in_stopped", fdr_callsign = callsign });
+    }
+
+    // Floating FDRs this controller tracks - activated, no coupled radar track - are reported where
+    // vatSys draws their flight plan track, which moves along the route by itself and raises no FDR
+    // event as it does. Every FloatingEvery-th flush they are queued again with that position, so
+    // the map's box moves with vatSys's. Only tracked ones: ShouldPush never reports a floating FDR
+    // nobody tracks.
     const int FloatingEvery = 3; // x FlushInterval = every 15 s
 
     void FloatingSweep()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         List<FDP2.FDR> fdrs;
         try
         {
@@ -373,6 +583,9 @@ public class FdrSync
 
     void SweepAuthorityFdrs()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         List<FDP2.FDR> fdrs;
         try
         {
@@ -400,6 +613,13 @@ public class FdrSync
 
     void Merge(OzServerFdrUpdateDto dto)
     {
+        if (OzServerMode.Disabled)
+            return;
+
+        // Landed is final for the server's record, whatever this client's vatSys still has the FDR as.
+        if (Landed.ContainsKey(dto.Callsign))
+            dto.State = nameof(FDP2.FDR.FDRStates.STATE_FINISHED);
+
         lock (_lock)
         {
             if (_pending.TryGetValue(dto.Callsign, out var existing))
@@ -411,6 +631,9 @@ public class FdrSync
 
     async Task FlushAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Leaves whatever's pending queued rather than dropping it - not connected right now just
         // means nothing gets pushed yet, not that this update never happened. An unsupported server
         // (see NetworkServer.Current) is the same: every push would fail before it was sent, and
@@ -620,6 +843,9 @@ public class FdrSync
     static void FillAuthority(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
     {
         dto.AuthoritySector = fdr.ControllingSector?.Name;
+        // Who really tracks it, whoever that is - for a controller not on OzServer this is the only
+        // place their name reaches the record (controlling_* is OzServer's own authority, null here).
+        dto.TrackedBy = fdr.ControllerTracking?.Callsign ?? "";
 
         if (!fdr.IsTrackedByMe)
         {

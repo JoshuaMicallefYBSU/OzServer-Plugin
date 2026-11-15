@@ -62,6 +62,9 @@ public class ObserverPositionMirror
 
     void Apply()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // A real controller manages their own sectors through every other path in this plugin, so
         // this must never run for one. Read from the connection's own Position/Rating
         // (NetworkIdentity.IsObserver), never Network.Me.IsRealATC: that flag reads false for a

@@ -93,6 +93,9 @@ public class RequestedSectorOverlay
 
     public void SetIncoming(IReadOnlyList<SectorsVolumes.Sector> sectors)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Shaded to what would actually move, not the whole responsible-sectors group the named
         // sector expands through. That WAS the whole group once - accepting a request for BLA handed
         // over ELW and the Melbourne Approach sectors right along with it, because the backend's own
@@ -119,6 +122,9 @@ public class RequestedSectorOverlay
 
     public void SetOutgoing(IReadOnlyList<OzServerSectorOwnershipRequestDto> requests)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Mirrors SetIncoming's own "what would actually move" narrowing, from the other side: a
         // request only ever moves what its own target currently holds among the covered set (see
         // the same transferRequest/covered fix referenced above), so each request is narrowed
@@ -161,6 +167,9 @@ public class RequestedSectorOverlay
     // change already funnels through for PendingSectorGhosts' own staged-request preview.
     public void SetStaged(IReadOnlyList<SectorsVolumes.Sector> stagedClaims, IReadOnlyList<SectorsVolumes.Sector> stagedRequests)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var claimed = stagedClaims.SelectMany(PrimaryPosition.CoveredBy);
 
         var requested = stagedRequests.SelectMany(named =>
@@ -181,6 +190,9 @@ public class RequestedSectorOverlay
     // window takes the shading off the scope, so it never outlives the reason it was drawn.
     public void SetRevealed(bool revealed)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (_revealed == revealed)
             return;
 

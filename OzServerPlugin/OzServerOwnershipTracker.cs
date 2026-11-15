@@ -346,6 +346,9 @@ public class OzServerOwnershipTracker
     // resolves rather than retrying forever.
     void RetryUnclaimedMmiSectors()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected || !IsRealAtc || !_hasBaseline)
             return;
 
@@ -411,6 +414,9 @@ public class OzServerOwnershipTracker
     // VSCS untouched, so the giving controller's scope does not show airspace that is not theirs.
     void DropGivenAwayFromMmi()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var current = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
         var keep = current.Where(s => !IsGivenAway(s.Name)).ToList();
         if (keep.Count != current.Count)
@@ -465,6 +471,9 @@ public class OzServerOwnershipTracker
     // own record of what this controller holds.
     void RestoreOwnedToMmi()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected || !IsRealAtc || !_hasBaseline)
             return;
 
@@ -564,6 +573,9 @@ public class OzServerOwnershipTracker
     // first finishes instead of starting immediately alongside it.
     void OnMmiSectorsControlledChanged()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // A stray MMI.SectorsControlled change before/after the network session is up (e.g. vatSys
         // clearing it out on disconnect) shouldn't touch OzServer or push anything back into MMI -
         // see the class-wide "don't do anything while offline" rule. An unsupported server counts as
@@ -654,6 +666,9 @@ public class OzServerOwnershipTracker
     // this returns) rely on their continuation resuming on the UI thread.
     public async Task RefreshFromServerAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Also called directly by OzServerSectorsWindow (on open, and on its own poll tick), not
         // just from within this class - guarded here too so neither path can slip an API call or an
         // MMI write past the "do nothing while offline" rule.
@@ -682,6 +697,9 @@ public class OzServerOwnershipTracker
     // the time they return (claim, release, accept) use RefreshFromServerAsync above and do queue.
     public async Task RefreshFromServerIfIdleAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!CanSync)
             return;
 
@@ -849,6 +867,9 @@ public class OzServerOwnershipTracker
     // difference between this and RefreshFromServerIfIdleAsync.
     async Task ApplySyncGatedAsync(OzServerSyncDto sync)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         await _refreshGate.WaitAsync();
         try
         {
@@ -884,6 +905,9 @@ public class OzServerOwnershipTracker
     // something out from under someone actively working it.
     async Task ResumePreviousSessionAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Waits for IsConnected and Me to settle. Network.Connected fires before either has -
         // AfvSectorClaimer retries for exactly that reason - and this used to read IsConnected once
         // at entry, find it false, and return silently, with nothing logged and nothing to retry it.
@@ -1036,6 +1060,9 @@ public class OzServerOwnershipTracker
     // with the action, so the same code applies it either way and the UI moves on the first reply.
     void ApplySync(OzServerSyncDto sync)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Captured before the replacement: a sector this session just gained needs the owner it had
         // a moment ago, which the incoming payload no longer mentions.
         var previousControlled = _controlled;
@@ -1094,6 +1121,9 @@ public class OzServerOwnershipTracker
     void ReconcileMmiWithOwned(List<SectorsVolumes.Sector> previous, List<SectorsVolumes.Sector> current,
         IReadOnlyDictionary<string, OzServerControlledSectorOwnerDto> previousControlled)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var gained = current.Where(s => !previous.Any(p => p.Equals(s))).ToList();
         var lost = previous.Where(p => !current.Any(s => s.Equals(p))).ToList();
 
@@ -1784,6 +1814,9 @@ public class OzServerOwnershipTracker
     // than sit in MMI as if this controller owns it when OzServer disagrees.
     async Task HandleConflictAsync(SectorsVolumes.Sector sector, IReadOnlyList<OzServerSectorConflictDto> conflicts)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // This session's own position is requested without asking. A controller logging on to BLA
         // while Huon holds it wants BLA; "request it from them?" is not a real question, and "no"
         // would leave them sitting on a position they cannot work.

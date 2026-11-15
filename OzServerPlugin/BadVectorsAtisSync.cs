@@ -54,6 +54,9 @@ public class BadVectorsAtisSync
 
     void Rescan()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             if (DateTime.UtcNow >= _nextRefresh)
@@ -105,6 +108,9 @@ public class BadVectorsAtisSync
 
     async Task PushAsync(object? control, bool quiet = false)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // NetworkServer.Current: see AtisSync.PushAsync.
         if (control == null || !Network.IsConnected || NetworkServer.Current == null)
             return;

@@ -103,6 +103,9 @@ public class PendingSectorGhosts
         try
         {
             var pending = PendingSectors();
+            // Disabled: nothing is pending any more, so whatever is painted is handed back to vatSys.
+            if (OzServerMode.Disabled)
+                pending.Clear();
 
             // The overwhelmingly common case: nothing staged or requested, nothing painted. Reassert
             // runs on every FDR and radar update, and each pass otherwise walks every flight - and

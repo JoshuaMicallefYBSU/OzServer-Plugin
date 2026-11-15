@@ -153,6 +153,9 @@ public class AfvSectorClaimer
 
     void BeginInit()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         _initAttemptsLeft = InitMaxAttempts;
         RetryInit();
     }
@@ -162,6 +165,9 @@ public class AfvSectorClaimer
 
     void RetryInit()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Session went away while still waiting for it to become ready - nothing left to grant.
         if (!Network.IsConnected)
         {
@@ -214,6 +220,9 @@ public class AfvSectorClaimer
 
     void OnTransmitChanged(object? sender, EventArgs e)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (sender is VSCSFrequency frequency)
             CheckActive(frequency);
 
@@ -226,6 +235,9 @@ public class AfvSectorClaimer
     // Starts putting back the frequencies this callsign was transmitting on before it dropped.
     void BeginTransmitRestore()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         StopTransmitRestore();
 
         if (!Network.IsConnected || NetworkIdentity.IsObserver)
@@ -252,6 +264,9 @@ public class AfvSectorClaimer
 
     void RetryTransmitRestore()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected || NetworkIdentity.IsObserver)
         {
             StopTransmitRestore();
@@ -289,6 +304,9 @@ public class AfvSectorClaimer
     // settled, so nothing is written twice.
     void RestoreRememberedTransmits()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // The same gate vatSys's own Transmit button uses (VSCSControlDX's Freq_Trans clickspot):
         // until the network has confirmed this session as a controller, setting Transmit puts the
         // panel in a state AFV will not actually carry.
@@ -422,6 +440,9 @@ public class AfvSectorClaimer
     // reached via different lookups compare unequal under == even though they're the same sector.
     void CheckActive(VSCSFrequency frequency)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Same reasoning as Init() above - nothing here means anything before the network
         // connection is actually up.
         if (!Network.IsConnected)
@@ -611,6 +632,9 @@ public class AfvSectorClaimer
     // this way, as temporary relief.
     void PromptToRequestHeldSector(VSCSFrequency frequency, SectorsVolumes.Sector sector, string myCallsign)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!_tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner))
             return;
 
@@ -694,6 +718,9 @@ public class AfvSectorClaimer
     // release, and nothing of anyone else's is touched.
     void BackToReceive(VSCSFrequency frequency, SectorsVolumes.Sector sector)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         _tracker.ReleaseTransmitPromptHold(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));
         RemoveHeldFromMmi(sector, _tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner) ? owner.Cid : (int?)null);
 
@@ -709,6 +736,9 @@ public class AfvSectorClaimer
     // position or anything it owns.
     void RemoveHeldFromMmi(SectorsVolumes.Sector sector, int? ownerCid)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var own = Network.Me?.Callsign;
         var current = MMI.SectorsControlled.ToList();
         var remove = PrimaryPosition.CoveredBy(sector)
@@ -749,6 +779,9 @@ public class AfvSectorClaimer
     // backend can only refuse.
     void ReleaseQuietLineMissingFromMmi(SectorsVolumes.Sector frequencySector, SectorsVolumes.Sector primarySector)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // The position this session is logged on as is never given away by going quiet on it, the
         // same rule the in-MMI path applies.
         if (frequencySector.Equals(primarySector))

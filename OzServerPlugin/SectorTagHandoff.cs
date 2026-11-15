@@ -235,6 +235,9 @@ public class SectorTagHandoff
     // 1-second cadence PendingSectorGhosts already uses to win the identical fight.
     void ReassertConfirmations()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         List<KeyValuePair<string, PendingConfirmation>> toCheck;
         lock (_lock)
         {
@@ -321,6 +324,9 @@ public class SectorTagHandoff
     // and only for tags at risk - a controller logging on somewhere unrelated changes nothing.
     void ProtectTagsFromArrivals()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             if (!Network.IsConnected)
@@ -397,6 +403,9 @@ public class SectorTagHandoff
 
     void OnOwnershipChanged(SectorOwnershipDiff diff)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         foreach (var transfer in diff.Lost)
             GiveAway(transfer);
 
@@ -428,6 +437,9 @@ public class SectorTagHandoff
     // controller who now owns it.
     void GiveAway(SectorTransfer transfer)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Released to nobody - there is no one to hand the aircraft to, and they are left exactly as
         // they are rather than dropped to uncontrolled.
         if (transfer.Counterparty?.Callsign is not { Length: > 0 } toCallsign)
@@ -554,6 +566,9 @@ public class SectorTagHandoff
     // updates like any other, so there is no update-driven event left to hang a retry off.
     void RetryDeferredHandoffs()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         List<KeyValuePair<string, DeferredHandoff>> toCheck;
         lock (_lock)
         {
@@ -630,6 +645,9 @@ public class SectorTagHandoff
     // The taking half. Accepts an incoming handoff silently when it belongs to a transfer.
     void TryAcceptTransfer(FDP2.FDR fdr)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (string.IsNullOrEmpty(fdr.Callsign))
             return;
 
@@ -802,6 +820,9 @@ public class SectorTagHandoff
 
     void RequestOwnershipCatchUp()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         lock (_lock)
         {
             if (DateTime.UtcNow - _lastCatchUp < CatchUpInterval)
@@ -816,6 +837,9 @@ public class SectorTagHandoff
     // The accept itself, split out only so the in-flight guard above has a body to wrap.
     void AcceptTransfer(FDP2.FDR fdr, PendingTransfer match, string? from)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Resolved against what this session actually holds now, rather than assuming the
         // transferred sector: the aircraft may sit in a sub-sector of it.
         var mine = SectorLocator.Resolve(fdr, MMI.SectorsControlled.Where(s => !s.IsDummy))

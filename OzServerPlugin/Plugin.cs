@@ -85,6 +85,13 @@ public class Plugin : IPlugin
     readonly HashSet<string> _announcedRequestGroups = new(StringComparer.OrdinalIgnoreCase);
     ToolStripMenuItem? _settingsMenuHeader;
     ToolStripItem? _ozServerSectorsItem;
+    // vatSys's own Settings > Sectors... entry, hidden while OzServer runs and shown again when it is
+    // disabled.
+    ToolStripItem? _builtInSectorsItem;
+    // Every menu entry this plugin adds, hidden when OzServer is disabled - apart from the Disable
+    // entry itself, which stays to say so.
+    readonly List<ToolStripItem> _ozServerMenuItems = new();
+    ToolStripMenuItem? _disableItem;
 
     public Plugin()
     {
@@ -99,6 +106,8 @@ public class Plugin : IPlugin
         // A request sent from a VSCS transmit press opens the Sectors window on it.
         _afvSectorClaimer.SectorRequested += sectorName =>
         {
+            if (OzServerMode.Disabled)
+                return;
             OpenSectorsWindow();
             _sectorsWindow?.HighlightRequest(sectorName);
         };
@@ -158,6 +167,8 @@ public class Plugin : IPlugin
         {
             void Apply()
             {
+                if (OzServerMode.Disabled)
+                    return;
                 _pendingRequests = requests.Count;
                 RefreshRequestFlash();
 
@@ -239,6 +250,17 @@ public class Plugin : IPlugin
         settingsMenuItem.Item.Click += (_, _) => OpenSettingsWindow();
         MMI.AddCustomMenuItem(settingsMenuItem);
 
+        _disableItem = new ToolStripMenuItem("Disable OzServer");
+        _disableItem.Click += (_, _) => ConfirmDisable();
+        MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
+            CustomToolStripMenuItemWindowType.Main,
+            CustomToolStripMenuItemCategory.Settings,
+            _disableItem));
+
+        _ozServerMenuItems.Add(sectorsMenuItem.Item);
+        _ozServerMenuItems.Add(settingsMenuItem.Item);
+        _ozServerMenuItems.Add(debugMenu);
+
         // The vatsys plugin API always inserts Settings-category items at the bottom of the
         // Settings menu (just above its final separator), not next to any specific built-in
         // entry. Application.Idle keeps firing (harmlessly) until vatsys has actually built the
@@ -268,6 +290,14 @@ public class Plugin : IPlugin
 
             settingsMenu.DropDownItems.Remove(settingsMenuItem.Item);
             settingsMenu.DropDownItems.Insert(insertAt + 1, settingsMenuItem.Item);
+
+            if (_disableItem != null)
+            {
+                settingsMenu.DropDownItems.Remove(_disableItem);
+                settingsMenu.DropDownItems.Insert(insertAt + 2, _disableItem);
+            }
+
+            _builtInSectorsItem = sectorsItem;
 
             // Captured here rather than earlier: this is the first point at which both the Settings
             // header and our own entry inside it definitely exist.
@@ -445,6 +475,7 @@ public class Plugin : IPlugin
         // for you - see MapDrawing.RemoveAt and SharedNotes.
         foreach (var item in new[] { drawItem, undoItem })
         {
+            _ozServerMenuItems.Add(item);
             MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
                 CustomToolStripMenuItemWindowType.Main,
                 CustomToolStripMenuItemCategory.Custom,
@@ -452,8 +483,128 @@ public class Plugin : IPlugin
         }
     }
 
+    // Settings > Disable OzServer. One-way for the session (see OzServerMode), so it asks first.
+    void ConfirmDisable()
+    {
+        if (OzServerMode.Disabled)
+            return;
+
+        var prompt = new SectorConflictPromptWindow(
+            "Disable OzServer for the rest of this session?" + Environment.NewLine + Environment.NewLine
+            + "Your sectors are released on OzServer, nothing more is sent to it, and the plugin stops "
+            + "changing anything in vatSys - sectors, VSCS, tags and flight plans are left entirely to you. "
+            + "vatSys's own Sectors window comes back under Settings." + Environment.NewLine + Environment.NewLine
+            + "Restart vatSys to use OzServer again.",
+            "Disable OzServer", "Disable", "Cancel");
+        prompt.FormClosed += (_, _) =>
+        {
+            if (prompt.Answer)
+                DisableNow();
+        };
+        ShowDebugPopup(prompt);
+    }
+
+    // Shuts OzServer out of the session. On the UI thread (the menu click and the prompt both are).
+    void DisableNow()
+    {
+        if (OzServerMode.Disabled)
+            return;
+
+        var sectorsWindowWasOpen = _sectorsWindow is { IsDisposed: false, Visible: true };
+        ActionLog.Log("OzServer", "Disabled for this session by the controller", new
+        {
+            action = "ozserver_disabled",
+            callsign = Network.Callsign,
+            connected = Network.IsConnected
+        });
+
+        // From here every handler and timer in the plugin is a no-op, and no request leaves it.
+        OzServerMode.Disable();
+
+        // The OzServer windows and indicators go away.
+        _sectorsWindow?.Hide();
+        _settingsWindow?.Hide();
+        _pendingRequests = 0;
+        RefreshRequestFlash();
+        if (_settingsMenuHeader != null)
+            _settingsMenuHeader.Checked = false;
+
+        // Anything the plugin had put on the scope comes off, and anything it changed is handed back.
+        Isolate("Disable", () => _requestedSectorOverlay.Clear());
+        Isolate("Disable", () => _pendingSectorGhosts.Reassert());   // releases painted ghosts
+        Isolate("Disable", () => _fmpLevelFilter.Shutdown());
+        Isolate("Disable", () => _sharedNotes.Shutdown());
+
+        // The menu: vatSys's own Sectors entry back, the OzServer ones gone, and this one saying so.
+        foreach (var item in _ozServerMenuItems)
+            item.Visible = false;
+        if (_builtInSectorsItem != null)
+            _builtInSectorsItem.Visible = true;
+        if (_disableItem != null)
+        {
+            _disableItem.Text = "OzServer disabled (restart vatSys to re-enable)";
+            _disableItem.Enabled = false;
+        }
+
+        // Someone working from the OzServer Sectors window is left with vatSys's in its place.
+        if (sectorsWindowWasOpen)
+            _builtInSectorsItem?.PerformClick();
+
+        _ = FinishDisablingAsync();
+    }
+
+    // The last calls OzServer gets from this session: this controller's sectors released, so nobody
+    // else is left blocked by a controller who has stopped reporting, their drawings withdrawn, and
+    // the log sent. Inside AllowFinalCalls, which is what lets them through.
+    async System.Threading.Tasks.Task FinishDisablingAsync()
+    {
+        var released = false;
+        using (OzServerMode.AllowFinalCalls())
+        {
+            try
+            {
+                _mapDrawing.Shutdown();
+                if (Network.IsConnected && NetworkServer.Current != null)
+                {
+                    await new OzServerApiClient().ReleaseAllSectorsAsync();
+                    released = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                ActionLog.Log("OzServer", $"Couldn't release sectors while disabling: {ex.Message}");
+            }
+
+            if (released)
+                ActionLog.Log("OzServer", "Released all sectors on OzServer - disabled for this session", new { action = "ozserver_disabled_released" });
+
+            try
+            {
+                await _clientLogForwarder.FlushNowAsync();
+            }
+            catch (Exception)
+            {
+                // Nothing else will be sent anyway.
+            }
+        }
+
+        var notice = new SectorNoticeWindow(
+            "OzServer is disabled for this session." + Environment.NewLine + Environment.NewLine
+            + (released ? "Your sectors have been released on OzServer. " : "")
+            + "Use Settings > Sectors... for vatSys's own Sectors window." + Environment.NewLine + Environment.NewLine
+            + "Restart vatSys to use OzServer again.",
+            "OzServer disabled");
+        if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
+            mainForm.BeginInvoke((MethodInvoker)(() => ShowDebugPopup(notice)));
+        else
+            ShowDebugPopup(notice);
+    }
+
     void OpenSectorsWindow()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // OzServerSectorsWindow hides rather than closes, so once created the same
         // instance is reused (and its event subscriptions stay alive) for the plugin's lifetime.
         if (_sectorsWindow == null)
@@ -473,6 +624,9 @@ public class Plugin : IPlugin
 
     void OpenSettingsWindow()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         _settingsWindow ??= new OzServerSettingsWindow();
         ShowWindow(_settingsWindow);
     }
@@ -503,6 +657,9 @@ public class Plugin : IPlugin
 
     public void OnFDRUpdate(FDP2.FDR updated)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Each subsystem isolated from the next. vatSys calls this inside its own catch-and-log, so
         // a throw in the first call used to take the other two with it and leave no trace anywhere
         // OzServer can see - a tag silently never accepted, ghosts silently never reasserted, and
@@ -514,12 +671,17 @@ public class Plugin : IPlugin
         // Run after TagHandoff so an accepted incoming strip is published as this controller's
         // jurisdiction, not as the handover state vatSys delivered at the start of the callback.
         Isolate("FdrSync", () => _fdrSync.OnFdrUpdate(updated));
+        // A flight plan just activated by hand is coupled to its radar return if vatSys will not.
+        Isolate("Couple", () => _coupleAssist.OnFdrUpdate(updated));
         // vatSys has just recomputed this track's state, so any ghost of ours needs reasserting.
         Isolate("Ghost", () => _pendingSectorGhosts.Reassert());
     }
 
     public void OnRadarTrackUpdate(RDP.RadarTrack updated)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         Isolate("FdrSync", () => _fdrSync.OnRadarTrackUpdate(updated));
         Isolate("Ghost", () => _pendingSectorGhosts.Reassert());
         Isolate("Couple", () => _coupleAssist.OnRadarTrackUpdate(updated));

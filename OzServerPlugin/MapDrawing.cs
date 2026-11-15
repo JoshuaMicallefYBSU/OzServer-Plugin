@@ -168,7 +168,27 @@ public class MapDrawing
     // Position/Rating rather than IsRealATC.
     static bool CanPublish => NetworkIdentity.CanPublishMarkup;
 
-    public void Toggle() => SetEnabled(!_enabled);
+    public void Toggle()
+    {
+        if (OzServerMode.Disabled)
+            return;
+        SetEnabled(!_enabled);
+    }
+
+    // Disabling OzServer: the tool off, this controller's strokes withdrawn for everyone (called inside
+    // OzServerMode.AllowFinalCalls, so those last deletes still go), and everyone else's taken off
+    // this scope.
+    public void Shutdown()
+    {
+        SetEnabled(false);
+        foreach (var id in _strokeIds.Where(id => !string.IsNullOrEmpty(id)))
+            _ = SafelyAsync(_api.DeleteAnnotationAsync(id), "withdraw on disable");
+        _strokes.Clear();
+        _strokeIds.Clear();
+        Redraw();
+        _remote = new List<RemoteStroke>();
+        _remoteLayer.Clear();
+    }
 
     public void SetEnabled(bool enabled)
     {
@@ -205,6 +225,9 @@ public class MapDrawing
     // an undo is clearing everything and starting again.
     public void UndoLast()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (_strokes.Count == 0)
             return;
 
@@ -228,6 +251,9 @@ public class MapDrawing
     // would show it in both colours.
     async Task RefreshRemoteAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             var mine = NetworkIdentity.Current?.Cid;
@@ -309,6 +335,9 @@ public class MapDrawing
 
     void OnMouseDown(object? sender, MouseEventArgs e)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!_enabled || sender is not Control asd)
             return;
 
@@ -488,6 +517,9 @@ public class MapDrawing
     // movement for something the author might still abandon.
     async Task PublishAsync(List<Coordinate> stroke)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!CanPublish)
             return;
 

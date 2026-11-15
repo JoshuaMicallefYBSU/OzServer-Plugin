@@ -288,6 +288,11 @@ public class OzServerFdrUpdateDto
     // backend uses it to recognise that push - see FdrSync.ShouldPush.
     [JsonProperty("authority_sector")] public string? AuthoritySector { get; set; }
 
+    // The callsign actually tracking the FDR in vatSys, whoever it is - empty when nobody is. For a
+    // controller who is not on OzServer (a neighbouring FIR's, WAAF_CTR) this is the only record of
+    // them, since controlling_cid/controlling_callsign only ever name an OzServer controller.
+    [JsonProperty("tracked_by")] public string? TrackedBy { get; set; }
+
     // Whether vatSys has the FDR coupled to a radar track on the reporting client. The map draws an
     // uncoupled FDR as a box (a flight plan track) rather than an aircraft symbol.
     [JsonProperty("coupled")] public bool? Coupled { get; set; }
@@ -659,6 +664,9 @@ public class OzServerApiClient
 
     async Task<T> GetAsync<T>(string path, Func<T> empty, TimeSpan? timeout = null)
     {
+        if (!OzServerMode.RequestsAllowed)
+            throw new OzServerApiException(OzServerMode.DisabledMessage);
+
         var (cid, callsign, server) = GetCredentials();
         var url = $"{OzServerSettings.BaseUrl}/api/v1{path}?controller_cid={cid}&controller_callsign={Uri.EscapeDataString(callsign)}&server={Uri.EscapeDataString(server)}";
 
@@ -720,6 +728,9 @@ public class OzServerApiClient
 
     async Task<string> PostRawAsync(string path, object? requestBody = null)
     {
+        if (!OzServerMode.RequestsAllowed)
+            throw new OzServerApiException(OzServerMode.DisabledMessage);
+
         var (cid, callsign, server) = GetCredentials();
         var json = requestBody != null ? JObject.FromObject(requestBody, BodySerializer) : new JObject();
         json["controller_cid"] = cid;
@@ -759,6 +770,9 @@ public class OzServerApiClient
     // endpoint this serves authenticates nothing and would simply ignore it.
     async Task PutAsync(string path, object requestBody)
     {
+        if (!OzServerMode.RequestsAllowed)
+            throw new OzServerApiException(OzServerMode.DisabledMessage);
+
         var payload = JObject.FromObject(requestBody, BodySerializer).ToString(Formatting.None);
 
         HttpResponseMessage response;

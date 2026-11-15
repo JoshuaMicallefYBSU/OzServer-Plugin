@@ -47,11 +47,14 @@ public class FmpLevelFilter
     static bool Contains(string? callsign) =>
         !string.IsNullOrEmpty(callsign) && callsign!.IndexOf(FmpMarker, StringComparison.OrdinalIgnoreCase) >= 0;
 
+    // Disabling OzServer: the controller's own display levels back, if the FMP filter was applied.
+    public void Shutdown() => RunOnUiThread(Evaluate);
+
     void Evaluate()
     {
         try
         {
-            if (IsFmp())
+            if (IsFmp() && !OzServerMode.Disabled)
                 Apply();
             else
                 Restore();

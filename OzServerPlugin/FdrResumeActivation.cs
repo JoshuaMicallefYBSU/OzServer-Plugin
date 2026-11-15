@@ -79,6 +79,7 @@ public class FdrResumeActivation
 
         Network.Disconnected += (_, _) =>
         {
+            ServerFdrSnapshot.Clear();
             lock (_gate)
             {
                 _pending.Clear();
@@ -106,12 +107,17 @@ public class FdrResumeActivation
     // held sector). Leaves the connect pass's own first window alone so the two never overlap.
     async Task ScanAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         int session;
+        bool connectPassRunning;
         lock (_gate)
         {
-            if (!Network.IsConnected || DateTime.UtcNow - _connectedAt < RetryWindow)
+            if (!Network.IsConnected)
                 return;
             session = _session;
+            connectPassRunning = DateTime.UtcNow - _connectedAt < RetryWindow;
         }
         if (NetworkServer.Current == null || Interlocked.CompareExchange(ref _scanning, 1, 0) != 0)
             return;
@@ -119,6 +125,12 @@ public class FdrResumeActivation
         try
         {
             var records = await _api.GetAllFlightsAsync();
+            // Also what FdrSync's watchdog reads, so it is kept current from connect - even while the
+            // connect pass below still owns activation.
+            ServerFdrSnapshot.Update(records);
+            if (connectPassRunning)
+                return;
+
             var myCid = NetworkIdentity.Current?.Cid;
             var cutoff = DateTimeOffset.UtcNow - MaxRecordAge;
 
@@ -179,6 +191,9 @@ public class FdrResumeActivation
 
     async Task BeginAsync(int session)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             await Task.Delay(StartDelay);
@@ -233,6 +248,9 @@ public class FdrResumeActivation
     // One pass over what is still outstanding, on the UI thread (it changes FDR and track state).
     void Attempt()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         List<OzServerFdrRecordDto> wanted;
         DateTime deadline;
         lock (_gate)

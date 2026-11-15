@@ -86,6 +86,9 @@ public class TagResumeRecovery
     // the whole truth, not an addition to the previous one.
     void Begin(IReadOnlyList<string> callsigns)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         lock (_gate)
         {
             _pending.Clear();
@@ -104,6 +107,9 @@ public class TagResumeRecovery
     // state, and being single-threaded there is also what keeps two passes from overlapping.
     void Attempt()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         List<string> wanted;
         DateTime deadline;
         lock (_gate)

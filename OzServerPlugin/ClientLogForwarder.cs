@@ -79,8 +79,14 @@ public class ClientLogForwarder
         }
     }
 
+    // The last of the log, sent while disabling (inside OzServerMode.AllowFinalCalls).
+    public Task FlushNowAsync() => FlushAsync();
+
     async Task FlushAsync()
     {
+        if (!OzServerMode.RequestsAllowed)
+            return;
+
         List<OzServerClientLogLineDto> batch;
 
         lock (_lock)

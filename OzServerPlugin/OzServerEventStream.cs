@@ -69,6 +69,8 @@ public sealed class OzServerEventStream : IDisposable
     OzServerEventStream()
     {
         Network.Disconnected += (_, _) => DropConnection();
+        // Disabled is permanent for the session - the loop below then never connects again.
+        OzServerMode.DisabledChanged += (_, _) => DropConnection();
         _ = RunAsync(_cancel.Token);
     }
 
@@ -77,7 +79,7 @@ public sealed class OzServerEventStream : IDisposable
     void Raise(string name)
     {
         var handlers = EventReceived;
-        if (handlers == null)
+        if (handlers == null || OzServerMode.Disabled)
             return;
 
         foreach (Action<string> handler in handlers.GetInvocationList())
@@ -116,7 +118,7 @@ public sealed class OzServerEventStream : IDisposable
         {
             // Nothing to subscribe to without a session, and nothing to subscribe *as* on a server
             // OzServer does not operate on (LocalHost, an unrecognised SweatBox).
-            var server = Network.IsConnected ? NetworkServer.Current : null;
+            var server = Network.IsConnected && !OzServerMode.Disabled ? NetworkServer.Current : null;
             if (server == null)
             {
                 backoff = MinBackoff;

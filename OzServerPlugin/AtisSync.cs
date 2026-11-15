@@ -45,6 +45,9 @@ public class AtisSync
     // or the next interval, sends the same thing again.
     async Task PushAsync(bool quiet = false)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var icao = vatsys.ATIS.AirportIcao;
         var letter = vatsys.ATIS.Code;
         var content = vatsys.ATIS.Content;

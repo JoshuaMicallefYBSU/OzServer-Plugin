@@ -66,6 +66,9 @@ public class GracefulDisconnectReleaser
 
     void OnDisconnected()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Nothing was ever claimed on a server OzServer does not operate on (LocalHost, an
         // unrecognised SweatBox), and the release would fail before it was sent - an error in the
         // Errors window, or a blocked shutdown, for nothing.
@@ -99,6 +102,9 @@ public class GracefulDisconnectReleaser
     // messages yet, and OzServerApiClient awaits with ConfigureAwait(false) throughout.
     void ReleaseBlocking()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             _api.ReleaseAllSectorsAsync().Wait(ShutdownReleaseTimeout);

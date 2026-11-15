@@ -110,6 +110,10 @@ public class SharedNotes
             _ => AsdMapLayer.RunOnUiThread(Poll), null, PollInterval, PollInterval);
     }
 
+    // Disabling OzServer: everyone else's notes come off the scope. The controller's own are left
+    // where they are - they are ordinary vatSys text areas, and theirs to keep.
+    public void Shutdown() => AsdMapLayer.RunOnUiThread(Forget);
+
     void Forget()
     {
         foreach (var control in AsdMapLayer.AsdControls())
@@ -135,6 +139,9 @@ public class SharedNotes
     // the server says. Runs on the UI thread, so nothing here races the controller's own edits.
     void Poll()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // Outside the scope work below, which returns early when no scope is open.
         if (++_pollsSinceFetch >= FallbackFetchEveryPolls)
         {
@@ -256,6 +263,9 @@ public class SharedNotes
     // good. A note made while disconnected likewise used to be tracked with no id and never published.
     void Push(LocalNote note)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         // NetworkServer.Current: on LocalHost or an unrecognised SweatBox every call fails before it is
         // sent, and a note waiting to be published would log that every RetryDelay for the session.
         if (!NetworkIdentity.CanPublishMarkup || NetworkServer.Current == null
@@ -299,6 +309,9 @@ public class SharedNotes
 
     async Task PublishAsync(LocalNote note, string text, Coordinate position)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         OzServerAnnotationDto? created = null;
         Exception? failure = null;
 
@@ -344,6 +357,9 @@ public class SharedNotes
 
     async Task UpdateAsync(LocalNote note, string id, string text, Coordinate position)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             await _api.UpdateNoteAsync(id, text, position).ConfigureAwait(false);
@@ -432,6 +448,9 @@ public class SharedNotes
 
     async Task RefreshRemoteAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             var annotations = await _api.GetAnnotationsAsync().ConfigureAwait(false);
