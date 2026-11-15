@@ -200,6 +200,8 @@ public class FdrSync
         if (!Network.IsConnected)
             return false;
 
+        ForgetLandingOfEarlierFlight(fdr);
+
         if (fdr.IsTrackedByMe)
             return fdr.ESTed;
 
@@ -247,18 +249,66 @@ public class FdrSync
     //
     // So the plugin watches the radar return itself: an activated, departed FDR whose aircraft is on
     // the ground (within 200 ft of aerodrome elevation, or flagged on ground with no Mode C) below
-    // 50 kt within 4 nm of its destination is reported FINISHED, and from then on always reported
-    // that way (see Merge). vatSys's own FDR is left alone - the tower may still be working the taxi,
-    // and finishing it here would take the tag off their scope. Reported by whoever sees it and holds
-    // a sector (or tracks it); a finish is the same from anyone, so two reporting is harmless.
-    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> Landed =
+    // 50 kt within 4 nm of its destination is reported FINISHED, and from then on reported that way
+    // (see Merge) for as long as it is still that landing. vatSys's own FDR is left alone - the tower
+    // may still be working the taxi, and finishing it here would take the tag off their scope.
+    // Reported by whoever sees it and holds a sector (or tracks it); a finish is the same from anyone,
+    // so two reporting is harmless.
+    //
+    // Kept by callsign, with the flight that landed (its departure time and destination), because a
+    // callsign outlives a landing: an aircraft flying circuits takes off again on the same flight
+    // plan, and a turnaround files a new one under the same callsign. Held for the whole session, the
+    // first landing had every later push for that callsign - tracked ones included - reported as
+    // completed. So the landing is forgotten when the aircraft is at speed again (CheckLanded) or the
+    // callsign's flight plan is no longer the one that landed (ForgetLandingOfEarlierFlight). Either
+    // one being wrong costs nothing: still down at its destination, it is seen landed again within
+    // the next look.
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime Atd, string Destination)> Landed =
         new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _landingChecked = new(StringComparer.OrdinalIgnoreCase);
+
+    // A different flight plan under a callsign with a landing on record - the next leg, not yet
+    // departed or departed at another time, or bound somewhere else. Run before every push decision
+    // (ShouldPush), so the new flight is never reported with the old one's "completed".
+    static void ForgetLandingOfEarlierFlight(FDP2.FDR fdr)
+    {
+        if (string.IsNullOrEmpty(fdr.Callsign) || !Landed.TryGetValue(fdr.Callsign, out var landed))
+            return;
+
+        if (fdr.ATD != landed.Atd || !string.Equals(fdr.DesAirport, landed.Destination, StringComparison.OrdinalIgnoreCase))
+            ForgetLanding(fdr.Callsign, "a different flight plan is using the callsign");
+    }
+
+    static void ForgetLanding(string callsign, string reason)
+    {
+        if (!Landed.TryRemove(callsign, out var landed))
+            return;
+
+        ActionLog.Log("FDR", $"{callsign} no longer reported completed - {reason}", new
+        {
+            action = "fdr_landed_cleared",
+            fdr_callsign = callsign,
+            landed_at = landed.Destination,
+            reason
+        });
+    }
 
     void CheckLanded(RDP.RadarTrack track)
     {
         var callsign = track.ActualAircraft?.Callsign;
-        if (string.IsNullOrEmpty(callsign) || track.LatLong == null || track.GroundSpeed >= 50 || Landed.ContainsKey(callsign!))
+        if (string.IsNullOrEmpty(callsign) || track.LatLong == null)
+            return;
+
+        if (track.GroundSpeed >= 50)
+        {
+            // At speed again after a landing: a take-off roll. ContainsKey first - this runs for
+            // every moving track on every radar update, and almost none of them has landed.
+            if (Landed.ContainsKey(callsign!))
+                ForgetLanding(callsign!, "at speed again");
+            return;
+        }
+
+        if (Landed.ContainsKey(callsign!))
             return;
 
         // Slow tracks are mostly aircraft sitting at gates; one look per callsign every 15 s.
@@ -299,7 +349,7 @@ public class FdrSync
         if (!onGround)
             return;
 
-        Landed[callsign!] = DateTime.UtcNow;
+        Landed[callsign!] = (fdr.ATD, fdr.DesAirport);
 
         var dto = new OzServerFdrUpdateDto
         {
@@ -616,7 +666,8 @@ public class FdrSync
         if (OzServerMode.Disabled)
             return;
 
-        // Landed is final for the server's record, whatever this client's vatSys still has the FDR as.
+        // A landing stands for the server's record, whatever this client's vatSys still has the FDR
+        // as - until the callsign flies again (see Landed).
         if (Landed.ContainsKey(dto.Callsign))
             dto.State = nameof(FDP2.FDR.FDRStates.STATE_FINISHED);
 
