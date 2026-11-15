@@ -288,13 +288,42 @@ public class OzServerFdrUpdateDto
     // backend uses it to recognise that push - see FdrSync.ShouldPush.
     [JsonProperty("authority_sector")] public string? AuthoritySector { get; set; }
 
+    // Whether vatSys has the FDR coupled to a radar track on the reporting client. The map draws an
+    // uncoupled FDR as a box (a flight plan track) rather than an aircraft symbol.
+    [JsonProperty("coupled")] public bool? Coupled { get; set; }
+
     // The aerodromes' own positions, from vatSys's airport data. The map draws an FDR that has not
     // departed yet at its departure aerodrome, and a completed one at its destination - neither
     // necessarily has a live position of its own.
+    // The route as vatSys parsed it (fdr.ParsedRoute): every waypoint with its position, so the map
+    // can draw where the aircraft is actually going rather than guessing from the route string.
+    // Only sent when it differs from what this session last sent for the callsign (and on the
+    // periodic sweep) - left out, the backend keeps the last one. route_next_index is the index in
+    // route_points of the next waypoint still to be flown, sent on every full FDR push since it
+    // moves on as waypoints are passed.
+    [JsonProperty("route_points")] public List<OzServerRoutePointDto>? RoutePoints { get; set; }
+    [JsonProperty("route_next_index")] public int? RouteNextIndex { get; set; }
+
     [JsonProperty("dep_lat")] public double? DepLat { get; set; }
     [JsonProperty("dep_lon")] public double? DepLon { get; set; }
     [JsonProperty("des_lat")] public double? DesLat { get; set; }
     [JsonProperty("des_lon")] public double? DesLon { get; set; }
+}
+
+// A stored flight record as /fdr/sync returns it: everything that was pushed, plus when the server
+// last heard about it.
+public class OzServerFdrRecordDto : OzServerFdrUpdateDto
+{
+    [JsonProperty("last_seen_at")] public DateTimeOffset? LastSeenAt { get; set; }
+}
+
+// One waypoint of OzServerFdrUpdateDto.RoutePoints. Short keys and 4dp (~10 m) positions: a long
+// route is dozens of these, for every FDR a controller answers for.
+public class OzServerRoutePointDto
+{
+    [JsonProperty("n")] public string Name { get; set; } = "";
+    [JsonProperty("lat")] public double Lat { get; set; }
+    [JsonProperty("lon")] public double Lon { get; set; }
 }
 
 // AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when
@@ -574,6 +603,11 @@ public class OzServerApiClient
             return null;
         }
     }
+
+    // Every flight record this server holds - see FdrResumeActivation, which on reconnect activates
+    // and positions the ones vatSys has not activated itself.
+    public Task<List<OzServerFdrRecordDto>> GetAllFlightsAsync() =>
+        GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
 
     // Shared markup (issue #9). Every controller reads the whole set: it is a few dozen small
     // shapes, all of it is needed to draw anything, and an area filter would have to be recomputed

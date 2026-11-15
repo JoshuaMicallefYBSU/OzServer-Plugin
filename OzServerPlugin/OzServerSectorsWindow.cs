@@ -2695,6 +2695,14 @@ public class OzServerSectorsWindow : BaseForm
     {
         try
         {
+            // A heading selected - "Requested From Me" or "Requested By Me" - means everything
+            // under it: every incoming request rejected, or every one of mine cancelled.
+            if (IsRequestHeading(node))
+            {
+                await RejectAllUnderHeadingAsync(node!);
+                return;
+            }
+
             // FindOwningRequest, not a direct Tag test - a request that bundles sub-sectors
             // renders them as rows underneath it, and clicking one of those means that request.
             var request = FindOwningRequest(node);
@@ -3251,8 +3259,90 @@ public class OzServerSectorsWindow : BaseForm
         _rejectButton.Visible = !IsObserver;
         _acceptButton.Enabled = requestsActionable && GetRequestsToAccept(selected).Count > 0;
         _rejectButton.Enabled = requestsActionable
-                                 && FindOwningRequest(selected) != null
-                                 && (category == RequestedFromMeName || category == RequestedByMeName);
+                                 && (IsRequestHeading(selected)
+                                     ? RequestsUnderHeading(selected!).Count > 0
+                                     : FindOwningRequest(selected) != null
+                                       && (category == RequestedFromMeName || category == RequestedByMeName));
+    }
+
+    // The "Requested From Me" / "Requested By Me" headings themselves, as opposed to a row under one.
+    static bool IsRequestHeading(TreeNode? node) =>
+        node != null && ReferenceEquals(node.Tag, CategoryTag)
+        && (node.Text == RequestedFromMeName || node.Text == RequestedByMeName);
+
+    // The real, already-sent requests listed under a heading. Read off the rendered rows, like
+    // GetRequestsToAccept, so it acts only on what is on screen: a placeholder row carries no
+    // request, and a staged one not yet applied is not a SectorChangeRequest (Cancel withdraws those).
+    static List<SectorChangeRequest> RequestsUnderHeading(TreeNode heading) =>
+        heading.Nodes.Cast<TreeNode>()
+            .Select(n => n.Tag as SectorChangeRequest)
+            .Where(r => r != null)
+            .Select(r => r!)
+            .ToList();
+
+    // Reject on a heading. Incoming requests go as one batch - the same single decision the backend
+    // takes for a grouped request, so no group is left half answered. Outgoing ones have no batch
+    // call and are cancelled one by one; one failing does not stop the rest.
+    async Task RejectAllUnderHeadingAsync(TreeNode heading)
+    {
+        if (!Network.IsConnected || _requestActionRunning || _applyRunning)
+            return;
+
+        var requests = RequestsUnderHeading(heading);
+        if (requests.Count == 0)
+            return;
+
+        var incoming = heading.Text == RequestedFromMeName;
+        _requestActionRunning = true;
+        UpdateRequestActionButtons();
+        try
+        {
+            if (incoming)
+            {
+                var rejected = await _tracker.RejectRequestsBatchAsync(requests.Select(r => r.Id));
+                ActionLog.Log("Ownership", $"Rejected all incoming requests: {rejected.Count} of {requests.Count}", new
+                {
+                    action = "reject_all_incoming",
+                    request_ids = requests.Select(r => r.Id).ToList(),
+                    rejected
+                });
+            }
+            else
+            {
+                var failed = new List<string>();
+                foreach (var request in requests)
+                {
+                    try
+                    {
+                        var result = await _api.CancelRequestAsync(request.Id);
+                        await _tracker.ApplyActionResultAsync(result);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed.Add($"{request.Sector.Name} ({ex.Message})");
+                    }
+                }
+                ActionLog.Log("Ownership", $"Cancelled all my requests: {requests.Count - failed.Count} of {requests.Count}", new
+                {
+                    action = "cancel_all_outgoing",
+                    request_ids = requests.Select(r => r.Id).ToList(),
+                    failed
+                });
+                if (failed.Count > 0)
+                    Errors.Add(new Exception($"Couldn't cancel: {string.Join(", ", failed)}"), "OzServer");
+            }
+
+            RefreshControlledSnapshot();
+        }
+        catch (Exception ex)
+        {
+            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+        }
+        finally
+        {
+            _requestActionRunning = false;
+            UpdateRequestActionButtons();
+        }
     }
 
     // What Accept acts on, entirely from the current selection:

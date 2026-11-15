@@ -65,8 +65,11 @@ public class FdrSync
     // skips; nothing is lost, since whatever accumulates meanwhile goes out on the next one.
     int _flushing;
 
-    public FdrSync()
+    readonly OzServerOwnershipTracker _tracker;
+
+    public FdrSync(OzServerOwnershipTracker tracker)
     {
+        _tracker = tracker;
         _flushTimer = new Timer(_ => _ = FlushAsync(), null, FlushInterval, FlushInterval);
 
         // Whatever was still queued belongs to the session that just ended. FlushAsync holds it
@@ -77,7 +80,11 @@ public class FdrSync
         Network.Disconnected += (_, _) =>
         {
             lock (_lock)
+            {
                 _pending.Clear();
+                // A new session starts with nothing sent: every route goes out again.
+                _sentRouteKeys.Clear();
+            }
         };
     }
 
@@ -89,7 +96,7 @@ public class FdrSync
         if (!ShouldPush(fdr))
             return;
 
-        Merge(BuildFdrDto(fdr));
+        Merge(BuildFdrDto(fdr, forceRoute: false));
     }
 
     // Sends without waiting for the flush timer.
@@ -113,7 +120,7 @@ public class FdrSync
         if (!ShouldPush(fdr))
             return;
 
-        Merge(BuildFdrDto(fdr));
+        Merge(BuildFdrDto(fdr, forceRoute: false));
         ActionLog.Log("FDR", $"Queued immediate FDR authority push for {fdr.Callsign}", new
         {
             action = "fdr_push_now",
@@ -129,6 +136,9 @@ public class FdrSync
 
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
+        // Coupled flight plans only. A floating FDR (no coupled track) is reported where its flight
+        // plan track is - see FloatingSweep - not where some uncoupled return with the same callsign
+        // happens to be; CoupleAssist couples the two when they really are the same aircraft.
         var fdr = track.CoupledFDR;
         if (string.IsNullOrEmpty(fdr?.Callsign))
             return;
@@ -139,13 +149,24 @@ public class FdrSync
         var dto = new OzServerFdrUpdateDto
         {
             Callsign = fdr!.Callsign,
-            State = fdr.State.ToString()
+            State = fdr.State.ToString(),
+            Coupled = fdr.CoupledTrack == track
         };
         FillPosition(dto, track);
         FillAuthority(dto, fdr);
+        FillResponsibleSector(dto, fdr);
         FillCurrentSector(dto, fdr);
 
         Merge(dto);
+    }
+
+    // An untracked push carries the sector that made this session responsible for it (see
+    // ResponsibleSectorForUntracked) - the backend accepts an untracked report from the holder of
+    // the sector named here.
+    void FillResponsibleSector(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
+    {
+        if (!fdr.IsTrackedByMe && ResponsibleSectorForUntracked(fdr, out var sector) && sector != null)
+            dto.AuthoritySector = sector;
     }
 
     // Gates every push on this session's own relationship to the flight, checked fresh every time.
@@ -162,7 +183,7 @@ public class FdrSync
     //
     // Connected as well: vatSys keeps delivering updates for a while after a disconnect, and what is
     // queued then would be sent first on the next session - see the Disconnected handler above.
-    static bool ShouldPush(FDP2.FDR fdr)
+    bool ShouldPush(FDP2.FDR fdr)
     {
         if (!Network.IsConnected)
             return false;
@@ -170,25 +191,175 @@ public class FdrSync
         if (fdr.IsTrackedByMe)
             return fdr.ESTed;
 
-        return HoldsDataAuthority(fdr);
+        // vatSys finishes an untracked FDR the moment its pilot drops off this client's picture - it
+        // cannot tell "left my visibility range" from "disconnected" (Network.ProcessRemovedPilot ->
+        // FDP2.CancelFDR). JST946 was finished at FL360 when CS1 cut its range to 10 nm, and CS_APP
+        // then reported it finished to everyone. A finish is only passed on when the aircraft was
+        // last seen down at its destination; anything else is this client losing sight of it, and
+        // the record is left as it was for a client that can still see it.
+        if (fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED && !IsCredibleFinish(fdr))
+        {
+            if (!string.IsNullOrEmpty(fdr.Callsign) && FinishedOutOfView.TryAdd(fdr.Callsign, DateTime.UtcNow))
+            {
+                ActionLog.Log("FDR", $"{fdr.Callsign} finished by vatSys out of view - not reported, kept active on OzServer", new
+                {
+                    action = "fdr_finish_out_of_view",
+                    fdr_callsign = fdr.Callsign
+                });
+            }
+            return false;
+        }
+
+        return ResponsibleSectorForUntracked(fdr, out _);
     }
 
-    static bool HoldsDataAuthority(FDP2.FDR fdr)
+    // FDRs vatSys finished because they went out of view here (see ShouldPush). FdrResumeActivation
+    // activates one again if it reappears while OzServer still has it active.
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> FinishedOutOfView =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Landed, or as good as: last seen within 15 nm of its destination and below 3,000 ft above it
+    // (or on the ground). Uses the radar return when there still is one, otherwise vatSys's last
+    // predicted position - which, for an aircraft lost in the cruise, is nowhere near the ground.
+    static bool IsCredibleFinish(FDP2.FDR fdr)
     {
-        if (fdr.IsTracked || fdr.ControllingSector == null)
+        if (string.IsNullOrEmpty(fdr.DesAirport) || Airspace2.GetAirport(fdr.DesAirport) is not { LatLong: { } destination } airport)
             return false;
 
+        var position = SectorLocator.ApproximatePosition(fdr);
+        if (position == null || Conversions.CalculateDistance(position, destination) > 15)
+            return false;
+
+        var altitude = SectorLocator.LiveAltitude(fdr);
+        var elevation = airport.Elevation > 0 ? airport.Elevation : 0;
+        return altitude != null && altitude < elevation + 3000;
+    }
+
+    // Exactly one connected controller keeps each untracked activated (or completed) FDR current on
+    // the server, at all times - so its position there follows the aircraft on VATSIM even when the
+    // controller who was working it has gone. Only a controller who can actually see the aircraft
+    // counts: a client receives an aircraft's position only while it is inside that controller's
+    // visibility range, and one picked without it - CS_APP for JST946 at FL360, 94 nm out - would be
+    // left reporting a tag it never receives. Among those who can see it:
+    //
+    //  1. whoever holds the sector the aircraft is in right now;
+    //  2. otherwise whoever holds the held sector nearest to it, by straight-line distance to that
+    //     sector's boundary (ties broken by sector name, so every client picks the same one).
+    //
+    // "Can see it": for this session, it has a live radar track for the aircraft. For another
+    // controller, the aircraft is within their visibility range of their vis centre - the Position
+    // and Range vatSys has for them off the network, which is what VATSIM itself sends positions by.
+    // That uses only their main vis centre; extra vis points they may have only widen what they see,
+    // so when this is wrong it leaves two clients reporting (harmless - the server merges them) rather
+    // than none. A controller vatSys no longer lists as online does not count at all.
+    //
+    // The sector that decided it is returned for the push to carry (authority_sector) - always one
+    // this session holds when the answer is "us" - which is what the backend checks an untracked
+    // report against.
+    bool ResponsibleSectorForUntracked(FDP2.FDR fdr, out string? sectorName)
+    {
+        sectorName = null;
+        if (fdr.IsTracked)
+            return false;
         if (!fdr.ESTed && fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED)
             return false;
 
+        // Not visible here: never ours, whatever anyone else can see.
+        // Where the aircraft is: this client's radar return if it has one, otherwise where the flight
+        // plan track is (what vatSys draws as the box).
+        var seen = SectorLocator.LivePosition(fdr);
+        var position = seen ?? SectorLocator.ApproximatePosition(fdr);
+        if (position == null)
+            return false;
+
+        var myCid = NetworkIdentity.Current?.Cid;
+        var onlineAtc = (Network.GetOnlineATCs ?? new List<NetworkATC>())
+            .Where(a => !string.IsNullOrEmpty(a.Callsign))
+            .GroupBy(a => a.Callsign, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        var others = _tracker.ControlledByOthers;
+
+        bool CanSee(string callsign) =>
+            onlineAtc.TryGetValue(callsign, out var atc)
+            && atc.Position != null && atc.Range > 0
+            && Conversions.CalculateDistance(atc.Position, position) <= atc.Range;
+
+        var mine = _tracker.Owned.Where(s => !s.IsDummy).ToList();
+        var othersHeld = SectorsVolumes.Sectors
+            .Where(s => !s.IsDummy && others.TryGetValue(s.Name, out var owner) && owner.Cid != myCid && online(owner.Callsign))
+            .ToList();
+        bool online(string callsign) => onlineAtc.ContainsKey(callsign);
+
+        // Controllers who can see the aircraft come first: their report is the real position.
+        var seeing = (seen != null ? mine.Select(s => (Sector: s, Mine: true)) : Enumerable.Empty<(SectorsVolumes.Sector Sector, bool Mine)>())
+            .Concat(othersHeld.Where(s => CanSee(others[s.Name].Callsign)).Select(s => (Sector: s, Mine: false)))
+            .ToList();
+
+        // Nobody holding a sector can see it - a floating FDR, out of everyone's radar. Every client
+        // has the flight plan, so its track's position is the same everywhere: the controller whose
+        // airspace that is (or the nearest held) reports it from there, until someone can see it.
+        var candidates = seeing.Count > 0
+            ? seeing
+            : mine.Select(s => (Sector: s, Mine: true)).Concat(othersHeld.Select(s => (Sector: s, Mine: false))).ToList();
+        if (candidates.Count == 0)
+            return false;
+
+        // 1. In one of those sectors, level and all (a live return is needed to know the level).
+        var here = seen != null
+            ? SectorLocator.Resolve(fdr, candidates.Select(h => h.Sector))
+            : candidates.Select(h => h.Sector).FirstOrDefault(s => s.IsInSector(position, fdr.PRL > 0 ? fdr.PRL : -1));
+        if (here != null)
+        {
+            sectorName = here.Name;
+            return candidates.First(h => h.Sector.Equals(here)).Mine;
+        }
+
+        // 2. The nearest of them.
+        var nearest = candidates
+            .Select(h => (h.Sector, h.Mine, Distance: SectorLocator.DistanceNm(h.Sector, position)))
+            .OrderBy(h => h.Distance)
+            .ThenBy(h => h.Sector.Name, StringComparer.Ordinal)
+            .First();
+        sectorName = nearest.Sector.Name;
+        return nearest.Mine;
+    }
+
+    // Floating FDRs - activated, no coupled radar track - are reported where vatSys draws their
+    // flight plan track, which moves along the route by itself and raises no FDR event as it does.
+    // Every FloatingEvery-th flush they are queued again with that position, so the map's box
+    // moves with vatSys's.
+    const int FloatingEvery = 3; // x FlushInterval = every 15 s
+
+    void FloatingSweep()
+    {
+        List<FDP2.FDR> fdrs;
         try
         {
-            // vatSys's live list, mutated on its own thread - read a copy.
-            return MMI.SectorsControlled.ToList().Contains(fdr.ControllingSector);
+            fdrs = FDP2.GetFDRs.ToList();
         }
-        catch (InvalidOperationException)
+        catch (Exception)
         {
-            return false;
+            return;
+        }
+
+        foreach (var fdr in fdrs)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(fdr.Callsign) || fdr.CoupledTrack != null || !fdr.ESTed || !ShouldPush(fdr))
+                    continue;
+
+                var dto = new OzServerFdrUpdateDto { Callsign = fdr.Callsign, State = fdr.State.ToString(), Coupled = false };
+                FillAuthority(dto, fdr);
+                FillResponsibleSector(dto, fdr);
+                FillPredictedPosition(dto, fdr);
+                FillCurrentSector(dto, fdr);
+                Merge(dto);
+            }
+            catch (Exception ex)
+            {
+                ErrorThrottle.Report("fdr-floating", $"Couldn't read FDR {fdr.Callsign} for OzServer: {ex.Message}", ex);
+            }
         }
     }
 
@@ -217,7 +388,7 @@ public class FdrSync
             try
             {
                 if (!string.IsNullOrEmpty(fdr.Callsign) && ShouldPush(fdr))
-                    Merge(BuildFdrDto(fdr));
+                    Merge(BuildFdrDto(fdr, forceRoute: true));
             }
             catch (Exception ex)
             {
@@ -255,6 +426,8 @@ public class FdrSync
         {
             if (++_flushCount % SweepEvery == 0)
                 SweepAuthorityFdrs();
+            else if (_flushCount % FloatingEvery == 0)
+                FloatingSweep();
 
             List<OzServerFdrUpdateDto> batch;
 
@@ -289,6 +462,7 @@ public class FdrSync
         {
             Callsign = fdr.Callsign,
             State = fdr.State.ToString(),
+            Coupled = fdr.CoupledTrack != null,
             FlightRules = NullIfEmpty(fdr.FlightRules),
             AircraftType = NullIfEmpty(fdr.AircraftType),
             AircraftWake = NullIfEmpty(fdr.AircraftTypeAndWake?.WakeCategory),
@@ -327,6 +501,69 @@ public class FdrSync
         FillAerodromes(dto, fdr);
 
         return dto;
+    }
+
+    // What route this session last queued per callsign, so an unchanged route - the usual case on
+    // every FDR update - is not resent. The sweep sends it regardless (forceRoute), which also
+    // covers a batch that failed to go out after the key was recorded here.
+    readonly Dictionary<string, string> _sentRouteKeys = new(StringComparer.OrdinalIgnoreCase);
+
+    OzServerFdrUpdateDto BuildFdrDto(FDP2.FDR fdr, bool forceRoute)
+    {
+        var dto = BuildFdrDto(fdr);
+        FillResponsibleSector(dto, fdr);
+        FillRoute(dto, fdr, forceRoute);
+        return dto;
+    }
+
+    void FillRoute(OzServerFdrUpdateDto dto, FDP2.FDR fdr, bool force)
+    {
+        List<FDP2.FDR.ExtractedRoute.Segment> segments;
+        int overflown;
+        try
+        {
+            segments = fdr.ParsedRoute.ToList();
+            overflown = fdr.ParsedRoute.OverflownIndex;
+        }
+        catch (Exception)
+        {
+            return; // being re-parsed on vatSys's thread; the next update gets it
+        }
+
+        var points = new List<OzServerRoutePointDto>();
+        var nextIndex = 0;
+        for (var i = 0; i < segments.Count; i++)
+        {
+            var segment = segments[i];
+            // Trial routes are a controller's what-if, not the aircraft's route.
+            if (segment?.Intersection?.LatLong == null || segment.Type == FDP2.FDR.ExtractedRoute.Segment.SegmentTypes.TRIAL)
+                continue;
+
+            if (i <= overflown)
+                nextIndex = points.Count + 1;
+
+            points.Add(new OzServerRoutePointDto
+            {
+                Name = segment.Intersection.Name ?? "",
+                Lat = Math.Round(segment.Intersection.LatLong.Latitude, 4),
+                Lon = Math.Round(segment.Intersection.LatLong.Longitude, 4)
+            });
+        }
+
+        if (points.Count < 2)
+            return;
+
+        dto.RouteNextIndex = Math.Min(nextIndex, points.Count - 1);
+
+        var key = string.Join(";", points.Select(p => $"{p.Name},{p.Lat},{p.Lon}"));
+        lock (_lock)
+        {
+            if (!force && _sentRouteKeys.TryGetValue(fdr.Callsign, out var sent) && sent == key)
+                return;
+            _sentRouteKeys[fdr.Callsign] = key;
+        }
+
+        dto.RoutePoints = points;
     }
 
     static void FillAerodromes(OzServerFdrUpdateDto dto, FDP2.FDR fdr)

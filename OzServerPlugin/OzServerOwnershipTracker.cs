@@ -309,6 +309,7 @@ public class OzServerOwnershipTracker
             RunOnUiThread(() =>
             {
                 RetryUnclaimedMmiSectors();
+                DropGivenAwayFromMmi();
                 RestoreOwnedToMmi();
             });
         }, null, PollInterval, PollInterval);
@@ -368,6 +369,7 @@ public class OzServerOwnershipTracker
         && !IsWithheld(sector.Name)
         && !IsReliefCovered(sector)
         && !IsHeldForTransmitPrompt(sector.Name)
+        && !IsGivenAway(sector.Name)
         // Something else (VatpacPlugin, on the same transmit press) can still put an enroute or TMA
         // sector into a flow position's MMI. It is never claimed from there - see
         // PrimaryPosition.MayOwn.
@@ -380,6 +382,40 @@ public class OzServerOwnershipTracker
     // unowned and claims it like any other.
     bool IsReliefCovered(SectorsVolumes.Sector sector) =>
         _controlled.TryGetValue(sector.Name, out var owner) && PrimaryPosition.IsFlowCallsign(owner.Callsign);
+
+    // Sectors this session handed to another controller (see ReconcileMmiWithOwned). Their VSCS line
+    // is left alone on handover and may still be transmitting, which is enough for VatpacPlugin to
+    // put the sector back into MMI on the next panel change - and MMI is what the claim pass claims
+    // from. Without this the giving controller's client claimed the sector straight back, and with
+    // the new owner present that became a request popup for airspace they had just agreed to give.
+    // Cleared once nobody else holds it, or it is ours again; taking it back on purpose is a transmit
+    // press, which asks the new owner like any other held sector.
+    readonly HashSet<string> _givenAway = new(StringComparer.OrdinalIgnoreCase);
+
+    bool IsGivenAway(string name)
+    {
+        lock (_withheldGate)
+        {
+            if (!_givenAway.Contains(name))
+                return false;
+            if (!_controlled.ContainsKey(name) || _owned.Any(o => string.Equals(o.Name, name, StringComparison.OrdinalIgnoreCase)))
+            {
+                _givenAway.Remove(name);
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // A given-away sector back in MMI (re-added for its still-transmitting line) is taken out again,
+    // VSCS untouched, so the giving controller's scope does not show airspace that is not theirs.
+    void DropGivenAwayFromMmi()
+    {
+        var current = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
+        var keep = current.Where(s => !IsGivenAway(s.Name)).ToList();
+        if (keep.Count != current.Count)
+            MMI.SetControlledSectors(keep);
+    }
 
     bool IsWithheld(string name)
     {
@@ -1129,17 +1165,47 @@ public class OzServerOwnershipTracker
         // aircraft off (see its own comment), which is what keeps this second call from re-catching
         // the same aircraft on its way out: by now ControllingSector points at the new owner's
         // sector, which was never in this session's own list to begin with.
+        // The VSCS line is deliberately left as it is. Handing a sector over is not the controller
+        // leaving the frequency: they stay on it through the handover and come off it themselves.
+        // This used to switch the line off transmit, which changed the giving controller's panel as a
+        // side effect of someone else's request being accepted. Since the line may now stay on
+        // transmit, the sector is marked as given away so that the claim pass does not try to take
+        // it straight back when something (VatpacPlugin, on the next VSCS change) puts a transmitting
+        // line's sector back into MMI - see IsGivenAway.
         foreach (var sector in lost)
         {
             mmiSectors.RemoveAll(s => s.Equals(sector));
-
-            var freq = Audio.VSCSFrequencies.FirstOrDefault(f => f.Name == sector.Callsign);
-            if (freq is { Transmit: true })
-                freq.Transmit = false;
+            if (_controlled.ContainsKey(sector.Name))
+            {
+                lock (_withheldGate)
+                    _givenAway.Add(sector.Name);
+            }
         }
 
         if (lost.Count > 0)
             MMI.SetControlledSectors(mmiSectors);
+
+        // Gaining this session's own login position - asked for at logon from whoever was covering
+        // it - puts its line on transmit: being on your own frequency is what logging on to the
+        // position means. Every other gained sector is still left to the controller (issue #5).
+        foreach (var sector in gained)
+        {
+            if (!string.Equals(sector.Callsign, Network.Callsign, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var freq = Audio.VSCSFrequencies.FirstOrDefault(f => string.Equals(f.Name, sector.Callsign, StringComparison.OrdinalIgnoreCase));
+            if (freq == null || freq.Transmit)
+                continue;
+
+            freq.Receive = true;
+            freq.Transmit = true;
+            ActionLog.Log("Primary", $"Put transmit on {sector.Name} - own position gained", new
+            {
+                action = "vscs_transmit_own_position_gained",
+                sector = sector.Name,
+                from_callsign = diff.Gained.FirstOrDefault(g => g.Sector.Equals(sector))?.Counterparty?.Callsign
+            });
+        }
     }
 
     // Whether this session is actually connected as ATC, not merely a connection that happens to

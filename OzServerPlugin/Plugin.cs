@@ -39,6 +39,10 @@ public class Plugin : IPlugin
     readonly FdrSync _fdrSync;
     // Restores tags the backend confirms were this controller's moments ago.
     readonly TagResumeRecovery _tagResumeRecovery;
+    // Activates and positions, on reconnect, the flights OzServer still holds that vatSys has not.
+    readonly FdrResumeActivation _fdrResumeActivation;
+    // Couples an activated flight plan to the radar track carrying its callsign when vatSys will not.
+    readonly CoupleAssist _coupleAssist = new();
     // Moves aircraft with their sector when one changes hands on OzServer.
     readonly SectorTagHandoff _sectorTagHandoff;
     // Previews which aircraft a staged or pending sector request would bring with it.
@@ -98,9 +102,10 @@ public class Plugin : IPlugin
             OpenSectorsWindow();
             _sectorsWindow?.HighlightRequest(sectorName);
         };
-        _fdrSync = new FdrSync();
+        _fdrSync = new FdrSync(_ownershipTracker);
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
+        _fdrResumeActivation = new FdrResumeActivation();
         // After the tracker, whose OwnershipChanged tells it a sector moved.
         _sectorTagHandoff = new SectorTagHandoff(_ownershipTracker, _fdrSync);
         // After the tracker, whose own open requests it reads alongside the window's staged set.
@@ -517,6 +522,7 @@ public class Plugin : IPlugin
     {
         Isolate("FdrSync", () => _fdrSync.OnRadarTrackUpdate(updated));
         Isolate("Ghost", () => _pendingSectorGhosts.Reassert());
+        Isolate("Couple", () => _coupleAssist.OnRadarTrackUpdate(updated));
     }
 
     // Runs one of the per-update subsystems, reporting a failure rather than letting it escape into
