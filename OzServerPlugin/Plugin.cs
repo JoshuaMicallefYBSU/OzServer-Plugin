@@ -691,6 +691,7 @@ public class Plugin : IPlugin
     // vatSys's own handler where nothing this plugin logs would ever record it.
     static void Isolate(string category, Action work)
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             work();
@@ -699,5 +700,60 @@ public class Plugin : IPlugin
         {
             ActionLog.Log(category, $"update handler failed: {ex.Message}");
         }
+        finally
+        {
+            HandlerTiming.Record(category, started);
+        }
+    }
+}
+
+// How much of vatSys's own time the plugin's per-update handlers take - on whichever thread vatSys
+// calls them on, which may be the UI thread. A controller reported vatSys freezing on activating an
+// FDR; the logs could show the UI thread was alive but not whether the plugin was what kept it busy.
+// This makes it provable: a single call over SlowCallMs, or a category over BusyMsPerSecond in one
+// second, is logged with the count of calls that second. Silent during a freeze means it was not us.
+static class HandlerTiming
+{
+    const double SlowCallMs = 100;
+    const double BusyMsPerSecond = 300;
+    static readonly object Gate = new();
+    static readonly Dictionary<string, (long Second, double Ms, int Calls, bool Reported)> Window = new();
+    static DateTime _lastSlowLog = DateTime.MinValue;
+
+    public static void Record(string category, long started)
+    {
+        var ms = (System.Diagnostics.Stopwatch.GetTimestamp() - started) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        var second = DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond;
+        string? report = null;
+
+        lock (Gate)
+        {
+            Window.TryGetValue(category, out var w);
+            if (w.Second != second)
+                w = (second, 0, 0, false);
+            w.Ms += ms;
+            w.Calls++;
+            if (!w.Reported && w.Ms > BusyMsPerSecond)
+            {
+                w.Reported = true;
+                report = $"{category} handlers used {w.Ms:0} ms of vatSys's time in one second ({w.Calls} calls)";
+            }
+            Window[category] = w;
+
+            if (report == null && ms > SlowCallMs && DateTime.UtcNow - _lastSlowLog > TimeSpan.FromSeconds(5))
+            {
+                _lastSlowLog = DateTime.UtcNow;
+                report = $"{category} handler took {ms:0} ms";
+            }
+        }
+
+        if (report != null)
+            ActionLog.Log("Perf", report, new
+            {
+                action = "handler_slow",
+                category,
+                thread = System.Threading.Thread.CurrentThread.ManagedThreadId,
+                ui_thread = System.Windows.Forms.Application.OpenForms["MainForm"] is Control main && !main.InvokeRequired
+            });
     }
 }
