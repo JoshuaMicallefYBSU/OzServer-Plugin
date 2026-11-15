@@ -123,6 +123,11 @@ public class OzServerCommitResultDto
     [JsonProperty("released")] public List<string> Released { get; set; } = new();
     [JsonProperty("requested")] public List<string> Requested { get; set; } = new();
     [JsonProperty("skipped")] public List<string> Skipped { get; set; } = new();
+    // Covered sectors left with a controller who is logged on as that position inside the claimed
+    // group (the backend's claimGroup `withheld`). Not a conflict and not reported to the controller
+    // - leaving a staffed position's airspace alone is the rule working - but logged, so "why did
+    // that Apply not take X" has an answer.
+    [JsonProperty("withheld")] public List<string> Withheld { get; set; } = new();
     [JsonProperty("failed")] public List<string> Failed { get; set; } = new();
 }
 
@@ -608,7 +613,9 @@ public class OzServerApiClient
     }
 
     // Every flight record this server holds - see FdrResumeActivation, which on reconnect activates
-    // and positions the ones vatSys has not activated itself.
+    // and positions the ones vatSys has not activated itself, and LabelStateMirror. The backend
+    // leaves route_points out of this list (nothing here reads it, and it is most of a record's
+    // size); GetFlightAsync still returns it.
     public Task<List<OzServerFdrRecordDto>> GetAllFlightsAsync() =>
         GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
 

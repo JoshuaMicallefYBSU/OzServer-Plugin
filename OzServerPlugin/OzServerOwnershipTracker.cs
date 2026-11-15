@@ -1407,6 +1407,19 @@ public class OzServerOwnershipTracker
             result.Skipped.AddRange(response.Result.Skipped);
             result.Failed.AddRange(response.Result.Failed);
 
+            if (response.Result.Withheld.Count > 0)
+            {
+                ActionLog.Log("Ownership",
+                    $"Apply left {string.Join(", ", response.Result.Withheld.Distinct())} with the controller logged on as that position",
+                    new
+                    {
+                        action = "commit_withheld",
+                        withheld = response.Result.Withheld.Distinct().ToArray(),
+                        claimed = response.Result.Claimed.ToArray(),
+                        own_callsign = Network.Me?.Callsign
+                    });
+            }
+
             if (response.Sync != null)
                 await ApplySyncGatedAsync(response.Sync);
             else

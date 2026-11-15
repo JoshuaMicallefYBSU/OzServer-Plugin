@@ -710,22 +710,47 @@ public class FdrSync
 
     void QueueLabelStateChanges()
     {
-        foreach (var fdr in FDP2.GetFDRs)
+        // Copied first and guarded throughout, like the two sweeps above: this runs on the flush
+        // timer's thread while vatSys adds and removes FDRs on its own, and an enumeration that
+        // collided with one threw straight out of FlushAsync - the whole batch (every position and
+        // authority update queued behind it) then waited another five seconds, each time it happened.
+        List<FDP2.FDR> fdrs;
+        try
         {
-            if (string.IsNullOrEmpty(fdr.Callsign) || !fdr.IsTrackedByMe || !fdr.ESTed || IsLabelStateHeld(fdr.Callsign))
-                continue;
+            fdrs = FDP2.GetFDRs.ToList();
+        }
+        catch (Exception)
+        {
+            return; // modified mid-copy; the next flush looks again
+        }
 
-            var track = MMI.FindTrack(fdr);
-            var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.NewCFL}\u001f{track?.CPrompt}";
-
-            lock (_lock)
+        foreach (var fdr in fdrs)
+        {
+            try
             {
-                if (_labelStateKeys.TryGetValue(fdr.Callsign, out var last) && last == key)
+                if (string.IsNullOrEmpty(fdr.Callsign) || !fdr.IsTrackedByMe || !fdr.ESTed || IsLabelStateHeld(fdr.Callsign))
                     continue;
-                _labelStateKeys[fdr.Callsign] = key;
-            }
 
-            Merge(BuildFdrDto(fdr, forceRoute: false));
+                var track = MMI.FindTrack(fdr);
+                var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.NewCFL}\u001f{track?.CPrompt}";
+
+                lock (_lock)
+                {
+                    if (_labelStateKeys.TryGetValue(fdr.Callsign, out var last) && last == key)
+                        continue;
+                }
+
+                Merge(BuildFdrDto(fdr, forceRoute: false));
+
+                // Recorded only once the update is queued, so a read that failed part-way is looked
+                // at again on the next flush rather than remembered as already sent.
+                lock (_lock)
+                    _labelStateKeys[fdr.Callsign] = key;
+            }
+            catch (Exception ex)
+            {
+                ErrorThrottle.Report("fdr-label-state", $"Couldn't read {fdr.Callsign}'s label state for OzServer: {ex.Message}", ex);
+            }
         }
     }
 
