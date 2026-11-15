@@ -41,6 +41,8 @@ public class Plugin : IPlugin
     readonly TagResumeRecovery _tagResumeRecovery;
     // Activates and positions, on reconnect, the flights OzServer still holds that vatSys has not.
     readonly FdrResumeActivation _fdrResumeActivation;
+    // Puts the tracking controller's "C" on everyone else's copy of the label - see LabelStateMirror.
+    readonly LabelStateMirror _labelStateMirror;
     // Couples an activated flight plan to the radar track carrying its callsign when vatSys will not.
     readonly CoupleAssist _coupleAssist = new();
     // Moves aircraft with their sector when one changes hands on OzServer.
@@ -107,6 +109,7 @@ public class Plugin : IPlugin
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
         _fdrResumeActivation = new FdrResumeActivation();
+        _labelStateMirror = new LabelStateMirror();
         // After the tracker, whose OwnershipChanged tells it a sector moved.
         _sectorTagHandoff = new SectorTagHandoff(_ownershipTracker, _fdrSync);
         // After the tracker, whose own open requests it reads alongside the window's staged set.
@@ -237,11 +240,14 @@ public class Plugin : IPlugin
         settingsMenuItem.Item.Click += (_, _) => OpenSettingsWindow();
         MMI.AddCustomMenuItem(settingsMenuItem);
 
+        // Under Tools, not Settings: switching OzServer off mid-session is something done to the
+        // running session, alongside vatSys's own on/off tools (Disable Filters, Disable GRIB
+        // Winds), not a setting. vatSys appends plugin Tools items at the bottom of that menu.
         _disableItem = new ToolStripMenuItem("Disable OzServer");
         _disableItem.Click += (_, _) => ConfirmDisable();
         MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
-            CustomToolStripMenuItemCategory.Settings,
+            CustomToolStripMenuItemCategory.Tools,
             _disableItem));
 
         _ozServerMenuItems.Add(sectorsMenuItem.Item);
@@ -277,12 +283,6 @@ public class Plugin : IPlugin
 
             settingsMenu.DropDownItems.Remove(settingsMenuItem.Item);
             settingsMenu.DropDownItems.Insert(insertAt + 1, settingsMenuItem.Item);
-
-            if (_disableItem != null)
-            {
-                settingsMenu.DropDownItems.Remove(_disableItem);
-                settingsMenu.DropDownItems.Insert(insertAt + 2, _disableItem);
-            }
 
             _builtInSectorsItem = sectorsItem;
 
@@ -423,7 +423,7 @@ public class Plugin : IPlugin
             _settingsMenuHeader.Checked = pending;
     }
 
-    // Settings > Disable OzServer. One-way for the session (see OzServerMode), so it asks first.
+    // Tools > Disable OzServer. One-way for the session (see OzServerMode), so it asks first.
     void ConfirmDisable()
     {
         if (OzServerMode.Disabled)

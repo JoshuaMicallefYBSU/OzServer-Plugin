@@ -406,8 +406,16 @@ public class SectorTagHandoff
         if (OzServerMode.Disabled)
             return;
 
+        // One handoff per aircraft for the whole change, however many of the lost sectors it sits in.
+        // Stacked sectors share their ground footprint, so an aircraft is "inside" every one of them:
+        // BLA losing SAN, SAS, SDN, SDS, SFE, SFW and SYC at once handed JST516 to SNO seven times.
+        // SNO's client accepted the first as the transfer it was expecting; the other six arrived
+        // after that and read as ordinary handoffs, each leaving the tag pending again from BLA -
+        // while BLA, holding SNO's acceptance of the first, already counted it as SNO's. Nobody was
+        // tracking it, and when the sectors went back SNO had nothing to hand over.
+        var handedOver = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var transfer in diff.Lost)
-            GiveAway(transfer);
+            GiveAway(transfer, handedOver);
 
         foreach (var transfer in diff.Gained)
         {
@@ -435,7 +443,9 @@ public class SectorTagHandoff
 
     // The losing half. Hands each aircraft this controller holds inside the lost sector to the
     // controller who now owns it.
-    void GiveAway(SectorTransfer transfer)
+    // handedOver: aircraft already handed off earlier in this same ownership change - see
+    // OnOwnershipChanged. Never handed a second time.
+    void GiveAway(SectorTransfer transfer, HashSet<string> handedOver)
     {
         if (OzServerMode.Disabled)
             return;
@@ -468,6 +478,16 @@ public class SectorTagHandoff
             // FdrSync uses to report a flight's sector, restricted here to the one sector involved.
             if (SectorLocator.Resolve(fdr, new[] { transfer.Sector }) == null)
                 continue;
+
+            // Handed over already - by another of the sectors lost in this same change, or by an
+            // earlier change whose handoff to this very controller is still in flight. A second
+            // handoff PDU re-opens the transfer on the receiving side after it has been accepted.
+            if (handedOver.Contains(fdr.Callsign)
+                || (fdr.HandoffSector != null && fdr.HandoffSector.Equals(toSector)))
+            {
+                handedOver.Add(fdr.Callsign);
+                continue;
+            }
 
             // See the class header for why this check exists: MMI.HandoffJurisdiction silently does
             // something else entirely - dropping the aircraft from network tracking rather than
@@ -535,6 +555,7 @@ public class SectorTagHandoff
             lock (_lock)
                 _confirming.Remove(fdr.Callsign);
 
+            handedOver.Add(fdr.Callsign);
             moved.Add(fdr.Callsign);
         }
 
@@ -850,6 +871,11 @@ public class SectorTagHandoff
         var beforeControllerTracking = fdr.ControllerTracking?.Callsign;
         var beforeControllingSector = fdr.ControllingSector?.Name;
 
+        // Before the accept: from the moment the tag is ours, FdrSync would report this client's own
+        // label - a CFL vatSys has just reset to new, nothing typed yet - over the previous
+        // controller's, before ApplyClearanceDataAsync has had the chance to read theirs back.
+        FdrSync.HoldLabelState(fdr.Callsign);
+
         MMI.AcceptJurisdiction(fdr);
 
         if (fdr.State != FDP2.FDR.FDRStates.STATE_CONTROLLED)
@@ -927,9 +953,14 @@ public class SectorTagHandoff
     // jurisdiction only ever moves who is tracking a tag - none of vatSys's own local FDR fields -
     // so without this the new controller's screen simply shows no CFL at all until they enter one
     // themselves, even though OzServer's own record of it survived the transfer intact.
+    //
+    // The rest of the label comes with it - scratchpad, global ops, whether the CFL is shown as new
+    // or acknowledged, and the C (see LabelStateRestore). Without the CFL colour in particular every
+    // transferred tag arrived green, because vatSys marks the CFL new whenever a tag enters a
+    // controller's jurisdiction, whatever the previous controller had acknowledged.
     async System.Threading.Tasks.Task ApplyClearanceDataAsync(FDP2.FDR fdr)
     {
-        OzServerFdrUpdateDto? flight;
+        OzServerFdrUpdateDto? flight = null;
 
         try
         {
@@ -938,43 +969,41 @@ public class SectorTagHandoff
         catch (Exception ex)
         {
             Errors.Add(new Exception($"Couldn't fetch clearance data for {fdr.Callsign}: {ex.Message}", ex), "OzServer");
-            return;
         }
 
-        if (flight == null)
-            return;
-
-        // Still ours - a tag handed off again, or dropped, in the time this round trip took is not
-        // something to write clearance data onto after the fact.
-        if (!fdr.IsTrackedByMe)
-            return;
-
-        var changed = false;
-
-        if (flight.CflLower is { } lower && fdr.CFLLower != lower)
+        RunOnUiThread(() =>
         {
-            fdr.CFLLower = lower;
-            changed = true;
-        }
+            try
+            {
+                // Still ours - a tag handed off again, or dropped, in the time this round trip took
+                // is not something to write the previous controller's label onto after the fact.
+                if (flight == null || !fdr.IsTrackedByMe)
+                    return;
 
-        if (flight.CflUpper is { } upper && fdr.CFLUpper != upper)
-        {
-            fdr.CFLUpper = upper;
-            changed = true;
-        }
+                var applied = LabelStateRestore.Apply(fdr, flight, replaceCfl: true);
+                if (applied == null)
+                    return;
 
-        if (!changed)
-            return;
-
-        ActionLog.Log("Tag", $"Applied clearance data to {fdr.Callsign} from OzServer (CFL {flight.CflLower?.ToString() ?? "-"}/{flight.CflUpper?.ToString() ?? "-"})", new
-        {
-            action = "handoff_cfl_applied",
-            fdr_callsign = fdr.Callsign,
-            cfl_lower = flight.CflLower,
-            cfl_upper = flight.CflUpper
+                ActionLog.Log("Tag", $"Applied {fdr.Callsign}'s label from OzServer after the transfer: {applied}", new
+                {
+                    action = "handoff_label_state_applied",
+                    fdr_callsign = fdr.Callsign,
+                    cfl_lower = flight.CflLower,
+                    cfl_upper = flight.CflUpper,
+                    label_op_data = flight.LabelOpData,
+                    global_op_data = flight.GlobalOpData,
+                    new_cfl = flight.NewCfl,
+                    c_prompt = flight.CPrompt
+                });
+            }
+            finally
+            {
+                // Always released, and always followed by a push: whatever was applied - or nothing,
+                // if the read failed - this controller now speaks for the label.
+                FdrSync.ReleaseLabelState(fdr.Callsign);
+                _fdrSync.PushNow(fdr);
+            }
         });
-
-        _fdrSync.PushNow(fdr);
     }
 
     object[] PendingTransferContext()

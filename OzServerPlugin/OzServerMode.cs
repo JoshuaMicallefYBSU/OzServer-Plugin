@@ -3,7 +3,7 @@ using System.Threading;
 
 namespace OzServerPlugin;
 
-// The session-wide "Disable OzServer" switch (Settings > Disable OzServer).
+// The session-wide "Disable OzServer" switch (Tools > Disable OzServer).
 //
 // OzServer is going into testing, and a controller who hits a problem needs to be able to take it out
 // of their session completely and carry on with plain vatSys. Once disabled, for the rest of the

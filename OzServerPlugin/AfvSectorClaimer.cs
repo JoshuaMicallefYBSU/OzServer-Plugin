@@ -345,7 +345,9 @@ public class AfvSectorClaimer
             if (frequency == null)
                 continue;
 
-            if (frequency.Transmit)
+            // Done only when both are on - a line showing Transmit without Receive is exactly the
+            // broken state the write below exists to avoid (see there), not a restored one.
+            if (frequency.Transmit && frequency.Receive)
             {
                 _transmitToRestore.Remove(name);
                 continue;
@@ -362,7 +364,13 @@ public class AfvSectorClaimer
             if (sector == null || !_tracker.IsMine(sector))
                 continue;
 
+            // Both flags, in the order vatSys's own Transmit button writes them (VSCSControlDX,
+            // VSCS_Button_Freq_Trans). AFV only builds transceivers for lines with Receive on
+            // (AFV.UpdateTransceivers: transmit is decided inside the Receive branch), and a line
+            // comes back from a reconnect Idle - so Transmit alone lit the button on the panel while
+            // nothing was actually keyed on AFV.
             frequency.Transmit = true;
+            frequency.Receive = true;
             _transmitToRestore.Remove(name);
 
             ActionLog.Log("Primary", $"Put transmit back on {sector.Name} after reconnecting", new

@@ -50,6 +50,10 @@ public class FdrSync
                     // The cleared level is merged as a unit too - see CopyNonNull.
                     && p.Name != nameof(OzServerFdrUpdateDto.CflLower)
                     && p.Name != nameof(OzServerFdrUpdateDto.CflUpper)
+                    && p.Name != nameof(OzServerFdrUpdateDto.LabelOpData)
+                    && p.Name != nameof(OzServerFdrUpdateDto.GlobalOpData)
+                    && p.Name != nameof(OzServerFdrUpdateDto.NewCfl)
+                    && p.Name != nameof(OzServerFdrUpdateDto.CPrompt)
                     && p.Name != nameof(OzServerFdrUpdateDto.ClearanceKnown))
         .ToArray();
 
@@ -84,6 +88,8 @@ public class FdrSync
                 _pending.Clear();
                 // A new session starts with nothing sent: every route goes out again.
                 _sentRouteKeys.Clear();
+                // Likewise every tag's label state, the first time it is seen tracked again.
+                _labelStateKeys.Clear();
             }
             Landed.Clear();
         };
@@ -680,6 +686,49 @@ public class FdrSync
         }
     }
 
+    // The label state last queued per tracked flight: scratchpad, global ops, and the two track flags
+    // (see OzServerFdrUpdateDto.NewCfl). The flags live on the Track and vatSys raises nothing when a
+    // middle click flips them, so no FDR update ever carries the change - it has to be looked for.
+    // Checked once per flush, for this controller's own tags only (the only ones it reports these
+    // for), and queued only when something actually moved.
+    readonly Dictionary<string, string> _labelStateKeys = new(StringComparer.OrdinalIgnoreCase);
+
+    // Tags whose label this client must not speak for yet: just accepted from another controller,
+    // with the previous controller's label still being read back (SectorTagHandoff.AcceptTransfer).
+    // Until released, a push for one leaves the whole label out, as a non-tracking client's would.
+    // Expires on its own so a read that never completes cannot silence a tag for good.
+    static readonly TimeSpan LabelHoldLimit = TimeSpan.FromSeconds(15);
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> LabelStateHeld =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public static void HoldLabelState(string callsign) => LabelStateHeld[callsign] = DateTime.UtcNow + LabelHoldLimit;
+
+    public static void ReleaseLabelState(string callsign) => LabelStateHeld.TryRemove(callsign, out _);
+
+    static bool IsLabelStateHeld(string? callsign) =>
+        !string.IsNullOrEmpty(callsign) && LabelStateHeld.TryGetValue(callsign!, out var until) && DateTime.UtcNow < until;
+
+    void QueueLabelStateChanges()
+    {
+        foreach (var fdr in FDP2.GetFDRs)
+        {
+            if (string.IsNullOrEmpty(fdr.Callsign) || !fdr.IsTrackedByMe || !fdr.ESTed || IsLabelStateHeld(fdr.Callsign))
+                continue;
+
+            var track = MMI.FindTrack(fdr);
+            var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.NewCFL}\u001f{track?.CPrompt}";
+
+            lock (_lock)
+            {
+                if (_labelStateKeys.TryGetValue(fdr.Callsign, out var last) && last == key)
+                    continue;
+                _labelStateKeys[fdr.Callsign] = key;
+            }
+
+            Merge(BuildFdrDto(fdr, forceRoute: false));
+        }
+    }
+
     async Task FlushAsync()
     {
         if (OzServerMode.Disabled)
@@ -702,6 +751,8 @@ public class FdrSync
                 SweepAuthorityFdrs();
             else if (_flushCount % FloatingEvery == 0)
                 FloatingSweep();
+
+            QueueLabelStateChanges();
 
             List<OzServerFdrUpdateDto> batch;
 
@@ -757,7 +808,15 @@ public class FdrSync
             CflUpper = fdr.CFLUpper > 0 ? fdr.CFLUpper : null,
             // Read straight off the FDR, so "no cleared level" here is a fact to report, not a gap
             // in what this push knows - see OzServerFdrUpdateDto.CflLower.
-            ClearanceKnown = true,
+            //
+            // But only from the controller tracking it. The cleared level is that controller's own
+            // entry; a client reporting an untracked aircraft on OzServer's behalf (the untracked
+            // rules, a stand-in for a dropped controller) holds whatever its own copy happens to
+            // say, which after a disconnect is usually nothing. Stated as "none", that erased the
+            // CFL a disconnected controller had set - JST516 came back to ML-BLA_CTR with no level
+            // because ML-SNO_CTR had reported it in the meantime. Left unstated, the backend keeps
+            // what the tracking controller last said.
+            ClearanceKnown = fdr.IsTrackedByMe && !IsLabelStateHeld(fdr.Callsign),
             AssignedSsrCode = fdr.AssignedSSRCode == -1 ? null : fdr.AssignedSSRCode,
             Atd = fdr.ATD == DateTime.MaxValue ? null : fdr.ATD,
             Etd = fdr.ETD == DateTime.MaxValue ? null : fdr.ETD,
@@ -765,9 +824,20 @@ public class FdrSync
             Tas = fdr.TAS > 0 ? fdr.TAS : null,
             TextOnly = fdr.TextOnly,
             ReceiveOnly = fdr.ReceiveOnly,
-            LabelOpData = NullIfEmpty(fdr.LabelOpData),
+            // "" rather than null - a cleared scratchpad is a fact the tracking controller states (see
+            // OzServerFdrUpdateDto.LabelOpData). Not sent at all from anyone else.
+            LabelOpData = fdr.LabelOpData ?? "",
+            GlobalOpData = fdr.GlobalOpData ?? "",
             Remarks = NullIfEmpty(fdr.Remarks),
         };
+
+        // The two label flags vatSys keeps on the track rather than the FDR - see
+        // OzServerFdrUpdateDto.NewCfl. Left unset with no track to read them from.
+        if (MMI.FindTrack(fdr) is { } track)
+        {
+            dto.NewCfl = track.NewCFL;
+            dto.CPrompt = track.CPrompt;
+        }
 
         FillAuthority(dto, fdr);
         FillPredictedPosition(dto, fdr);
@@ -969,6 +1039,13 @@ public class FdrSync
             target.ClearanceKnown = true;
             target.CflLower = source.CflLower;
             target.CflUpper = source.CflUpper;
+            target.LabelOpData = source.LabelOpData;
+            target.GlobalOpData = source.GlobalOpData;
+            // Null here means no track was read, not "off" - see BuildFdrDto.
+            if (source.NewCfl != null)
+                target.NewCfl = source.NewCfl;
+            if (source.CPrompt != null)
+                target.CPrompt = source.CPrompt;
         }
 
         foreach (var prop in MergeProperties)

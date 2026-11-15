@@ -57,6 +57,14 @@ public class TagResumeRecovery
     // So "waiting on vatSys" is logged once per resume rather than every two seconds.
     bool _waitLogged;
 
+    // The label state OzServer held for each resumed tag (CFL, scratchpad, global ops, CFL colour,
+    // C), read when the resume arrives - see FetchLabelStateAsync. _labelStateRead is false until
+    // that read has finished, and no tag is restored before it has. Guarded by _gate like the
+    // fields above.
+    readonly Dictionary<string, OzServerFdrUpdateDto> _labelState = new(StringComparer.OrdinalIgnoreCase);
+    bool _labelStateRead = true;
+    readonly OzServerApiClient _api = new();
+
     public TagResumeRecovery(OzServerOwnershipTracker tracker)
     {
         _tracker = tracker;
@@ -89,18 +97,90 @@ public class TagResumeRecovery
         if (OzServerMode.Disabled)
             return;
 
+        var wanted = callsigns.Where(c => !string.IsNullOrEmpty(c)).ToList();
+
         lock (_gate)
         {
             _pending.Clear();
-            foreach (var callsign in callsigns.Where(c => !string.IsNullOrEmpty(c)))
+            _labelState.Clear();
+            _labelStateRead = wanted.Count == 0;
+            foreach (var callsign in wanted)
                 _pending[callsign] = "no flight plan loaded";
 
             _deadline = DateTime.UtcNow + RetryWindow;
             _waitLogged = false;
         }
 
-        if (callsigns.Count > 0)
+        if (wanted.Count > 0)
+        {
+            _ = FetchLabelStateAsync(wanted);
             RunOnUiThread(Attempt);
+        }
+    }
+
+    // A restored tag comes back with a bare label. Every flight plan arrives fresh from the network
+    // after a reconnect: the CFL and the CFL colour and C are vatSys's own local state, and the
+    // scratchpad and global ops are only sent by whoever is tracking the tag - which, while this
+    // controller was away, nobody was. OzServer has all of it (FdrSync pushes it), so it is read from
+    // there.
+    //
+    // Read now, while the tag is still not ours, and finished before any tag is restored (Attempt
+    // waits on _labelStateRead): from the moment a tag is tracked by this controller FdrSync pushes
+    // it, and a push states the label outright - an empty scratchpad as "", no CFL as "none". A
+    // restore that beat this read would have its first push erase the very record it needs.
+    async System.Threading.Tasks.Task FetchLabelStateAsync(List<string> callsigns)
+    {
+        foreach (var callsign in callsigns)
+        {
+            try
+            {
+                var flight = await _api.GetFlightAsync(callsign);
+                if (flight == null)
+                    continue;
+
+                lock (_gate)
+                    _labelState[callsign] = flight;
+            }
+            catch (Exception ex)
+            {
+                ActionLog.Log("Tag", $"Couldn't read {callsign}'s label state for its restore: {ex.Message}");
+            }
+        }
+
+        // Released even when a read failed: a tag restored without its label is better than a tag
+        // not restored at all.
+        lock (_gate)
+            _labelStateRead = true;
+
+        RunOnUiThread(Attempt);
+    }
+
+    // Puts the stored label state onto a just-restored tag, once.
+    void ApplyLabelState(FDP2.FDR fdr)
+    {
+        OzServerFdrUpdateDto? stored;
+        lock (_gate)
+        {
+            if (!_labelState.TryGetValue(fdr.Callsign, out stored))
+                return;
+            _labelState.Remove(fdr.Callsign);
+        }
+
+        var applied = LabelStateRestore.Apply(fdr, stored, replaceCfl: false);
+        if (applied == null)
+            return;
+
+        ActionLog.Log("Tag", $"Put {fdr.Callsign}'s label back after reconnect: {applied}", new
+        {
+            action = "resume_label_state_applied",
+            fdr_callsign = fdr.Callsign,
+            cfl_lower = stored.CflLower,
+            cfl_upper = stored.CflUpper,
+            label_op_data = stored.LabelOpData,
+            global_op_data = stored.GlobalOpData,
+            new_cfl = stored.NewCfl,
+            c_prompt = stored.CPrompt
+        });
     }
 
     // One pass over everything still outstanding. Always on the UI thread: it changes FDR and track
@@ -112,6 +192,7 @@ public class TagResumeRecovery
 
         List<string> wanted;
         DateTime deadline;
+        bool labelStateRead;
         lock (_gate)
         {
             if (_pending.Count == 0)
@@ -119,6 +200,7 @@ public class TagResumeRecovery
 
             wanted = _pending.Keys.ToList();
             deadline = _deadline;
+            labelStateRead = _labelStateRead;
         }
 
         if (!Network.IsConnected)
@@ -169,6 +251,12 @@ public class TagResumeRecovery
                 continue;
             }
 
+            if (!labelStateRead)
+            {
+                waiting[fdr.Callsign] = "reading its label state from OzServer";
+                continue;
+            }
+
             // Resolved against what this controller actually holds right now. Null covers three
             // things that all clear up on their own: the sector grant has not reached MMI yet, there
             // is no radar return for the aircraft yet, or there is one without Mode C under two
@@ -184,6 +272,9 @@ public class TagResumeRecovery
             {
                 waiting.Remove(fdr.Callsign);
                 restored.Add(fdr.Callsign);
+                // Straight away, in the same pass: FdrSync's first push of the now-tracked tag
+                // must carry the label back, not an empty one - see FetchLabelStateAsync.
+                ApplyLabelState(fdr);
             }
             else
             {

@@ -29,7 +29,7 @@ OzServer flows back into vatSys and onto your VSCS panel automatically.
 | **ATIS** | Pushes vatSys's built-in ATIS and all four [ATISPlugin](https://github.com/badvectors/ATISPlugin) slots on change, refreshed every 20 minutes while on air. ATISPlugin broadcasts are also published to `/vatsim/atis` for the public map — live network only, never SweatBox. |
 | **Observers** | An observer claims nothing, but mirrors the airspace the watched controller currently holds on OzServer (`ObserverPositionMirror`). |
 | **FMP level filter** | On an `_FMP` position the level filter is set to 998–999, hiding non-jurisdiction labels; the previous filter is put back on leaving, unless you changed it by hand. |
-| **Disable switch** | **Settings → Disable OzServer** releases your sectors, stops all traffic to OzServer and all changes to vatSys, and restores vatSys's own Sectors window for the rest of the session. One-way until restart. |
+| **Disable switch** | **Tools → Disable OzServer** releases your sectors, stops all traffic to OzServer and all changes to vatSys, and restores vatSys's own Sectors window for the rest of the session. One-way until restart. |
 | **Network separation** | Live VATSIM, SweatBox-1 and SweatBox-2 are kept apart (`NetworkServer`); the backend scopes ownership, events and ATIS per server. |
 | **Log forwarding** | Non-API log lines are copied to OzServer (`ClientLogForwarder`) so a problem between two controllers can be read from both sides in one place. The local daily log is unchanged. |
 
@@ -48,12 +48,15 @@ endpoint and then re-reads it rather than guessing locally what the result must 
 vatSys also loads plugins from `<install dir>\bin\Plugins`, which applies to every profile but needs
 administrator rights to write to.
 
-The plugin's entries live under **Settings**, in place of the built-in *Sectors...* entry (which is
+The plugin's windows live under **Settings**, in place of the built-in *Sectors...* entry (which is
 hidden while OzServer runs, and comes back if it is disabled):
 
 - **Settings → OzServer Sectors**
 - **Settings → OzServer Settings**
-- **Settings → Disable OzServer**
+
+The off switch is under **Tools**, at the bottom, with vatSys's other session toggles:
+
+- **Tools → Disable OzServer**
 
 ### Staying up to date
 

@@ -231,6 +231,31 @@ public class OzServerFdrUpdateDto
     // Newtonsoft's conditional-serialisation convention: ShouldSerialize + the property's own name.
     public bool ShouldSerializeCflLower() => ClearanceKnown;
     public bool ShouldSerializeCflUpper() => ClearanceKnown;
+
+    // The rest of what the tracking controller has put on the label, under the same rule as the
+    // cleared level: stated by the controller tracking the tag (ClearanceKnown), and left out by
+    // anyone else, so a client reporting an untracked aircraft can never blank them. Empty text is
+    // sent as "" rather than null, so a scratchpad that has been cleared reads as cleared.
+    //
+    //   label_op_data   the scratchpad (FDR.LabelOpData)
+    //   global_op_data  global ops (FDR.GlobalOpData)
+    //   new_cfl         the CFL shown as new (green) or acknowledged (white) - Track.NewCFL, toggled
+    //                   by middle click. vatSys sets it back to new whenever a tag becomes this
+    //                   controller's, which is what a reconnect or sector change otherwise shows.
+    //   c_prompt        the "C" on the label - Track.CPrompt, also middle click. Purely local in
+    //                   vatSys: nothing on the network carries it to anyone else.
+    //
+    // vatSys does share the scratchpad and global ops between controllers itself, but only from
+    // whoever is tracking the tag at the time - after a reconnect nobody is, and both come back empty.
+    [JsonProperty("label_op_data")] public string? LabelOpData { get; set; }
+    [JsonProperty("global_op_data")] public string? GlobalOpData { get; set; }
+    [JsonProperty("new_cfl")] public bool? NewCfl { get; set; }
+    [JsonProperty("c_prompt")] public bool? CPrompt { get; set; }
+    public bool ShouldSerializeLabelOpData() => ClearanceKnown;
+    public bool ShouldSerializeGlobalOpData() => ClearanceKnown;
+    // Null when there was no track to read them from - left out, not stated as "off".
+    public bool ShouldSerializeNewCfl() => ClearanceKnown && NewCfl != null;
+    public bool ShouldSerializeCPrompt() => ClearanceKnown && CPrompt != null;
     [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
     [JsonProperty("atd")] public DateTime? Atd { get; set; }
     [JsonProperty("etd")] public DateTime? Etd { get; set; }
@@ -238,7 +263,6 @@ public class OzServerFdrUpdateDto
     [JsonProperty("tas")] public int? Tas { get; set; }
     [JsonProperty("text_only")] public bool? TextOnly { get; set; }
     [JsonProperty("receive_only")] public bool? ReceiveOnly { get; set; }
-    [JsonProperty("label_op_data")] public string? LabelOpData { get; set; }
     [JsonProperty("remarks")] public string? Remarks { get; set; }
 
     [JsonProperty("lat")] public double? Lat { get; set; }
