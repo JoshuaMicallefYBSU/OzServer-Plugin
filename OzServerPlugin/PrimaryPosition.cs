@@ -303,10 +303,14 @@ public static class PrimaryPosition
         sectors.Any(sector => AwaitingValidationFor(sector, ownCallsign));
 
     // Every sector in the position of another controller who is online, with their callsign.
+    //
+    // Their position as it stands this session, less the cover a controller below them is logged
+    // on for: Melbourne Approach's group lists MAW, but with Avalon Approach online MAW is
+    // Avalon's, and counting it as Melbourne's would leave Avalon's own tags in it unrestored.
     public static List<(SectorsVolumes.Sector Sector, string Callsign)> StaffedByOthers(string? ownCallsign) =>
         OnlineRealAtcs()
             .Where(atc => !string.Equals(atc.Callsign, ownCallsign, StringComparison.OrdinalIgnoreCase))
-            .SelectMany(atc => DefaultSectorsFor(atc.Callsign).Select(sector => (Sector: sector, Callsign: atc.Callsign)))
+            .SelectMany(atc => DefaultSectorsForCurrentSession(atc.Callsign).Select(sector => (Sector: sector, Callsign: atc.Callsign)))
             .ToList();
 
     // A callsign of the form vatSys's IsRealATC accepts as a controller position.

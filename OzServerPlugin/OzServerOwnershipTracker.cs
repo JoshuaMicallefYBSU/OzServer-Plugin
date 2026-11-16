@@ -448,14 +448,15 @@ public class OzServerOwnershipTracker
     }
 
     // Whether another controller is online whose position includes this sector - logged on as it,
-    // or as the primary of a group it belongs to (ML_APP for MAE, MDN, MDS, MAV and MAW).
+    // or as the primary of a group it belongs to (ML_APP for MAE, MDN, MDS, MAV and MAW). Their
+    // position as it stands this session - see PrimaryPosition.StaffedByOthers.
     static bool IsStaffedByOtherController(SectorsVolumes.Sector sector)
     {
         var me = Network.Me?.Callsign;
         return PrimaryPosition.OnlineRealAtcs()
             .Where(atc => !string.Equals(atc.Callsign, me, StringComparison.OrdinalIgnoreCase))
             .Any(atc => string.Equals(atc.Callsign, sector.Callsign, StringComparison.OrdinalIgnoreCase)
-                        || PrimaryPosition.DefaultSectorsFor(atc.Callsign).Any(s => s.Equals(sector)));
+                        || PrimaryPosition.DefaultSectorsForCurrentSession(atc.Callsign).Any(s => s.Equals(sector)));
     }
 
     // Names this client has just asked the backend to release, excused from RestoreOwnedToMmi
