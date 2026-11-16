@@ -9,10 +9,9 @@ using vatsys;
 namespace OzServerPlugin;
 
 // What the tracking controller has put on a tag's label, beyond the flight plan itself: the cleared
-// level, the scratchpad, global ops, whether the CFL is shown as new (green) or acknowledged
-// (white), and the "C". See OzServerFdrUpdateDto.LabelOpData for what each one is and why vatSys
-// loses it - in short, the CFL and the two track flags are local to vatSys, and the scratchpad and
-// global ops are only shared by whoever is tracking the tag at the time.
+// level, the scratchpad, global ops, and the "C". See OzServerFdrUpdateDto.LabelOpData for what
+// each one is and why vatSys loses it - in short, the CFL and the C are local to vatSys, and the
+// scratchpad and global ops are only shared by whoever is tracking the tag at the time.
 //
 // FdrSync pushes all of it from the tracking controller's client. This puts it back onto a tag that
 // has just become this controller's, by reconnect (TagResumeRecovery) or by sector change
@@ -65,26 +64,14 @@ public static class LabelStateRestore
             applied.Add($"global ops \"{stored.GlobalOpData}\"");
         }
 
-        // After the tag has become this controller's, not before: vatSys sets NewCFL back to true
-        // as a track enters Jurisdiction (MMI.SetTrackState), so set any earlier it would simply be
-        // overwritten by the acceptance itself.
-        if (MMI.FindTrack(fdr) is { } track)
+        // The CFL's colour (Track.NewCFL, new or acknowledged) is deliberately not carried: vatSys
+        // marks the CFL new again whenever a track enters Jurisdiction, at a moment a restore cannot
+        // reliably get behind, so it is left as vatSys shows it.
+        if (MMI.FindTrack(fdr) is { } track && stored.CPrompt is { } cPrompt && track.CPrompt != cPrompt)
         {
-            var flagsChanged = false;
-            if (stored.NewCfl is { } newCfl && track.NewCFL != newCfl)
-            {
-                track.NewCFL = newCfl;
-                flagsChanged = true;
-                applied.Add(newCfl ? "CFL as new" : "CFL as acknowledged");
-            }
-            if (stored.CPrompt is { } cPrompt && track.CPrompt != cPrompt)
-            {
-                track.CPrompt = cPrompt;
-                flagsChanged = true;
-                applied.Add(cPrompt ? "C on" : "C off");
-            }
-            if (flagsChanged)
-                MMI.RequestRedraw();
+            track.CPrompt = cPrompt;
+            applied.Add(cPrompt ? "C on" : "C off");
+            MMI.RequestRedraw();
         }
 
         return applied.Count > 0 ? string.Join(", ", applied) : null;

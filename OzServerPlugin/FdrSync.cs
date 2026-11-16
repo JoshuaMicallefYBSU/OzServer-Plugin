@@ -52,7 +52,6 @@ public class FdrSync
                     && p.Name != nameof(OzServerFdrUpdateDto.CflUpper)
                     && p.Name != nameof(OzServerFdrUpdateDto.LabelOpData)
                     && p.Name != nameof(OzServerFdrUpdateDto.GlobalOpData)
-                    && p.Name != nameof(OzServerFdrUpdateDto.NewCfl)
                     && p.Name != nameof(OzServerFdrUpdateDto.CPrompt)
                     && p.Name != nameof(OzServerFdrUpdateDto.ClearanceKnown))
         .ToArray();
@@ -686,9 +685,9 @@ public class FdrSync
         }
     }
 
-    // The label state last queued per tracked flight: scratchpad, global ops, and the two track flags
-    // (see OzServerFdrUpdateDto.NewCfl). The flags live on the Track and vatSys raises nothing when a
-    // middle click flips them, so no FDR update ever carries the change - it has to be looked for.
+    // The label state last queued per tracked flight: scratchpad, global ops, and the "C"
+    // (see OzServerFdrUpdateDto.CPrompt). The C lives on the Track and vatSys raises nothing when a
+    // middle click flips it, so no FDR update ever carries the change - it has to be looked for.
     // Checked once per flush, for this controller's own tags only (the only ones it reports these
     // for), and queued only when something actually moved.
     readonly Dictionary<string, string> _labelStateKeys = new(StringComparer.OrdinalIgnoreCase);
@@ -732,7 +731,7 @@ public class FdrSync
                     continue;
 
                 var track = MMI.FindTrack(fdr);
-                var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.NewCFL}\u001f{track?.CPrompt}";
+                var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.CPrompt}";
 
                 lock (_lock)
                 {
@@ -856,13 +855,10 @@ public class FdrSync
             Remarks = NullIfEmpty(fdr.Remarks),
         };
 
-        // The two label flags vatSys keeps on the track rather than the FDR - see
-        // OzServerFdrUpdateDto.NewCfl. Left unset with no track to read them from.
+        // The "C", which vatSys keeps on the track rather than the FDR - see
+        // OzServerFdrUpdateDto.CPrompt. Left unset with no track to read it from.
         if (MMI.FindTrack(fdr) is { } track)
-        {
-            dto.NewCfl = track.NewCFL;
             dto.CPrompt = track.CPrompt;
-        }
 
         FillAuthority(dto, fdr);
         FillPredictedPosition(dto, fdr);
@@ -911,12 +907,34 @@ public class FdrSync
             if (i <= overflown)
                 nextIndex = points.Count + 1;
 
-            points.Add(new OzServerRoutePointDto
+            var point = new OzServerRoutePointDto
             {
                 Name = segment.Intersection.Name ?? "",
                 Lat = Math.Round(segment.Intersection.LatLong.Latitude, 4),
                 Lon = Math.Round(segment.Intersection.LatLong.Longitude, 4)
-            });
+            };
+
+            // A sector crossing, not a waypoint: vatSys inserts a ZPOINT segment wherever the
+            // predicted trajectory enters a volume (FDP2.CalculateAffectedSectors), named "Z" + the
+            // volume's name - ZMUN, ZMLTWR, ZYTCUZONE - with the volume itself in Tag. Told apart by
+            // the segment type, never the name: a volume can be called anything. The sector is
+            // vatSys's own answer for that volume (SectorsVolumes.FindSector), the same lookup its
+            // handoff window uses to pick the next sector.
+            if (segment.Type == FDP2.FDR.ExtractedRoute.Segment.SegmentTypes.ZPOINT)
+            {
+                point.Crossing = true;
+                if (segment.Tag is SectorsVolumes.Volume volume)
+                {
+                    point.Volume = volume.Name;
+                    if (SectorsVolumes.FindSector(volume) is { } sector)
+                    {
+                        point.Sector = sector.Name;
+                        point.SectorCallsign = sector.Callsign;
+                    }
+                }
+            }
+
+            points.Add(point);
         }
 
         if (points.Count < 2)
@@ -924,7 +942,7 @@ public class FdrSync
 
         dto.RouteNextIndex = Math.Min(nextIndex, points.Count - 1);
 
-        var key = string.Join(";", points.Select(p => $"{p.Name},{p.Lat},{p.Lon}"));
+        var key = string.Join(";", points.Select(p => $"{p.Name},{p.Lat},{p.Lon},{p.Sector}"));
         lock (_lock)
         {
             if (!force && _sentRouteKeys.TryGetValue(fdr.Callsign, out var sent) && sent == key)
@@ -1067,8 +1085,6 @@ public class FdrSync
             target.LabelOpData = source.LabelOpData;
             target.GlobalOpData = source.GlobalOpData;
             // Null here means no track was read, not "off" - see BuildFdrDto.
-            if (source.NewCfl != null)
-                target.NewCfl = source.NewCfl;
             if (source.CPrompt != null)
                 target.CPrompt = source.CPrompt;
         }

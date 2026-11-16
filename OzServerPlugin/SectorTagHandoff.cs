@@ -954,10 +954,9 @@ public class SectorTagHandoff
     // so without this the new controller's screen simply shows no CFL at all until they enter one
     // themselves, even though OzServer's own record of it survived the transfer intact.
     //
-    // The rest of the label comes with it - scratchpad, global ops, whether the CFL is shown as new
-    // or acknowledged, and the C (see LabelStateRestore). Without the CFL colour in particular every
-    // transferred tag arrived green, because vatSys marks the CFL new whenever a tag enters a
-    // controller's jurisdiction, whatever the previous controller had acknowledged.
+    // The rest of the label comes with it - scratchpad, global ops and the C (see
+    // LabelStateRestore). The CFL's colour does not: vatSys marks the CFL new whenever a tag enters
+    // a controller's jurisdiction, and that is left as it is.
     async System.Threading.Tasks.Task ApplyClearanceDataAsync(FDP2.FDR fdr)
     {
         OzServerFdrUpdateDto? flight = null;
@@ -992,7 +991,6 @@ public class SectorTagHandoff
                     cfl_upper = flight.CflUpper,
                     label_op_data = flight.LabelOpData,
                     global_op_data = flight.GlobalOpData,
-                    new_cfl = flight.NewCfl,
                     c_prompt = flight.CPrompt
                 });
             }

@@ -244,22 +244,17 @@ public class OzServerFdrUpdateDto
     //
     //   label_op_data   the scratchpad (FDR.LabelOpData)
     //   global_op_data  global ops (FDR.GlobalOpData)
-    //   new_cfl         the CFL shown as new (green) or acknowledged (white) - Track.NewCFL, toggled
-    //                   by middle click. vatSys sets it back to new whenever a tag becomes this
-    //                   controller's, which is what a reconnect or sector change otherwise shows.
-    //   c_prompt        the "C" on the label - Track.CPrompt, also middle click. Purely local in
+    //   c_prompt        the "C" on the label - Track.CPrompt, toggled by middle click. Purely local in
     //                   vatSys: nothing on the network carries it to anyone else.
     //
     // vatSys does share the scratchpad and global ops between controllers itself, but only from
     // whoever is tracking the tag at the time - after a reconnect nobody is, and both come back empty.
     [JsonProperty("label_op_data")] public string? LabelOpData { get; set; }
     [JsonProperty("global_op_data")] public string? GlobalOpData { get; set; }
-    [JsonProperty("new_cfl")] public bool? NewCfl { get; set; }
     [JsonProperty("c_prompt")] public bool? CPrompt { get; set; }
     public bool ShouldSerializeLabelOpData() => ClearanceKnown;
     public bool ShouldSerializeGlobalOpData() => ClearanceKnown;
-    // Null when there was no track to read them from - left out, not stated as "off".
-    public bool ShouldSerializeNewCfl() => ClearanceKnown && NewCfl != null;
+    // Null when there was no track to read it from - left out, not stated as "off".
     public bool ShouldSerializeCPrompt() => ClearanceKnown && CPrompt != null;
     [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
     [JsonProperty("atd")] public DateTime? Atd { get; set; }
@@ -332,6 +327,22 @@ public class OzServerRoutePointDto
     [JsonProperty("n")] public string Name { get; set; } = "";
     [JsonProperty("lat")] public double Lat { get; set; }
     [JsonProperty("lon")] public double Lon { get; set; }
+
+    // Set only on a sector crossing (a vatSys ZPOINT - see FdrSync.FillRoute), left out of every
+    // ordinary waypoint:
+    //   z   true: this is where the route enters a volume, not a waypoint on the route
+    //   v   the volume entered (n is "Z" + this)
+    //   s   the vatSys sector that volume belongs to (Sector.Name, as the handoff window shows it)
+    //   sc  that sector's callsign
+    // s and sc are absent for a volume no sector in the profile contains.
+    [JsonProperty("z")] public bool Crossing { get; set; }
+    [JsonProperty("v")] public string? Volume { get; set; }
+    [JsonProperty("s")] public string? Sector { get; set; }
+    [JsonProperty("sc")] public string? SectorCallsign { get; set; }
+    public bool ShouldSerializeCrossing() => Crossing;
+    public bool ShouldSerializeVolume() => Volume != null;
+    public bool ShouldSerializeSector() => Sector != null;
+    public bool ShouldSerializeSectorCallsign() => SectorCallsign != null;
 }
 
 // AtisController::update (backend) - upserts one airport's current ATIS. Sent by AtisSync only when

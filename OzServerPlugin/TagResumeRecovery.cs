@@ -57,8 +57,8 @@ public class TagResumeRecovery
     // So "waiting on vatSys" is logged once per resume rather than every two seconds.
     bool _waitLogged;
 
-    // The label state OzServer held for each resumed tag (CFL, scratchpad, global ops, CFL colour,
-    // C), read when the resume arrives - see FetchLabelStateAsync. _labelStateRead is false until
+    // The label state OzServer held for each resumed tag (CFL, scratchpad, global ops, C),
+    // read when the resume arrives - see FetchLabelStateAsync. _labelStateRead is false until
     // that read has finished, and no tag is restored before it has. Guarded by _gate like the
     // fields above.
     readonly Dictionary<string, OzServerFdrUpdateDto> _labelState = new(StringComparer.OrdinalIgnoreCase);
@@ -119,7 +119,7 @@ public class TagResumeRecovery
     }
 
     // A restored tag comes back with a bare label. Every flight plan arrives fresh from the network
-    // after a reconnect: the CFL and the CFL colour and C are vatSys's own local state, and the
+    // after a reconnect: the CFL and the C are vatSys's own local state, and the
     // scratchpad and global ops are only sent by whoever is tracking the tag - which, while this
     // controller was away, nobody was. OzServer has all of it (FdrSync pushes it), so it is read from
     // there.
@@ -178,7 +178,6 @@ public class TagResumeRecovery
             cfl_upper = stored.CflUpper,
             label_op_data = stored.LabelOpData,
             global_op_data = stored.GlobalOpData,
-            new_cfl = stored.NewCfl,
             c_prompt = stored.CPrompt
         });
     }
