@@ -90,14 +90,13 @@ Once loaded, the plugin adds:
 
 ## Updates
 
-You only install the plugin once. After that it keeps itself up to date: it checks two minutes
-after vatSys starts and every six hours afterwards.
+You only install the plugin once. After that it keeps itself up to date: it checks as soon as
+vatSys opens and every six hours afterwards.
 
 An update never disturbs a running session. It is downloaded, verified, and put in place for the
-**next vatSys start**. When one has been installed you will see a single line in the vatSys Errors
-window:
-
-> `OzServer: An update (0.1.9) was detected and installed. It will be loaded at the next vatSys launch.`
+**next vatSys start**. When one has been installed an **OzServer update** window tells you a new
+version has been found and recommends you update, which is closing and reopening vatSys. Because
+the check runs as vatSys opens, that is usually before you have connected.
 
 If a new version ever fails to load, the previous one is still beside it as
 `OzServerPlugin.dll.backup` — close vatSys, delete `OzServerPlugin.dll`, and rename the backup

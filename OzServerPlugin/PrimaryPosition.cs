@@ -66,15 +66,34 @@ public static class PrimaryPosition
 
         var online = OnlineRealAtcs();
 
+        // This session is online too, but vatSys's list holds only the other controllers. Working
+        // out somebody else's position without it gave them the member this controller is logged
+        // on as: from ML_APP's own client Benalla's position still held MAE, so a reconnecting
+        // ML_APP left every tag in MAE alone as "Benalla's" (TagResumeRecovery).
+        var me = OwnControllerCallsign(callsign);
+
         return group
             // Someone else logged on directly as a member keeps it. A member sharing the callsign
             // being computed is always kept: members often carry their primary's callsign, and the
             // controller logging on is online under it themselves, so an unqualified "is anyone
             // online as this" check would strip them of their own group.
             .Where(member => string.Equals(member.Callsign, callsign, StringComparison.OrdinalIgnoreCase)
-                             || !online.Any(atc => string.Equals(atc.Callsign, member.Callsign,
-                                                                 StringComparison.OrdinalIgnoreCase)))
+                             || !(online.Any(atc => string.Equals(atc.Callsign, member.Callsign,
+                                                                  StringComparison.OrdinalIgnoreCase))
+                                  || string.Equals(member.Callsign, me, StringComparison.OrdinalIgnoreCase)))
             .ToList();
+    }
+
+    // This session's callsign when it is a controller's and is not the one a position is being
+    // worked out for - the case where this session has to be counted among the controllers online,
+    // since vatSys's list leaves it out. Null otherwise.
+    static string? OwnControllerCallsign(string? computingFor)
+    {
+        var me = Network.Me?.Callsign;
+        return Network.IsConnected && IsControllerCallsign(me)
+               && !string.Equals(me, computingFor, StringComparison.OrdinalIgnoreCase)
+            ? me
+            : null;
     }
 
     // The sectors this session should hold right now: DefaultSectorsFor, less any top-down cover
@@ -170,12 +189,22 @@ public static class PrimaryPosition
         var claimable = new HashSet<string>(CoveredBy(sector).Select(c => c.Name), StringComparer.OrdinalIgnoreCase);
         var staffed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var atc in onlineAtcs.Where(a => a.IsRealATC && !string.IsNullOrEmpty(a.Callsign)))
+        // CountsAsController, not IsRealATC alone: that dropped a controller vatSys had validated
+        // but not yet heard a position update from, which is the moment a claim made on logging on
+        // most needs them counted (see OnlineRealAtcs).
+        var staffing = onlineAtcs.Where(CountsAsController).Select(a => a.Callsign).ToList();
+
+        // And this session, when the position being worked out is somebody else's: what this
+        // controller holds by position is not theirs either (see DefaultSectorsFor).
+        if (OwnControllerCallsign(ownCallsign) is { } me)
+            staffing.Add(me);
+
+        foreach (var callsign in staffing)
         {
-            if (string.Equals(atc.Callsign, ownCallsign, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(callsign, ownCallsign, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            foreach (var theirs in DefaultSectorsFor(atc.Callsign))
+            foreach (var theirs in DefaultSectorsFor(callsign))
             {
                 if (claimable.Contains(theirs.Name))
                     staffed.Add(theirs.Name);
@@ -266,8 +295,13 @@ public static class PrimaryPosition
     // holding ML_APP's MAE group on OzServer for those seconds after logging on.
     public static List<NetworkATC> OnlineRealAtcs() =>
         (Network.GetOnlineATCs ?? new List<NetworkATC>())
-        .Where(a => !string.IsNullOrEmpty(a.Callsign) && (a.IsRealATC || (a.ValidATC && IsControllerCallsign(a.Callsign))))
+        .Where(CountsAsController)
         .ToList();
+
+    // The one test for "a controller who staffs sectors", so no caller applies a narrower one.
+    static bool CountsAsController(NetworkATC atc) =>
+        atc != null && !string.IsNullOrEmpty(atc.Callsign)
+        && (atc.IsRealATC || (atc.ValidATC && IsControllerCallsign(atc.Callsign)));
 
     static readonly System.Text.RegularExpressions.Regex ControllerCallsign =
         new(@"\w_(FSS|CTR|APP|DEP|TWR|GND|DEL|RMP|TMU|FMP|RDO)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);

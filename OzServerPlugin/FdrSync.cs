@@ -1198,6 +1198,11 @@ public class FdrSync
         if (GroundReturn(fdr) is { } ground)
         {
             FillPosition(dto, ground);
+            // Stated, not left to the track's own flag: vatSys works that out from terrain height
+            // for an uncoupled return, and one read as airborne would have every other client
+            // place this flight on its route as departed (FdrResumeActivation.FloatAt).
+            if (fdr.ATD == DateTime.MaxValue)
+                dto.OnGround = true;
             return;
         }
 

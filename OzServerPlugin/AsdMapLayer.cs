@@ -55,6 +55,10 @@ public sealed class AsdMapLayer
     readonly object _lock = new();
 
     List<List<Coordinate>> _polygons = new();
+    // Shapes set but not yet on the pool - an apply that found the maps reloading, or failed part
+    // way. Reassert applies them; without this they waited for the next change of shape, which
+    // SetPolygons no longer passes on when the shapes are the same.
+    bool _polygonsPending;
     DisplayMaps.Map? _map;
     DisplayMaps.Map.BasePolygon[]? _pool;
 
@@ -94,6 +98,7 @@ public sealed class AsdMapLayer
             if (SameShapes(_polygons, next))
                 return;
             _polygons = next;
+            _polygonsPending = true;
         }
 
         RunOnUiThread(ApplyNow);
@@ -166,8 +171,11 @@ public sealed class AsdMapLayer
         try
         {
             var changed = EnsureMap();
-            if (changed)
+            if (changed || PolygonsPending())
+            {
                 ApplyPolygons();
+                changed = true;
+            }
             changed |= EnsureVisible();
             if (changed)
                 MMI.RequestRedraw(true, false, false);
@@ -178,6 +186,12 @@ public sealed class AsdMapLayer
             // change, it stops drawing rather than taking the plugin or the scope with it.
             ActionLog.Log("MapLayer", $"{_mapName}: {ex.Message}");
         }
+    }
+
+    bool PolygonsPending()
+    {
+        lock (_lock)
+            return _polygonsPending;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -274,7 +288,10 @@ public sealed class AsdMapLayer
 
         List<List<Coordinate>> polygons;
         lock (_lock)
+        {
             polygons = _polygons;
+            _polygonsPending = false;
+        }
 
         // Reference swaps only, never Points.Clear() or AddRange - see MutationSafety.
         for (var i = 0; i < pool.Length; i++)

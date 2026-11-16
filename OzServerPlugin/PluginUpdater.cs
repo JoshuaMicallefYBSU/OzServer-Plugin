@@ -54,11 +54,24 @@ public class PluginUpdater
     // Far above any real build (about 300 KB), and a bound on what a bad response can make us buffer.
     const long MaxDownloadBytes = 20 * 1024 * 1024;
 
-    // Clear of vatSys's own startup, when a controller is waiting on the radar to come up.
-    static readonly TimeSpan StartupDelay = TimeSpan.FromMinutes(2);
+    // Straight after vatSys opens. The check itself runs off the UI thread and costs the scope
+    // nothing; what matters is that a controller hears about a new version before they connect,
+    // while restarting is still free. It used to wait two minutes, by which time they were
+    // controlling - and stayed on the old build for the whole session (NW_APP and ML-SNO_CTR ran
+    // 0.1.9 for hours on 16 Nov, after 0.2.1 had fixed the freezes they were reporting).
+    static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(3);
     // Catches a release published during a long session.
     static readonly TimeSpan CheckInterval = TimeSpan.FromHours(6);
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+    // A check that could not reach either source is tried again this soon, this many times, before
+    // it is left to CheckInterval. Checking this early in startup can beat the PC's own network.
+    static readonly TimeSpan RetryDelay = TimeSpan.FromMinutes(2);
+    const int MaxRetries = 3;
+    int _retries;
+
+    // How long the update notice waits for vatSys's main window before falling back to the Errors
+    // window: the check can finish while vatSys is still starting.
+    static readonly TimeSpan NoticeWait = TimeSpan.FromSeconds(60);
 
     // Held for the plugin's lifetime: vatSys gives a plugin no shutdown hook to dispose it in.
     readonly Timer _timer;
@@ -115,13 +128,7 @@ public class PluginUpdater
 
             ActionLog.Log("Update", $"Updated to {release.Version}; it will be used the next time vatSys starts.");
 
-            // Not an error, but the Errors window is the only notification surface vatSys gives a
-            // plugin. It is shown without taking focus and marshals to the UI thread itself, so it
-            // is safe to call from this timer thread. vatSys prefixes the source, so the line reads
-            // "OzServer: An update ...". An OzServerNotice, so it is not reported as a failure.
-            Errors.Add(
-                new OzServerNotice($"An update ({release.Version}) was detected and installed. It will be loaded at the next vatSys launch."),
-                "OzServer");
+            await AnnounceAsync(release.Version, current).ConfigureAwait(false);
         }
         // OperationCanceledException covers the TaskCanceledException HttpClient raises on timeout.
         catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
@@ -129,6 +136,9 @@ public class PluginUpdater
             // Offline, or the source is unavailable. The installed version keeps working and the
             // next check retries, so this goes to the log rather than in front of the controller.
             ActionLog.Log("Update", $"Couldn't check for an update: {ex.Message}");
+
+            if (Interlocked.Increment(ref _retries) <= MaxRetries)
+                _timer.Change(RetryDelay, CheckInterval);
         }
         catch (Exception ex)
         {
@@ -136,6 +146,59 @@ public class PluginUpdater
             Errors.Add(new Exception($"Couldn't check for a plugin update: {ex.Message}", ex), "OzServer");
         }
     }
+
+    // Tells the controller a new version has been found, in a window of its own, and recommends
+    // they update - which is restarting vatSys, since the new DLL is already in place and the
+    // running session cannot swap itself. A window rather than a line in the Errors window, which
+    // read as one more error and was left unread for whole sessions.
+    //
+    // Called from the timer thread, possibly while vatSys is still starting, so it waits for the
+    // main window before posting to it. If that never appears the Errors window is used after all.
+    static async Task AnnounceAsync(Version installed, Version? running)
+    {
+        var message = $"A new version of OzServer has been found: {Display(installed)}."
+                      + (running != null ? $" You are running {Display(running)}." : "")
+                      + Environment.NewLine + Environment.NewLine
+                      + "It is recommended you update. The new version is already downloaded and loads the next time vatSys starts, so "
+                      + (Network.IsConnected
+                          ? "restart vatSys as soon as it is convenient."
+                          : "close and reopen vatSys now, before you connect.");
+
+        var waitedUntil = DateTime.UtcNow + NoticeWait;
+        while (DateTime.UtcNow < waitedUntil)
+        {
+            try
+            {
+                if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form { IsHandleCreated: true, IsDisposed: false } mainForm)
+                {
+                    mainForm.BeginInvoke(UiThread.Guard(() =>
+                    {
+                        var notice = new SectorNoticeWindow(message, "OzServer update");
+                        notice.Show(mainForm);
+                        notice.BringToFront();
+                    }));
+                    return;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // vatSys was opening or closing a window as the list was read, or the main window
+                // went away between the check and the post; look again.
+            }
+
+            await Task.Delay(500).ConfigureAwait(false);
+        }
+
+        // vatSys prefixes the source, so the line reads "OzServer: A new version ...". An
+        // OzServerNotice, so it is not reported as a failure.
+        Errors.Add(
+            new OzServerNotice($"A new version ({Display(installed)}) was found and installed. It is recommended you restart vatSys to update."),
+            "OzServer");
+    }
+
+    // "v0.2.3" - the assembly's fourth part is dropped when it is unset or zero.
+    static string Display(Version version) =>
+        "v" + (version.Revision > 0 || version.Build < 0 ? version.ToString() : version.ToString(3));
 
     // OzServer's answer if it gives one, GitHub's otherwise. Null when there is no release to offer.
     static async Task<Release?> FindReleaseAsync()

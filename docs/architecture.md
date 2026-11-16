@@ -170,7 +170,7 @@ All under `{BaseUrl}/api/v1`. Every call carries `controller_cid`, `controller_c
 | Event stream reconnect | 2 s, backing off to 30 s |
 | HTTP timeout | 20 s; 6 s for the ownership sync |
 | Concurrent HTTP connections | 8 |
-| Update check | 2 min after start, then every 6 h, with a 30 s timeout |
+| Update check | 3 s after start, then every 6 h, with a 30 s timeout; retried after 2 min (up to 3 times) if neither source can be reached |
 
 ## Self-update
 

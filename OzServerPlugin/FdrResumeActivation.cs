@@ -344,7 +344,13 @@ public class FdrResumeActivation
                 // log on is theirs, taken straight into jurisdiction like a reconnect's own tags
                 // (no flashing offer). One that comes into view later in the session is crossing
                 // airspace, and is only activated: it reaches this controller by handoff.
-                if (inMine != null && connectPass && Network.ValidATC && !OwnedElsewhere(record)
+                //
+                // Nor one that has not departed. Activated flights still on the ground are on
+                // OzServer too (FdrSync.GroundReturn), and logging on must not take jurisdiction of
+                // every aircraft at the gate: vatSys gives a departure to its controller when it
+                // departs.
+                var departed = fdr.ATD != DateTime.MaxValue;
+                if (inMine != null && connectPass && departed && Network.ValidATC && !OwnedElsewhere(record)
                     && TagResumeRecovery.TryTakeJurisdiction(fdr, inMine))
                 {
                     offered.Add($"{record.Callsign} ({inMine.Name})");
