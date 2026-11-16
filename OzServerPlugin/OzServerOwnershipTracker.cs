@@ -205,6 +205,15 @@ public class OzServerOwnershipTracker
         // The first sync of a session comes from the resume, not from waiting for the poll timer.
         Network.Connected += (_, _) =>
         {
+            // Before anything claims: a reconnect inside the resume window keeps the controller's
+            // dropped sub-sectors out of the logon claim - see _droppedSubSectors.
+            lock (_droppedSubSectors)
+            {
+                if (DateTime.UtcNow - _droppedDisconnectedAt > DroppedResumeWindow)
+                    _droppedSubSectors.Clear();
+                _droppedDisconnectedAt = DateTime.MaxValue;
+            }
+
             PrimaryPosition.MarkConnected();
             _ = ResumePreviousSessionAsync();
         };
@@ -212,8 +221,10 @@ public class OzServerOwnershipTracker
         // different position.
         Network.Disconnected += (_, _) =>
         {
+            // Kept, not cleared: a reconnect within the resume window is the same session as far
+            // as the controller is concerned. Network.Connected decides.
             lock (_droppedSubSectors)
-                _droppedSubSectors.Clear();
+                _droppedDisconnectedAt = DateTime.UtcNow;
 
             lock (_withheldGate)
                 _withheldUntil.Clear();
@@ -1171,13 +1182,32 @@ public class OzServerOwnershipTracker
     // backend's group claim returned LTA and HBA moments after ML-BLA_CTR had dropped them.
     //
     // A member leaves the set when the controller claims it, or claims or releases the group, in
-    // the window: that is them deciding about the whole group again. Cleared on disconnect.
+    // the window: that is them deciding about the whole group again.
+    //
+    // Kept across a disconnect for as long as the server keeps the resume snapshot
+    // (RESUME_WINDOW_MINUTES), and only for the same callsign. ML-BLA_CTR dropped MAV, logged off
+    // and back on a minute later, and the logon claim of BLA's group took MAV and MAW straight
+    // back: the set had been cleared on disconnect. A longer gap, or another position, starts
+    // clean - as the server's own resume does.
     readonly HashSet<string> _droppedSubSectors = new(StringComparer.OrdinalIgnoreCase);
+    static readonly TimeSpan DroppedResumeWindow = TimeSpan.FromMinutes(5);
+    DateTime _droppedDisconnectedAt = DateTime.MaxValue;
+    string? _droppedCallsign;
 
     List<string> DroppedSubSectorsOf(SectorsVolumes.Sector sector)
     {
         lock (_droppedSubSectors)
         {
+            // Network.Me settles after Network.Connected, so the callsign is checked here, at the
+            // first claim, rather than there.
+            var me = Network.Me?.Callsign;
+            if (!string.IsNullOrEmpty(me) && _droppedCallsign != null
+                && !string.Equals(me, _droppedCallsign, StringComparison.OrdinalIgnoreCase))
+            {
+                _droppedSubSectors.Clear();
+                _droppedCallsign = null;
+            }
+
             if (_droppedSubSectors.Count == 0)
                 return new List<string>();
 
@@ -1191,23 +1221,36 @@ public class OzServerOwnershipTracker
     // Called with what an Apply is about to claim and release, before it goes out.
     void NoteWindowDecisions(IReadOnlyList<SectorsVolumes.Sector> toClaim, IReadOnlyList<SectorsVolumes.Sector> toRelease)
     {
-        // The groups this controller keeps after the Apply.
-        var kept = _owned.Where(o => !o.IsDummy && !toRelease.Any(r => r.Name == o.Name)).ToList();
+        // Everything the releases give back - each named sector plus the owned members of its
+        // group, as the backend's releaseGroup takes them (MAV takes MAW, which it covers) - and
+        // the groups this controller keeps after the Apply.
+        var released = toRelease
+            .SelectMany(PrimaryPosition.CoveredBy)
+            .Where(s => _owned.Any(o => o.Name == s.Name))
+            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList();
+        var kept = _owned.Where(o => !o.IsDummy && !released.Any(r => r.Name == o.Name)).ToList();
 
         lock (_droppedSubSectors)
         {
-            // Claiming a sector, or releasing a group, is a fresh decision about everything under it.
-            foreach (var sector in toClaim.Concat(toRelease))
+            _droppedCallsign = Network.Me?.Callsign ?? _droppedCallsign;
+
+            // Claiming a sector is a fresh decision about everything under it.
+            foreach (var sector in toClaim)
                 foreach (var covered in PrimaryPosition.CoveredBy(sector))
                     _droppedSubSectors.Remove(covered.Name);
 
-            // A released sector still covered by a group that is kept was dropped out of that group.
-            foreach (var sector in toRelease)
+            // A released sector still covered by a group that is kept was dropped out of that
+            // group. One covered by nothing kept went with its whole group, and is forgotten.
+            foreach (var sector in released)
             {
                 var coveredByKept = kept.Any(group => group.Name != sector.Name
                     && PrimaryPosition.CoveredBy(group).Any(c => c.Name == sector.Name));
                 if (coveredByKept)
                     _droppedSubSectors.Add(sector.Name);
+                else
+                    _droppedSubSectors.Remove(sector.Name);
             }
         }
     }

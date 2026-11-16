@@ -1111,7 +1111,7 @@ public class OzServerSectorsWindow : BaseForm
 
         if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in children)
+            foreach (var child in OffBuildPath(sector, children))
             {
                 if (ReferenceEquals(child, sector))
                 {
@@ -1127,6 +1127,39 @@ public class OzServerSectorsWindow : BaseForm
 
         ApplySectorNodeText(node, FormatSectorText(sector));
         return node;
+    }
+
+    // The sectors on the branch currently being built, root first - see OffBuildPath.
+    readonly HashSet<string> _buildPath = new(StringComparer.OrdinalIgnoreCase);
+
+    // A grouping sector's children, minus any already on the branch being built. Every tree
+    // builder in this window walks its children through here.
+    //
+    // The dataset has groupings that cover each other: MAV lists MAW as a sub-sector and MAW lists
+    // MAV. The builders only guarded against a sector listing itself, so MAV > MAW > MAV > ...
+    // nested until the depth bound stopped it, eight levels deep (Drop Sectors showed it first).
+    // A sector already above this point on the branch is shown there, and is skipped here.
+    //
+    // The sector itself stays allowed: the self-reference (TBD listing TBD) is rendered as a leaf
+    // by each builder. Lazy, so the sector is on the path for exactly as long as its children are
+    // being built - the recursion runs inside the caller's loop body.
+    IEnumerable<SectorsVolumes.Sector> OffBuildPath(SectorsVolumes.Sector sector, IEnumerable<SectorsVolumes.Sector> children)
+    {
+        var added = _buildPath.Add(sector.Name);
+        try
+        {
+            foreach (var child in children.ToList())
+            {
+                if (!ReferenceEquals(child, sector) && _buildPath.Contains(child.Name))
+                    continue;
+                yield return child;
+            }
+        }
+        finally
+        {
+            if (added)
+                _buildPath.Remove(sector.Name);
+        }
     }
 
     void ExpandDropGroups(TreeNode parent)
@@ -1735,7 +1768,7 @@ public class OzServerSectorsWindow : BaseForm
         // SectorGroupings entry.
         if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in children)
+            foreach (var child in OffBuildPath(sector, children))
             {
                 // The tree is built from the local dataset's groupings, which know nothing of
                 // ownership, so a sub-sector that is not in the working selection is skipped when:
@@ -1865,7 +1898,7 @@ public class OzServerSectorsWindow : BaseForm
 
         if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in children)
+            foreach (var child in OffBuildPath(sector, children))
             {
                 // A child belongs under this parent only if OzServer records it as controlled by
                 // someone else too. The grouping alone would show sectors that have since been
@@ -2088,7 +2121,7 @@ public class OzServerSectorsWindow : BaseForm
         // TryGetValue.
         if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in children)
+            foreach (var child in OffBuildPath(sector, children))
             {
                 if (ReferenceEquals(child, sector))
                 {
@@ -2976,7 +3009,7 @@ public class OzServerSectorsWindow : BaseForm
         // See BuildOwnedSectorNodeCore for why this is TryGetValue rather than an indexer.
         if (request.Sector.SubSectors.Count > 0 && SectorsVolumes.SectorGroupings.TryGetValue(request.Sector, out var children))
         {
-            foreach (var child in children)
+            foreach (var child in OffBuildPath(request.Sector, children))
             {
                 if (ReferenceEquals(child, request.Sector))
                 {
@@ -3007,7 +3040,7 @@ public class OzServerSectorsWindow : BaseForm
         // See BuildOwnedSectorNodeCore for why this is TryGetValue rather than an indexer.
         if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
         {
-            foreach (var child in children)
+            foreach (var child in OffBuildPath(sector, children))
             {
                 if (ReferenceEquals(child, sector))
                 {
