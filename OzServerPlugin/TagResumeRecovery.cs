@@ -246,6 +246,25 @@ public class TagResumeRecovery
             // Resolved against what this controller holds now. Null covers three things that clear
             // up by themselves: the sector grant has not reached MMI, there is no radar return for
             // the aircraft, or there is one without Mode C under two stacked sectors.
+            // Not before vatSys has validated the controllers online: until then it knows neither
+            // whose position the aircraft is in nor, often, who is tracking it - VOZ233 was taken
+            // from ML_APP this way, BLA reconnecting before vatSys had heard from them.
+            if (PrimaryPosition.AwaitingValidationForAny(mine, Network.Me?.Callsign))
+            {
+                waiting[fdr.Callsign] = "waiting for vatSys to validate the controllers online";
+                continue;
+            }
+
+            // Inside another online controller's position: theirs, even if a sector of it is still
+            // listed here for a moment (it is being handed to them - PrimaryPositionWatcher).
+            var staffed = PrimaryPosition.StaffedByOthers(Network.Me?.Callsign);
+            if (staffed.Count > 0 && SectorLocator.Resolve(fdr, staffed.Select(s => s.Sector)) is { } theirs)
+            {
+                waiting.Remove(fdr.Callsign);
+                abandoned.Add($"{fdr.Callsign} (in {theirs.Name}, {staffed.First(s => s.Sector.Equals(theirs)).Callsign}'s position)");
+                continue;
+            }
+
             var sector = SectorLocator.Resolve(fdr, mine);
             if (sector == null)
             {

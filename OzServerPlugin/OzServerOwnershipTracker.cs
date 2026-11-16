@@ -205,6 +205,7 @@ public class OzServerOwnershipTracker
         // The first sync of a session comes from the resume, not from waiting for the poll timer.
         Network.Connected += (_, _) =>
         {
+            PrimaryPosition.MarkConnected();
             _ = ResumePreviousSessionAsync();
         };
         // Back-offs and resume state do not carry into the next session, which may be on a
@@ -422,6 +423,10 @@ public class OzServerOwnershipTracker
             // A release this client has just sent: Owned still lists the sector until the release's
             // refresh lands, and putting it back meanwhile would undo the removal on screen.
             .Where(owned => !WasJustReleased(owned.Name))
+            // Nor one vatSys took off because its own controller is online: vatSys does that as it
+            // validates them (Network.VATSIM_ClientQueryResponseReceived), and putting it back
+            // fights vatSys while PrimaryPositionWatcher is handing it to them.
+            .Where(owned => !IsStaffedByOtherController(owned))
             .ToList();
 
         if (missing.Count == 0)
@@ -440,6 +445,17 @@ public class OzServerOwnershipTracker
                 sectors = missing.Select(s => s.Name).ToArray(),
                 own_callsign = Network.Me?.Callsign
             });
+    }
+
+    // Whether another controller is online whose position includes this sector - logged on as it,
+    // or as the primary of a group it belongs to (ML_APP for MAE, MDN, MDS, MAV and MAW).
+    static bool IsStaffedByOtherController(SectorsVolumes.Sector sector)
+    {
+        var me = Network.Me?.Callsign;
+        return PrimaryPosition.OnlineRealAtcs()
+            .Where(atc => !string.Equals(atc.Callsign, me, StringComparison.OrdinalIgnoreCase))
+            .Any(atc => string.Equals(atc.Callsign, sector.Callsign, StringComparison.OrdinalIgnoreCase)
+                        || PrimaryPosition.DefaultSectorsFor(atc.Callsign).Any(s => s.Equals(sector)));
     }
 
     // Names this client has just asked the backend to release, excused from RestoreOwnedToMmi
@@ -665,12 +681,18 @@ public class OzServerOwnershipTracker
     //
     // `also` carries anything else to leave out - the contested sub-sectors from a 409 retry.
     // Answers with what was granted - see OzServerApiClient.ClaimSectorAsync.
-    Task<IReadOnlyList<string>?> ClaimWithExclusionsAsync(SectorsVolumes.Sector sector, IEnumerable<string>? also = null)
+    async Task<IReadOnlyList<string>?> ClaimWithExclusionsAsync(SectorsVolumes.Sector sector, IEnumerable<string>? also = null)
     {
         // Every claim path comes through here, so this is the plugin's last check on a flow
         // position taking enroute or TMA airspace - see PrimaryPosition.MayOwn.
         if (!PrimaryPosition.MayOwn(sector, Network.Me?.Callsign))
-            return Task.FromResult<IReadOnlyList<string>?>(Array.Empty<string>());
+            return Array.Empty<string>();
+
+        // Just after connecting, the exclusions below cannot see a controller vatSys has not
+        // validated yet - see PrimaryPosition.AwaitingValidationFor.
+        var waitedUntil = DateTime.UtcNow + PrimaryPosition.ValidationWait;
+        while (PrimaryPosition.AwaitingValidationFor(sector, Network.Me?.Callsign) && DateTime.UtcNow < waitedUntil)
+            await Task.Delay(250);
 
         var exclude = PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign);
 
@@ -680,7 +702,7 @@ public class OzServerOwnershipTracker
                 exclude.Add(name);
         }
 
-        return _api.ClaimSectorAsync(sector.Name, exclude);
+        return await _api.ClaimSectorAsync(sector.Name, exclude);
     }
 
     // Takes back top-down cover that was withheld while somebody was logged on as it, once they

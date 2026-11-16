@@ -38,6 +38,11 @@ public class AfvSectorClaimer
     // granted the position's sectors.
     static readonly TimeSpan InitRetryInterval = TimeSpan.FromSeconds(1);
     const int InitMaxAttempts = 20;
+
+    // How long the first claim waits for vatSys to validate the controllers already online - see
+    // AwaitingAtcValidation.
+    static readonly TimeSpan AtcValidationWait = PrimaryPosition.ValidationWait;
+    DateTime _initStartedAt = DateTime.MinValue;
     readonly System.Threading.Timer _initRetryTimer;
     int _initAttemptsLeft;
 
@@ -118,6 +123,7 @@ public class AfvSectorClaimer
             return;
 
         _initAttemptsLeft = InitMaxAttempts;
+        _initStartedAt = DateTime.UtcNow;
         RetryInit();
     }
 
@@ -334,6 +340,18 @@ public class AfvSectorClaimer
         }
     }
 
+    // Whether to hold the position's grant back until vatSys has validated the controllers already
+    // online, so their top-down cover is left out from the start - see
+    // PrimaryPosition.AwaitingValidationFor. At most AtcValidationWait from the first attempt.
+    bool AwaitingAtcValidation(string? ownCallsign)
+    {
+        if (DateTime.UtcNow - _initStartedAt > AtcValidationWait)
+            return false;
+
+        return PrimaryPosition.DefaultSectorsFor(ownCallsign)
+            .Any(sector => PrimaryPosition.AwaitingValidationFor(sector, ownCallsign));
+    }
+
     // Sets the controlled sectors on connect or on a position change (see the
     // VSCSFrequenciesChanged handler): the primary sector matching this session's login callsign,
     // plus the rest of its group, less any top-down cover already staffed by another controller.
@@ -353,6 +371,9 @@ public class AfvSectorClaimer
         // PrimaryPosition, not a local copy of the same rule: PrimaryPositionWatcher applies it on
         // the other controller's side to decide what to release to this session, and the two have
         // to agree or a sector is either released to nobody or never handed over.
+        if (AwaitingAtcValidation(callsign))
+            return false;
+
         var unfiltered = PrimaryPosition.DefaultSectorsFor(callsign);
         var sectors = PrimaryPosition.WithoutStaffedTopDownCover(unfiltered, callsign);
         if (sectors.Count == 0)

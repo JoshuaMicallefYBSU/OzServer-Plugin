@@ -258,8 +258,58 @@ public static class PrimaryPosition
 
     // IsRealATC filters out observers and the other non-controlling connections in this list, so
     // only a real controller counts as staffing a sector.
+    //
+    // A validated connection on a controller callsign counts too. IsRealATC also needs the
+    // controller's facility, which comes with their next position update, seconds after vatSys
+    // has validated them - and vatSys takes their sectors off this scope on validation alone
+    // (Network.VATSIM_ClientQueryResponseReceived, IsValidATC). Waiting for IsRealATC left BLA
+    // holding ML_APP's MAE group on OzServer for those seconds after logging on.
     public static List<NetworkATC> OnlineRealAtcs() =>
         (Network.GetOnlineATCs ?? new List<NetworkATC>())
-        .Where(a => a.IsRealATC && !string.IsNullOrEmpty(a.Callsign))
+        .Where(a => !string.IsNullOrEmpty(a.Callsign) && (a.IsRealATC || (a.ValidATC && IsControllerCallsign(a.Callsign))))
         .ToList();
+
+    static readonly System.Text.RegularExpressions.Regex ControllerCallsign =
+        new(@"\w_(FSS|CTR|APP|DEP|TWR|GND|DEL|RMP|TMU|FMP|RDO)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    // Straight after connecting, the online list holds controllers vatSys has not validated yet (it
+    // asks each one, IsValidATC), and until it has they do not count as staffing anything. A claim
+    // made then took their sectors - BLA logging on claimed ML_APP's MAE group, and vatSys took it
+    // off the scope seconds later. So a claim waits, at most ValidationWait, while a controller
+    // whose position the claim would sweep up is still unvalidated, and only in the first
+    // ValidationWindow of a session: a client that never answers must not slow every claim.
+    public static readonly TimeSpan ValidationWait = TimeSpan.FromSeconds(8);
+    static readonly TimeSpan ValidationWindow = TimeSpan.FromSeconds(30);
+    static DateTime _connectedAt = DateTime.MinValue;
+
+    public static void MarkConnected() => _connectedAt = DateTime.UtcNow;
+
+    public static bool AwaitingValidationFor(SectorsVolumes.Sector sector, string? ownCallsign)
+    {
+        if (DateTime.UtcNow - _connectedAt > ValidationWindow)
+            return false;
+
+        var covered = CoveredBy(sector);
+        return (Network.GetOnlineATCs ?? new List<NetworkATC>()).Any(atc =>
+            !atc.ValidATC
+            && IsControllerCallsign(atc.Callsign)
+            && !string.Equals(atc.Callsign, ownCallsign, StringComparison.OrdinalIgnoreCase)
+            && DefaultSectorsFor(atc.Callsign).Any(theirs => covered.Any(c => c.Equals(theirs))));
+    }
+
+    // Whether any controller online is still awaiting vatSys's validation, for a position that
+    // includes one of these sectors - see AwaitingValidationFor.
+    public static bool AwaitingValidationForAny(IEnumerable<SectorsVolumes.Sector> sectors, string? ownCallsign) =>
+        sectors.Any(sector => AwaitingValidationFor(sector, ownCallsign));
+
+    // Every sector in the position of another controller who is online, with their callsign.
+    public static List<(SectorsVolumes.Sector Sector, string Callsign)> StaffedByOthers(string? ownCallsign) =>
+        OnlineRealAtcs()
+            .Where(atc => !string.Equals(atc.Callsign, ownCallsign, StringComparison.OrdinalIgnoreCase))
+            .SelectMany(atc => DefaultSectorsFor(atc.Callsign).Select(sector => (Sector: sector, Callsign: atc.Callsign)))
+            .ToList();
+
+    // A callsign of the form vatSys's IsRealATC accepts as a controller position.
+    public static bool IsControllerCallsign(string? callsign) =>
+        !string.IsNullOrEmpty(callsign) && ControllerCallsign.IsMatch(callsign);
 }
