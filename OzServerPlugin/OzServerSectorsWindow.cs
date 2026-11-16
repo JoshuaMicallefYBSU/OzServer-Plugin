@@ -695,6 +695,9 @@ public class OzServerSectorsWindow : BaseForm
     }
 
     // Adopts _tracker.Owned as the Owned list, unless the controller has staged edits.
+    // The server's Owned list as SyncOwnedFromTracker last adopted it - see the change test there.
+    string? _lastSyncedOwnedKey;
+
     void SyncOwnedFromTracker()
     {
         // While anything is staged, the Owned list is the controller's working selection, and a
@@ -714,10 +717,17 @@ public class OzServerSectorsWindow : BaseForm
             ? _tracker.Owned.ToList()
             : MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
+        // Also against what the server said last time: after an Apply the working selection
+        // already matches the result, so comparing only with it found nothing to redraw - and
+        // rows drawn from the old ownership (a released child still nested under its group)
+        // stayed.
+        var ownedKey = string.Join(",", owned.Where(s => !s.IsDummy).Select(s => s.Name).OrderBy(n => n, StringComparer.Ordinal));
         var changed = !_hasOwnedSnapshot
+                      || ownedKey != _lastSyncedOwnedKey
                       || owned.Count != _sectorsSelected.Count
                       || owned.Any(sector => !_sectorsSelected.Any(existing => existing.Equals(sector)));
 
+        _lastSyncedOwnedKey = ownedKey;
         _hasOwnedSnapshot = true;
         _sectorsSelected = owned;
         if (changed)
@@ -1648,13 +1658,19 @@ public class OzServerSectorsWindow : BaseForm
             foreach (var child in children)
             {
                 // The tree is built from the local dataset's groupings, which know nothing of
-                // ownership, so a sub-sector that is not this controller's is skipped when:
+                // ownership, so a sub-sector that is not in the working selection is skipped when:
                 //   - someone else owns it: a group's members can be handed away individually; or
                 //   - the group itself is owned: OzServer keeps one ownership record per
-                //     sub-sector, so a child missing from Owned was released or never granted.
+                //     sub-sector, so a child missing from Owned was released, never granted, or
+                //     has just been staged out.
                 // Under a group that is staged rather than owned, unowned children stay - they are
                 // what Apply would claim along with it. The self-reference (see above) is exempt.
-                if (!ReferenceEquals(child, sector) && !_tracker.IsMine(child)
+                //
+                // The working selection (_sectorsSelected), not the tracker: tested against the
+                // tracker, a child staged out stayed on screen until Apply, a child staged back in
+                // did not appear under its group until Apply, and after Apply nothing redrew - LTA
+                // stayed under HUO in ML-BLA_CTR's Owned list after it had been released.
+                if (!ReferenceEquals(child, sector) && !IsSelected(child)
                     && (_tracker.IsMine(sector) || _tracker.OwnerOf(child) != null))
                     continue;
 
@@ -1866,11 +1882,21 @@ public class OzServerSectorsWindow : BaseForm
     // in Owned and gets no row of its own there (see PopulateOwnedList), so listing it in
     // Available would offer a move that changes nothing on screen. For example, BAN declares
     // ResponsibleSectors="BAS,BDN,BDS,SHN".
+    // Covered by a group in Owned, and so shown nested under it there rather than offered here.
+    // Not when the group is this controller's on OzServer and the sector is not in the selection:
+    // then it was dropped out of the group (or never granted with it), is not on the Owned list
+    // either, and has to be listed here to be taken back - LTA and HBA, dropped from HUO, could
+    // not be re-added because neither list showed them.
     bool IsCoveredByOwned(SectorsVolumes.Sector sector) =>
         _sectorsSelected.Any(owned =>
             !owned.Equals(sector)
             && SectorsVolumes.SectorGroupings.TryGetValue(owned, out var covered)
-            && covered.Contains(sector));
+            && covered.Contains(sector)
+            && !(_tracker.IsMine(owned) && !IsSelected(sector)));
+
+    // In the working selection, by name - the footing every Owned/Available decision uses.
+    bool IsSelected(SectorsVolumes.Sector sector) =>
+        _sectorsSelected.Any(s => !s.IsDummy && s.Name == sector.Name);
 
     // Whether a sector belongs in the Available list at all. Only the two "already effectively
     // mine" cases exclude it - in Owned by name, or covered by something in Owned - and not

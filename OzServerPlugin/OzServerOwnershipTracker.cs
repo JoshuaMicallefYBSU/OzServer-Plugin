@@ -212,6 +212,9 @@ public class OzServerOwnershipTracker
         // different position.
         Network.Disconnected += (_, _) =>
         {
+            lock (_droppedSubSectors)
+                _droppedSubSectors.Clear();
+
             lock (_withheldGate)
                 _withheldUntil.Clear();
 
@@ -697,6 +700,14 @@ public class OzServerOwnershipTracker
 
         var exclude = PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign);
 
+        // Sub-sectors the controller dropped from this group by hand stay dropped - see
+        // _droppedSubSectors. Only the members, never the sector being claimed.
+        foreach (var name in DroppedSubSectorsOf(sector))
+        {
+            if (!exclude.Contains(name, StringComparer.OrdinalIgnoreCase))
+                exclude.Add(name);
+        }
+
         foreach (var name in also ?? Enumerable.Empty<string>())
         {
             if (!exclude.Contains(name, StringComparer.OrdinalIgnoreCase))
@@ -1153,6 +1164,54 @@ public class OzServerOwnershipTracker
         await RefreshFromServerAsync();
     }
 
+    // Sub-sectors the controller released in the Sectors window while keeping the group that
+    // covers them (LTA and HBA out of HUO). Every automatic claim of the group leaves them out
+    // (ClaimWithExclusionsAsync) - the claim-back after a VSCS line's release, a resume, a retry.
+    // Without this, a VSCS click on 16 Nov released HUO and claimed it straight back, and the
+    // backend's group claim returned LTA and HBA moments after ML-BLA_CTR had dropped them.
+    //
+    // A member leaves the set when the controller claims it, or claims or releases the group, in
+    // the window: that is them deciding about the whole group again. Cleared on disconnect.
+    readonly HashSet<string> _droppedSubSectors = new(StringComparer.OrdinalIgnoreCase);
+
+    List<string> DroppedSubSectorsOf(SectorsVolumes.Sector sector)
+    {
+        lock (_droppedSubSectors)
+        {
+            if (_droppedSubSectors.Count == 0)
+                return new List<string>();
+
+            return PrimaryPosition.CoveredBy(sector)
+                .Where(s => s.Name != sector.Name && _droppedSubSectors.Contains(s.Name))
+                .Select(s => s.Name)
+                .ToList();
+        }
+    }
+
+    // Called with what an Apply is about to claim and release, before it goes out.
+    void NoteWindowDecisions(IReadOnlyList<SectorsVolumes.Sector> toClaim, IReadOnlyList<SectorsVolumes.Sector> toRelease)
+    {
+        // The groups this controller keeps after the Apply.
+        var kept = _owned.Where(o => !o.IsDummy && !toRelease.Any(r => r.Name == o.Name)).ToList();
+
+        lock (_droppedSubSectors)
+        {
+            // Claiming a sector, or releasing a group, is a fresh decision about everything under it.
+            foreach (var sector in toClaim.Concat(toRelease))
+                foreach (var covered in PrimaryPosition.CoveredBy(sector))
+                    _droppedSubSectors.Remove(covered.Name);
+
+            // A released sector still covered by a group that is kept was dropped out of that group.
+            foreach (var sector in toRelease)
+            {
+                var coveredByKept = kept.Any(group => group.Name != sector.Name
+                    && PrimaryPosition.CoveredBy(group).Any(c => c.Name == sector.Name));
+                if (coveredByKept)
+                    _droppedSubSectors.Add(sector.Name);
+            }
+        }
+    }
+
     // Commits one Apply: releases what the controller unpicked, claims what they picked and
     // requests what they staged from another controller. Apply is the confirmation, so unlike
     // ClaimAsync's interactive path (HandleConflictAsync) nothing here stops to ask.
@@ -1214,6 +1273,8 @@ public class OzServerOwnershipTracker
                 toRequest = toRequest.Where(s => !unheldRequests.Contains(s)).ToList();
             }
         }
+
+        NoteWindowDecisions(toClaim, toRelease);
 
         // Excuses every released sector and the group each takes with it from RestoreOwnedToMmi,
         // for both the batched commit and the per-sector fallback - see MarkReleased.
