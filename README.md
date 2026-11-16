@@ -39,7 +39,7 @@ and shown publicly on the live map at [ozserver.org](https://ozserver.org).
 | **Sector requests** | Ask another controller for a sector they own. They accept or reject from their Sectors window; a rejection is reported back to you. |
 | **Conflict prompts** | Claiming airspace someone else holds opens a prompt showing what is owned and by whom, and asks whether to send a request. The uncontested part is yours either way. |
 | **Primary positions** | Log on while someone is covering your position and your client sends them one request for all of it. Nothing moves until they accept. |
-| **Request indicators** | An incoming request flashes the Settings menu, badges the Sectors window, plays vatSys's ATC-message tone, and shades the requested airspace on your scope — yellow incoming, orange outgoing. |
+| **Request indicators** | An incoming request flashes the Settings menu, badges the Sectors window, plays vatSys's ATC-message tone, and shades the requested airspace on your scope — yellow incoming, light green outgoing. |
 | **Observers** | An observer claims nothing, and sees the airspace of the controller they are watching. |
 
 ### Aircraft and flight data

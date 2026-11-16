@@ -12,7 +12,7 @@ namespace OzServerPlugin;
 //   Incoming ("Requested From Me") - another controller is asking for this controller's sectors.
 //                                    Yellow.
 //   Outgoing ("Requested By Me")   - this controller is asking for, or has staged, sectors.
-//                                    Orange.
+//                                    Light green.
 //
 // OzServerSectorsWindow draws a swatch of each colour beside its headings from IncomingColour and
 // OutgoingColour (SectorsView_DrawNode), so the legend cannot drift from the highlight.
@@ -30,7 +30,7 @@ public class RequestedSectorOverlay
     const int PoolSize = 64;
 
     const byte IncomingRed = 255, IncomingGreen = 235, IncomingBlue = 0; // yellow
-    const byte OutgoingRed = 255, OutgoingGreen = 140, OutgoingBlue = 0; // orange
+    const byte OutgoingRed = 144, OutgoingGreen = 238, OutgoingBlue = 144; // light green
     const byte FillAlpha = 70;
     const byte BorderAlpha = 255;
     const float BorderWidth = 2f;
