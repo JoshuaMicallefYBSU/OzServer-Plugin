@@ -193,11 +193,11 @@ public class RequestedSectorOverlay
         var incomingPolygons = incoming.SelectMany(Boundaries).ToList();
         var outgoingPolygons = outgoing.SelectMany(Boundaries).ToList();
 
-        // The same shapes drive both layers of a direction: the border outlines what the fill
-        // shades.
-        _incomingFill.SetPolygons(incomingPolygons);
+        // The border outlines every volume, so the sector boundaries show inside the shading; the
+        // fill is their merged outline, so overlapping volumes are shaded once (see SectorFill).
+        _incomingFill.SetPolygons(SectorFill.Merge(incomingPolygons));
         _incomingBorder.SetPolygons(incomingPolygons);
-        _outgoingFill.SetPolygons(outgoingPolygons);
+        _outgoingFill.SetPolygons(SectorFill.Merge(outgoingPolygons));
         _outgoingBorder.SetPolygons(outgoingPolygons);
 
         var message = incoming.Count == 0 && outgoing.Count == 0

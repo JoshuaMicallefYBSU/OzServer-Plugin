@@ -69,6 +69,7 @@ public class FdrSync
             }
             // And adopts every tag's label from the record again when next tracked.
             LabelAdopted.Clear();
+            LabelStateRestore.ForgetAllPending();
             Landed.Clear();
         };
     }
@@ -768,6 +769,7 @@ public class FdrSync
                 // reads the record again and then pushes the label in full.
                 if (!fdr.IsTrackedByMe)
                 {
+                    LabelStateRestore.ForgetPending(fdr.Callsign);
                     if (LabelAdopted.TryRemove(fdr.Callsign, out _))
                         lock (_lock)
                             _labelStateKeys.Remove(fdr.Callsign);
@@ -901,9 +903,14 @@ public class FdrSync
         };
 
         // The "C", which vatSys keeps on the track rather than the FDR - see
-        // OzServerFdrUpdateDto.CPrompt. Left unset with no track to read it from.
+        // OzServerFdrUpdateDto.CPrompt. Left unset with no track to read it from. A C restored before
+        // the track existed is put on first, so this push does not report it as off.
         if (MMI.FindTrack(fdr) is { } track)
+        {
+            if (fdr.IsTrackedByMe)
+                LabelStateRestore.ApplyPendingCPrompt(fdr, track);
             dto.CPrompt = track.CPrompt;
+        }
 
         FillAuthority(dto, fdr);
         FillPredictedPosition(dto, fdr);

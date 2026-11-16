@@ -34,19 +34,17 @@ public static class LabelStateRestore
         var localCflSet = fdr.CFLUpper > 0 || fdr.CFLLower > 0;
         if (replaceCfl || !localCflSet)
         {
-            var cflChanged = false;
-            if (stored.CflUpper is { } upper && fdr.CFLUpper != upper)
+            var upper = stored.CflUpper ?? fdr.CFLUpper;
+            var lower = stored.CflLower ?? fdr.CFLLower;
+            if (fdr.CFLUpper != upper || fdr.CFLLower != lower)
             {
-                fdr.CFLUpper = upper;
-                cflChanged = true;
-            }
-            if (stored.CflLower is { } lower && fdr.CFLLower != lower)
-            {
-                fdr.CFLLower = lower;
-                cflChanged = true;
-            }
-            if (cflChanged)
+                // Sent, as the tracking controller: everyone connected gets it from vatSys at
+                // once. Their own vatSys cleared it when the previous tracker dropped the tag
+                // (FDP2.HandoffToNone), and the record has not changed, so LabelStateMirror would
+                // not put it back by itself.
+                FDP2.SetCFL(fdr, lower, upper, fdr.CFLVisual, true);
                 applied.Add($"CFL {stored.CflLower?.ToString() ?? "-"}/{stored.CflUpper?.ToString() ?? "-"}");
+            }
         }
 
         // Through vatSys's own setters, which also send the value to every other controller - as
@@ -67,15 +65,54 @@ public static class LabelStateRestore
 
         // The CFL's colour (Track.NewCFL, new or acknowledged) is not carried: vatSys marks the CFL
         // new again whenever a track enters Jurisdiction, so it is left as vatSys shows it.
-        if (MMI.FindTrack(fdr) is { } track && stored.CPrompt is { } cPrompt && track.CPrompt != cPrompt)
+        if (stored.CPrompt is { } cPrompt)
         {
-            track.CPrompt = cPrompt;
-            applied.Add(cPrompt ? "C on" : "C off");
-            MMI.RequestRedraw();
+            if (MMI.FindTrack(fdr) is { } track)
+            {
+                PendingCPrompt.TryRemove(fdr.Callsign, out _);
+                if (track.CPrompt != cPrompt)
+                {
+                    track.CPrompt = cPrompt;
+                    applied.Add(cPrompt ? "C on" : "C off");
+                    MMI.RequestRedraw();
+                }
+            }
+            else if (cPrompt)
+            {
+                // No track yet - straight after a reconnect vatSys has the FDR before the radar
+                // track is coupled. Kept until there is one (ApplyPendingCPrompt): otherwise the
+                // first push once it appears would report the C as off and erase the record.
+                PendingCPrompt[fdr.Callsign] = true;
+                applied.Add("C on (once the track appears)");
+            }
         }
 
         return applied.Count > 0 ? string.Join(", ", applied) : null;
     }
+
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> PendingCPrompt =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Called by FdrSync as it reads the C for a push, on a tag this controller tracks.
+    public static void ApplyPendingCPrompt(FDP2.FDR fdr, Track track)
+    {
+        if (string.IsNullOrEmpty(fdr.Callsign) || !PendingCPrompt.TryRemove(fdr.Callsign, out var cPrompt))
+            return;
+        if (track.CPrompt == cPrompt)
+            return;
+
+        track.CPrompt = cPrompt;
+        MMI.RequestRedraw();
+        ActionLog.Log("Tag", $"Put {fdr.Callsign}'s C back now its track has appeared", new
+        {
+            action = "pending_c_prompt_applied",
+            fdr_callsign = fdr.Callsign
+        });
+    }
+
+    public static void ForgetPending(string callsign) => PendingCPrompt.TryRemove(callsign, out _);
+
+    public static void ForgetAllPending() => PendingCPrompt.Clear();
 }
 
 // Shows every controller the label the tracking controller has put on a tag: the cleared level,
@@ -87,9 +124,9 @@ public static class LabelStateRestore
 // from the tracking controller's client), so every tag this controller is not tracking is filled
 // in from there.
 //
-// Each field is applied only when OzServer's value changes, never re-asserted: a controller who
-// changes one on someone else's tag for their own reference keeps it until the tracking controller
-// changes theirs. Values are written locally, never sent - sending would announce them to the
+// Each field is applied only when OzServer's value changes, or the tag's tracking controller does,
+// never re-asserted otherwise: a controller who changes one on someone else's tag for their own
+// reference keeps it until the tracking controller changes theirs. Values are written locally, never sent - sending would announce them to the
 // network as this controller's own.
 public sealed class LabelStateMirror
 {
@@ -101,6 +138,10 @@ public sealed class LabelStateMirror
     // What was last put onto each tag from OzServer, field by field.
     sealed class Applied
     {
+        // Who was tracking the tag when this was recorded. A change starts the tag afresh: vatSys
+        // resets the CFL when the tracking controller drops a tag (FDP2.HandoffToNone), while the
+        // record keeps it, so with only changes applied the label would stay blank on this scope.
+        public string? Tracker;
         public bool? CPrompt;
         public bool CflSeen;
         public int? CflLower;
@@ -185,8 +226,10 @@ public sealed class LabelStateMirror
                     _applied.Remove(record.Callsign);
                     continue;
                 }
-                if (!_applied.TryGetValue(record.Callsign, out last))
-                    _applied[record.Callsign] = last = new Applied();
+                var tracker = fdr.ControllerTracking?.Callsign;
+                if (!_applied.TryGetValue(record.Callsign, out last)
+                    || !string.Equals(last.Tracker, tracker, StringComparison.OrdinalIgnoreCase))
+                    _applied[record.Callsign] = last = new Applied { Tracker = tracker };
             }
 
             try
@@ -257,7 +300,9 @@ public sealed class LabelStateMirror
 
         if (record.CPrompt is { } cPrompt && cPrompt != last.CPrompt && MMI.FindTrack(fdr) is { } track)
         {
-            if (track.CPrompt != cPrompt)
+            // On first sight only a C that is on is shown, as for the fields above: one this
+            // controller put on for their own reference is not taken off by a record without it.
+            if ((last.CPrompt != null || cPrompt) && track.CPrompt != cPrompt)
             {
                 track.CPrompt = cPrompt;
                 changed = true;
