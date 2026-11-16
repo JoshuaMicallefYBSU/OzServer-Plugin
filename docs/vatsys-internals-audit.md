@@ -145,7 +145,7 @@ instant announcement on connect — this plugin already documents that exact lag
 (`OzServerOwnershipTracker.cs`, `PrimaryPositionWatcher.cs`: "VATSIM's own update cycle a few
 seconds") for a different symptom of the same fact. The scenario most likely to hit this: a
 controller logs on under a primary's callsign and OzServer reassigns that primary's sectors to them
-immediately (see the README's "Primary inheritance"), but the *previous* holder's client can run
+immediately (see "Primary positions" in the README), but the *previous* holder's client can run
 `GiveAway` before its own `OnlineATC` snapshot has caught up to the new controller's connection.
 
 `SectorTagHandoff` now checks `Network.GetOnlineATCs` itself before ever calling

@@ -1,43 +1,82 @@
 # Contributing
 
-## Reporting something
+## Reporting a problem
 
-Open an issue and fill in the form. **Attach the log** — `Documents\vatSys Files\ozserver_YYYYMMDD.txt`.
-Nearly every bug in this plugin has been found in it, and a report without one usually ends with us
-asking for it anyway.
+Open an [issue](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/issues/new/choose) and fill
+in the form.
 
-If the bug involves two controllers — ownership, requests, shared markup — say what the *other*
-controller was holding and doing. Half of this plugin is two clients agreeing with each other, so a
-one-sided report is often only half the story.
+**Attach the log** — `Documents\vatSys Files\ozserver_<yyyymmdd>.txt`. Nearly every bug in this
+plugin has been found in it.
 
-## Changing something
+If the problem involves two controllers — ownership, requests, a handover — say what the *other*
+controller was holding and doing. Most of this plugin is two clients agreeing with each other, so
+a one-sided report is often half the story.
 
-The [README](README.md) is the reference for how the thing actually works — read
-[Layout](README.md#layout) before moving code around, and
-[Notes for contributors](README.md#notes-for-contributors) before cutting a release.
+## Making a change
 
-A few things about this codebase that aren't obvious:
+Read [docs/architecture.md](docs/architecture.md) first. It covers the source layout, the rules
+the code is built around, and the vatSys behaviours it depends on.
 
-**There is no CI build.** Compiling needs a vatSys installation, and its assemblies aren't ours to
-redistribute to a build runner. The compiler on your machine is the only automated check there is,
-so test against a real install and say what you exercised in the PR.
+Things about this codebase that are not obvious:
 
-**Some of this can freeze somebody's radar.** vatSys renders on its own thread, and neither its
-render loop nor its paint block catches the exceptions plugin data can cause — an exception there
-stops the scope drawing permanently rather than dropping a frame. Anything touching map layers,
-text areas or the FDR state machine needs the care described in `AsdMapLayer`'s own comments.
+- **There is no CI build.** Compiling needs a vatSys installation, and its assemblies are not ours
+  to redistribute to a build runner. Build and test against a real install, and say in the pull
+  request what you exercised.
+- **Some of this can freeze a controller's radar.** vatSys does not catch exceptions on its render
+  path. Anything touching map layers, text areas or FDR state needs the care described in
+  `AsdMapLayer`.
+- **Some of this can take airspace off a controller mid-session.** The primary/group rules decide
+  what is released to an arriving controller, and getting them wrong produces no error.
+  `PrimaryPosition` is the single definition.
+- **An unhandled exception on the UI thread closes vatSys.** Post work there through the
+  `RunOnUiThread` helpers, which contain it (`UiThread.Guard`).
+- **Reflection into vatSys is checked by nothing.** No compiler error tells you when an internal
+  moves; only testing does.
 
-**Some of this can take airspace off a controller mid-session.** The primary/group rules decide what
-gets released to an arriving controller. Getting them wrong doesn't produce an error — it silently
-hands someone else's sectors away. `PrimaryPosition` is the single definition; three callers depend
-on it agreeing with itself exactly.
+### Building
 
-**Reflection into vatSys is checked by nothing.** Where the plugin reaches into vatSys internals it
-does so because there is no public API for it, and the reasoning is written down at each site. A
-compiler error is not available to tell you when one of those moves; only testing is.
+```bash
+dotnet build OzServerPlugin/OzServerPlugin.csproj -c Release
+```
 
-## Comments
+By default the DLL is written to `OzServerPlugin/bin/Release/`. To build straight into a vatSys
+profile, set `OutputPath` in a git-ignored `OzServerPlugin/OzServerPlugin.csproj.user`, or pass
+`-p:OutputPath=...` on the command line.
 
-Explain *why*, not *what*. The code says what it does. The comments exist for the decisions that
-took a while to work out and would otherwise be quietly undone — which is most of the hard-won
-behaviour in here.
+A local build is only replaced by the updater when a *higher* version is released. If your build's
+`<Version>` is behind the latest release, the updater will replace it at the next check; the
+previous file is kept beside it as `.backup`.
+
+### Comments
+
+Explain *why*, not *what*. Comments are for constraints and decisions that are not visible in the
+code — a vatSys behaviour being worked around, an ordering that matters, a consequence of getting
+it wrong. Write them as facts about the code as it is now, keep them short, and update them when
+the reasoning changes.
+
+## Publishing a release
+
+Every installed copy updates itself from this repository's GitHub releases, and it trusts the
+**assembly's** version, not the tag. A release must therefore be:
+
+1. **Versioned** — raise `<Version>` in `OzServerPlugin.csproj` and build in `Release` from that
+   commit.
+2. **Tagged to match** — `v0.1.9` for version `0.1.9`.
+3. **Published with the DLL attached** — the built file, named exactly `OzServerPlugin.dll`. A zip
+   may be attached as well for manual installs.
+
+The OzServer API picks a new release up within about five minutes, and each client installs it at
+its next check (two minutes after vatSys starts, then every six hours). It takes effect the next
+time that controller starts vatSys.
+
+Things to know:
+
+- **Prereleases are offered like any other release.** Only a draft is held back, so keep a release
+  as a draft until it is ready.
+- **A tag ahead of the assembly reaches nobody.** If `v0.1.9` carries a DLL still stamped `0.1.8`,
+  every client downloads it, sees it is not newer, and discards it.
+- **To pause a rollout**, set `PLUGIN_RELEASE_MAX_VERSION` on the API to the last good version, or
+  return the release to draft. Clients that already installed it are not downgraded; publish a
+  fixed, higher version for them.
+- **Write access to this repository is the trust boundary.** Whatever is published here runs
+  inside every controller's vatSys. Keep release rights restricted.
