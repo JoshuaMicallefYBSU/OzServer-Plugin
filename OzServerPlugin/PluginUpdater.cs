@@ -6,70 +6,75 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using vatsys;
 
 namespace OzServerPlugin;
 
-// Keeps the plugin up to date from the repository's GitHub releases, so nobody has to be told to go
-// and copy a DLL by hand.
+// Keeps the plugin up to date without anyone copying a DLL by hand.
 //
-// The awkward part is that a plugin cannot replace its own file. vatSys loads OzServerPlugin.dll and
-// holds it open for the whole session, so the file cannot be overwritten or deleted while it is
-// running - which is exactly why installing a build by hand means closing vatSys first. That also
-// rules out the obvious reading of "update when vatSys is closed": when vatSys is closed, this code
-// isn't running either, and a plugin has no business leaving a separate updater process behind.
+// Which release to install is asked of OzServer (GET /plugin/release), which keeps a cached copy of
+// the repository's GitHub releases - one cheap request per client, no GitHub API quota spent, and a
+// release can be held back centrally. If OzServer cannot answer, GitHub's releases API is asked
+// directly. Either way the file itself is only ever downloaded from this repository's own GitHub
+// releases (DownloadPrefix).
 //
-// Windows does allow a *loaded* file to be renamed, though (the loader shares it for delete, which is
-// what Chrome and Firefox's updaters lean on too), so the update is staged instead:
+// A plugin cannot replace its own file: vatSys holds OzServerPlugin.dll open for the whole session,
+// so it cannot be overwritten or deleted while running. Windows does allow a loaded file to be
+// renamed, so the update is staged:
 //
-//   1. download the new DLL alongside the current one, as .update
-//   2. verify it before it is allowed anywhere near the plugin folder's live name
-//   3. rename the running DLL to .backup, and move .update into its place
-//   4. next time vatSys starts it loads the new one, and deletes the .backup
+//   1. download the new DLL beside the current one, as .update
+//   2. verify it (VerifyDownload, IsValidUpgrade)
+//   3. rename the running DLL to .backup and move .update into its place
+//   4. the next vatSys start loads the new DLL and deletes the .backup
 //
-// The controller sees nothing at any point; the session they are in keeps running the version it
-// started with, and the new one is simply there next time.
-//
-// Neither staging file can itself be mistaken for a plugin - vatSys scans the Plugins tree for *.dll,
-// and these end in .update/.backup - so a half-finished download is never something vatSys tries to
-// load.
-//
-// Nothing is deleted while it might still be needed. The previous version stays on disk as .backup
-// until a later session has successfully started, and step 4 only runs once this plugin has loaded -
-// so if an update ever *does* ship something that won't load, the backup is still sitting there and
-// recovering is renaming one file back.
+// The running session keeps the version it started with. Neither staging file ends in .dll, so
+// vatSys never tries to load one, and the previous version stays on disk as .backup until a later
+// session has started successfully - recovering from a bad release is renaming that file back.
 public class PluginUpdater
 {
-    // The list endpoint, not /releases/latest.
-    //
-    // /latest excludes prereleases, and every release published so far is marked prerelease - so it
-    // answered 404 and this quietly concluded there was nothing to update to. Every session, since
-    // the updater was written. The list includes them, so a prerelease is found like any other.
-    //
-    // Drafts still have to be excluded by hand, since the list does include those and a draft is not
-    // something anyone should be handed.
-    const string ReleasesApi = "https://api.github.com/repos/JoshuaMicallefYBSU/OzServer-Plugin/releases";
+    const string Repository = "JoshuaMicallefYBSU/OzServer-Plugin";
+
+    // The list endpoint rather than /releases/latest, which excludes prereleases - and releases are
+    // published as prereleases.
+    const string GitHubReleasesApi = "https://api.github.com/repos/" + Repository + "/releases";
+
+    // The only location a download is accepted from, whichever source named it. A base URL changed
+    // in settings, or a compromised OzServer, can choose among published releases but cannot serve
+    // a file of its own.
+    const string DownloadPrefix = "https://github.com/" + Repository + "/releases/download/";
+
     const string AssetName = "OzServerPlugin.dll";
     const string AssemblyIdentity = "OzServerPlugin";
 
-    // Long enough that the check never competes with vatSys's own startup, which is when a controller
-    // is most likely to be waiting on the radar to come up.
+    // Far above any real build (about 300 KB), and a bound on what a bad response can make us buffer.
+    const long MaxDownloadBytes = 20 * 1024 * 1024;
+
+    // Clear of vatSys's own startup, when a controller is waiting on the radar to come up.
     static readonly TimeSpan StartupDelay = TimeSpan.FromMinutes(2);
-    // A session can run for a whole shift; this catches a release published part-way through one.
+    // Catches a release published during a long session.
     static readonly TimeSpan CheckInterval = TimeSpan.FromHours(6);
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
 
-    // Held for the plugin's lifetime, like the other timer-driven syncs - there is no plugin shutdown
-    // hook to dispose it in, and the process ending is what stops it.
+    // Held for the plugin's lifetime: vatSys gives a plugin no shutdown hook to dispose it in.
     readonly Timer _timer;
+
+    sealed class Release
+    {
+        public Version Version = new();
+        public string Url = "";
+        // Hex SHA-256 of the asset, when the source reported one.
+        public string? Sha256;
+        public bool IsZip;
+    }
 
     public PluginUpdater()
     {
-        // Anything left from a previous session's update can go now: whatever was holding the old file
-        // open was the *previous* process, which no longer exists.
+        // The process that held the previous version open has exited, so its backup can go.
         TryDeleteStaleBackup();
 
         _timer = new Timer(_ => _ = CheckAsync(), null, StartupDelay, CheckInterval);
@@ -82,110 +87,134 @@ public class PluginUpdater
             var current = Assembly.GetExecutingAssembly().GetName().Version;
             var installedPath = Assembly.GetExecutingAssembly().Location;
 
-            // No path means the assembly came from somewhere other than a file on disk (shadow
-            // copying, a host that streams it). There is nothing to replace.
+            // An assembly that was not loaded from a file on disk has nothing to replace.
             if (string.IsNullOrEmpty(installedPath) || !File.Exists(installedPath))
                 return;
 
-            var (version, downloadUrl, isZip) = await GetLatestReleaseAsync().ConfigureAwait(false);
-
-            if (version == null || downloadUrl == null || version.CompareTo(current) <= 0)
+            var release = await FindReleaseAsync().ConfigureAwait(false);
+            if (release == null || release.Version.CompareTo(current) <= 0)
                 return;
 
             var staged = installedPath + ".update";
-            await DownloadAsync(downloadUrl, staged, isZip).ConfigureAwait(false);
+            await DownloadAsync(release, staged).ConfigureAwait(false);
 
-            // Verified before it is allowed to take the live name. A truncated download, or an error
-            // page saved under a .dll name, would otherwise be what vatSys tries to load next time -
-            // and a plugin that fails to load takes every controller's sector syncing with it.
+            // Checked before the file can take the live name: a plugin that fails to load takes
+            // sector syncing with it.
             if (!IsValidUpgrade(staged, current))
             {
                 TryDelete(staged);
-                ActionLog.Log("Update", $"Discarded the {version} download - it isn't a newer {AssemblyIdentity}.");
+                ActionLog.Log("Update", $"Discarded the {release.Version} download - it isn't a newer {AssemblyIdentity}.");
                 return;
             }
 
             Install(installedPath, staged);
 
-            // Done for this session. The running assembly is still the old version, so without this
-            // the next check would compare against it, decide it is out of date all over again, and
-            // reinstall on top of the file it just wrote - overwriting the real backup in the process.
+            // The running assembly is still the old version, so a later check would find the same
+            // release again and reinstall over the backup. One install per session.
             _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
 
-            ActionLog.Log("Update", $"Updated to {version}; it will be used the next time vatSys starts.");
+            ActionLog.Log("Update", $"Updated to {release.Version}; it will be used the next time vatSys starts.");
 
-            // Not an error, despite the call. The Errors window is simply the only notification
-            // surface vatSys gives a plugin, and this is worth one line: the controller is running a
-            // version that is no longer the one on disk, and restarting is what closes that gap.
-            //
-            // It behaves well for the purpose - ErrorWindow.AddError shows the window with
-            // SW_SHOWNOACTIVATE and SetWindowPos(..., NOACTIVATE), so it appears above the main form
-            // without stealing focus from anything the controller is doing, and Errors_Changed
-            // marshals to the UI thread itself (BeginInvoke when InvokeRequired), which matters
-            // because this runs on the timer's threadpool thread.
-            //
-            // Worded without "for OzServer": the label is rendered as Source + ": " + Message, so the
-            // line already reads "OzServer: An update ...".
+            // Not an error, but the Errors window is the only notification surface vatSys gives a
+            // plugin. It is shown without taking focus and marshals to the UI thread itself, so it
+            // is safe to call from this timer thread. vatSys prefixes the source, so the line reads
+            // "OzServer: An update ...". An OzServerNotice, so it is not reported as a failure.
             Errors.Add(
-                new Exception($"An update ({version}) was detected and installed. It will be loaded at the next vatSys launch."),
+                new OzServerNotice($"An update ({release.Version}) was detected and installed. It will be loaded at the next vatSys launch."),
                 "OzServer");
         }
         // OperationCanceledException covers the TaskCanceledException HttpClient raises on timeout.
-        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
         {
-            // Offline, or GitHub is having a moment. Not worth putting in front of a controller in the
-            // Errors window - there is nothing for them to do about it, and the version they already
-            // have keeps working - so it goes to the log and the next check picks it up.
-            ActionLog.Log("Update", $"Couldn't reach GitHub to check for an update: {ex.Message}");
+            // Offline, or the source is unavailable. The installed version keeps working and the
+            // next check retries, so this goes to the log rather than in front of the controller.
+            ActionLog.Log("Update", $"Couldn't check for an update: {ex.Message}");
         }
         catch (Exception ex)
         {
-            // Anything else is unexpected enough to be worth surfacing - a permissions problem on the
-            // plugin folder, say, which does need someone to look at it.
+            // Anything else needs someone to look at it - a plugin folder that isn't writable, say.
             Errors.Add(new Exception($"Couldn't check for a plugin update: {ex.Message}", ex), "OzServer");
         }
     }
 
-    static async Task<(Version? Version, string? DownloadUrl, bool IsZip)> GetLatestReleaseAsync()
+    // OzServer's answer if it gives one, GitHub's otherwise. Null when there is no release to offer.
+    static async Task<Release?> FindReleaseAsync()
+    {
+        // A disabled session sends nothing to OzServer, and this is no exception.
+        if (!OzServerMode.Disabled)
+        {
+            try
+            {
+                var (answered, release) = await GetOzServerReleaseAsync().ConfigureAwait(false);
+                if (answered)
+                    return release;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
+            {
+                ActionLog.Log("Update", $"OzServer couldn't be asked for the current release ({ex.Message}); asking GitHub instead.");
+            }
+        }
+
+        return await GetGitHubReleaseAsync().ConfigureAwait(false);
+    }
+
+    // Answered is false when OzServer has nothing usable to say - an older backend without the
+    // endpoint, one that has not reached GitHub yet, or a reply naming a download this plugin will
+    // not accept - and the caller should ask GitHub instead.
+    static async Task<(bool Answered, Release? Release)> GetOzServerReleaseAsync()
     {
         using var client = CreateClient();
-        using var response = await client.GetAsync(ReleasesApi).ConfigureAwait(false);
+        using var response = await client.GetAsync(OzServerSettings.BaseUrl + "/api/v1/plugin/release").ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            return (false, null);
 
-        // A repository with no releases at all answers 404 here, which is a perfectly ordinary state
-        // and not a failure worth logging every session. Handled before EnsureSuccessStatusCode so
-        // it isn't reported as an error.
+        var body = JToken.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+
+        // A JSON null is a definite answer: there is no release to offer.
+        if (body.Type == JTokenType.Null)
+            return (true, null);
+
+        var url = (string?)body["url"];
+        if (body.Type != JTokenType.Object
+            || !TryParseVersion((string?)body["version"], out var version)
+            || !IsAcceptedDownload(url))
+            return (false, null);
+
+        return (true, new Release { Version = version, Url = url!, Sha256 = (string?)body["sha256"] });
+    }
+
+    static async Task<Release?> GetGitHubReleaseAsync()
+    {
+        using var client = CreateClient();
+        using var response = await client.GetAsync(GitHubReleasesApi).ConfigureAwait(false);
+
+        // A repository with no releases answers 404, which is an ordinary state rather than a failure.
         if (response.StatusCode == HttpStatusCode.NotFound)
-            return (null, null, false);
+            return null;
 
         response.EnsureSuccessStatusCode();
 
         var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
-        Version? bestVersion = null;
-        string? bestUrl = null;
-        var bestIsZip = false;
+        Release? best = null;
 
         foreach (var release in JArray.Parse(body))
         {
             if ((bool?)release["draft"] == true)
                 continue;
 
-            // Tags are conventionally written "v0.1.2"; the leading v is not part of the version.
-            var tag = (string?)release["tag_name"];
-            if (tag == null || !Version.TryParse(tag.TrimStart('v', 'V'), out var version))
+            if (!TryParseVersion((string?)release["tag_name"], out var version))
                 continue;
 
-            if (bestVersion != null && version.CompareTo(bestVersion) <= 0)
+            if (best != null && version.CompareTo(best.Version) <= 0)
                 continue;
 
-            // The releases published so far attach the plugin as OzServerPlugin-v0.1.4.zip, not as a
-            // bare OzServerPlugin.dll - so matching only the exact DLL name found nothing even once
-            // the 404 above was dealt with. A raw DLL is still preferred where one exists; a zip is
-            // unpacked after download.
             var assets = release["assets"];
             if (assets == null)
                 continue;
 
+            // A bare DLL is preferred. Early releases attached only a zip, which is unpacked after
+            // download.
             var dll = assets.FirstOrDefault(a =>
                 string.Equals((string?)a["name"], AssetName, StringComparison.OrdinalIgnoreCase));
 
@@ -194,34 +223,53 @@ public class PluginUpdater
                 : null;
 
             var chosen = dll ?? zip;
-            if (chosen == null)
+            var url = (string?)chosen?["browser_download_url"];
+            if (chosen == null || !IsAcceptedDownload(url))
                 continue;
 
-            bestVersion = version;
-            bestUrl = (string?)chosen["browser_download_url"];
-            bestIsZip = dll == null;
+            // GitHub reports the digest as "sha256:<hex>"; older assets have none.
+            var digest = (string?)chosen["digest"];
+
+            best = new Release
+            {
+                Version = version,
+                Url = url!,
+                Sha256 = digest != null && digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) ? digest.Substring(7) : null,
+                IsZip = dll == null
+            };
         }
 
-        return (bestVersion, bestUrl, bestIsZip);
+        return best;
     }
 
-    static async Task DownloadAsync(string url, string destination, bool isZip)
+    // Tags are written "v0.1.2"; the leading v is not part of the version.
+    static bool TryParseVersion(string? text, out Version version)
+    {
+        version = new Version();
+        return text != null && Version.TryParse(text.Trim().TrimStart('v', 'V'), out version!);
+    }
+
+    static bool IsAcceptedDownload(string? url) =>
+        url != null && url.StartsWith(DownloadPrefix, StringComparison.OrdinalIgnoreCase);
+
+    static async Task DownloadAsync(Release release, string destination)
     {
         using var client = CreateClient();
-        var bytes = await client.GetByteArrayAsync(url).ConfigureAwait(false);
+        client.MaxResponseContentBufferSize = MaxDownloadBytes;
+        var bytes = await client.GetByteArrayAsync(release.Url).ConfigureAwait(false);
+
+        VerifyDownload(bytes, release);
 
         TryDelete(destination);
 
-        if (!isZip)
+        if (!release.IsZip)
         {
             File.WriteAllBytes(destination, bytes);
             return;
         }
 
-        // Unpacked to the same staged path a raw DLL would have been written to, so everything
-        // downstream - the assembly-identity check, the rename dance - is identical either way.
-        // Whatever comes out still has to pass IsValidUpgrade before it can take the live name, so a
-        // zip containing the wrong thing is caught exactly like a truncated download is.
+        // Unpacked to the same staged path a bare DLL is written to, so everything after this point
+        // is identical either way.
         var archivePath = destination + ".zip";
         try
         {
@@ -242,12 +290,23 @@ public class PluginUpdater
         }
     }
 
-    // Confirms the download really is a newer build of *this* plugin before it is allowed to replace
-    // anything.
-    //
-    // GetAssemblyName reads the file's metadata and closes it again without adding the assembly to
-    // this domain, which is the point: whether the file can be trusted is not a question to answer by
-    // first running it. It also leaves no handle behind, so the move below is free to rename it.
+    // Catches a truncated or substituted download before anything is written. A release with no
+    // recorded digest is still held to IsValidUpgrade.
+    static void VerifyDownload(byte[] bytes, Release release)
+    {
+        if (string.IsNullOrWhiteSpace(release.Sha256))
+            return;
+
+        using var sha = SHA256.Create();
+        var actual = BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "");
+
+        if (!string.Equals(actual, release.Sha256!.Trim(), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"The {release.Version} download does not match its published checksum.");
+    }
+
+    // Whether the staged file is a newer build of this plugin. GetAssemblyName reads the metadata
+    // without loading the assembly, so the file is never run in order to be judged, and no handle
+    // is left open to block the rename.
     static bool IsValidUpgrade(string path, Version? current)
     {
         try
@@ -260,20 +319,19 @@ public class PluginUpdater
         }
         catch
         {
-            // Not a managed assembly at all - a truncated download, or an error page.
+            // Not a managed assembly - a truncated download or an error page.
             return false;
         }
     }
 
-    // Renames the running DLL aside and moves the new one into its place. Both are permitted on a file
-    // Windows currently has loaded; deleting or overwriting one is not, which is why the update is
-    // done this way round rather than simply writing over the top.
+    // Renames the running DLL aside and moves the new one into its place. Windows permits both on
+    // a loaded file, where it would refuse a delete or an overwrite.
     static void Install(string installedPath, string staged)
     {
         var backup = installedPath + ".backup";
         TryDelete(backup);
 
-        // If this throws, nothing has moved yet and the folder is still exactly as it was.
+        // If this throws, nothing has moved and the folder is as it was.
         File.Move(installedPath, backup);
 
         try
@@ -282,8 +340,7 @@ public class PluginUpdater
         }
         catch
         {
-            // Put the working version back rather than leaving the plugin folder with no DLL at all,
-            // which would stop the plugin loading entirely next time.
+            // Put the working version back rather than leave the folder with no DLL to load.
             File.Move(backup, installedPath);
             throw;
         }
@@ -299,7 +356,7 @@ public class PluginUpdater
         }
         catch
         {
-            // Housekeeping only, and the next start will try again.
+            // Housekeeping only; the next start tries again.
         }
     }
 
@@ -312,7 +369,7 @@ public class PluginUpdater
         }
         catch
         {
-            // Still locked, or not ours to remove. Left where it is.
+            // Still locked, or not ours to remove.
         }
     }
 
@@ -320,19 +377,19 @@ public class PluginUpdater
     {
         try
         {
-            // .NET Framework 4.7.2 picks its protocol from this rather than from the OS default, and
+            // .NET Framework 4.7.2 takes its protocols from here rather than the OS default, and
             // GitHub refuses anything below TLS 1.2.
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
         }
         catch
         {
-            // Best-effort - an older Windows build may not define Tls12 in this enum at all.
+            // Best effort.
         }
 
         var client = new HttpClient { Timeout = RequestTimeout };
         // GitHub rejects API requests that don't identify themselves.
         client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue(AssemblyIdentity, "1.0"));
-        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         return client;
     }
 }
