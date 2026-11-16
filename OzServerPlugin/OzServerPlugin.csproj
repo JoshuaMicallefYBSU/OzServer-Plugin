@@ -10,7 +10,7 @@
 
         <AssemblyName>OzServerPlugin</AssemblyName>
         <RootNamespace>OzServerPlugin</RootNamespace>
-        <Version>0.2.2</Version>
+        <Version>0.2.3</Version>
     </PropertyGroup>
 
     <PropertyGroup>
