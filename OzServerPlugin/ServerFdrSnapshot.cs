@@ -10,8 +10,9 @@ public static class ServerFdrSnapshot
 {
     public readonly struct Entry
     {
-        public Entry(DateTimeOffset? lastSeenAt, string? authoritySector, int? controllingCid)
+        public Entry(DateTimeOffset? lastSeenAt, string? authoritySector, int? controllingCid, string? controllingCallsign)
         {
+            ControllingCallsign = controllingCallsign;
             LastSeenAt = lastSeenAt;
             AuthoritySector = authoritySector;
             ControllingCid = controllingCid;
@@ -20,6 +21,7 @@ public static class ServerFdrSnapshot
         public DateTimeOffset? LastSeenAt { get; }
         public string? AuthoritySector { get; }
         public int? ControllingCid { get; }
+        public string? ControllingCallsign { get; }
     }
 
     static readonly object Gate = new();
@@ -32,7 +34,7 @@ public static class ServerFdrSnapshot
         foreach (var record in records)
         {
             if (!string.IsNullOrEmpty(record.Callsign))
-                entries[record.Callsign] = new Entry(record.LastSeenAt, record.AuthoritySector, record.ControllingCid);
+                entries[record.Callsign] = new Entry(record.LastSeenAt, record.AuthoritySector, record.ControllingCid, record.ControllingCallsign);
         }
 
         lock (Gate)

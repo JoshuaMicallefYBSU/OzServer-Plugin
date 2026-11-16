@@ -343,9 +343,16 @@ public class FdrSync
 
     // Tracked by a controller who is not on OzServer - a neighbouring FIR's, or anyone without the
     // plugin. They never report it, so for reporting it counts as untracked and the untracked rules
-    // decide who keeps the record current. "Not on OzServer" means they hold no OzServer sector and
-    // no OzServer client reports itself as the flight's controller; the second test keeps an
-    // OzServer user who holds nothing yet from being taken for an outsider.
+    // decide who keeps the record current.
+    //
+    // OzServer lists every controller whose plugin is calling it (PluginClients), and that decides.
+    // Holding a sector also counts, for the moment between a controller's claim and the next sync.
+    //
+    // Without the list (a backend that predates it), a controller who holds no sector counts as on
+    // OzServer only while the record names them as the controller. Any name used to do: a tag
+    // handed to a controller without the plugin kept the record naming whoever handed it over, and
+    // every client then left it to the new controller, who never reports - so FDX656 sat in
+    // handover on OzServer.
     bool TrackedOutsideOzServer(FDP2.FDR fdr)
     {
         var tracker = fdr.ControllerTracking?.Callsign;
@@ -353,7 +360,13 @@ public class FdrSync
             return false;
         if (_tracker.ControlledByOthers.Values.Any(o => string.Equals(o.Callsign, tracker, StringComparison.OrdinalIgnoreCase)))
             return false;
-        if (!string.IsNullOrEmpty(fdr.Callsign) && ServerFdrSnapshot.TryGet(fdr.Callsign, out var entry) && entry.ControllingCid != null)
+
+        if (_tracker.PluginClients is { } pluginClients)
+            return !pluginClients.Contains(tracker!);
+
+        if (!string.IsNullOrEmpty(fdr.Callsign) && ServerFdrSnapshot.TryGet(fdr.Callsign, out var entry)
+            && entry.ControllingCid != null
+            && string.Equals(entry.ControllingCallsign, tracker, StringComparison.OrdinalIgnoreCase))
             return false;
         return true;
     }

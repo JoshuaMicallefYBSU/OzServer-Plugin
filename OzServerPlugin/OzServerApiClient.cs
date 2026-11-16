@@ -87,6 +87,9 @@ public class OzServerSyncDto
     [JsonProperty("mine")] public List<OzServerSectorDto> Mine { get; set; } = new();
     [JsonProperty("controlled")] public List<OzServerControlledSectorDto> Controlled { get; set; } = new();
     [JsonProperty("requests")] public OzServerMyRequestsDto Requests { get; set; } = new();
+    // Every controller whose plugin is calling OzServer now, sectors or not. Null from a backend
+    // that predates the list - see OzServerOwnershipTracker.PluginClients.
+    [JsonProperty("plugin_clients")] public List<OzServerControlledSectorOwnerDto>? PluginClients { get; set; }
 }
 
 public class OzServerAcceptBatchResultDto

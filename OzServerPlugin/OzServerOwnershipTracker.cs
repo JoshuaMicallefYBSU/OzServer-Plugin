@@ -176,6 +176,10 @@ public class OzServerOwnershipTracker
     // fetching its own.
     public IReadOnlyDictionary<string, OzServerControlledSectorOwnerDto> ControlledByOthers => _controlled;
 
+    // Callsigns of every controller running the plugin now, this one included, from the last sync.
+    // Null until a sync has carried the list, or when the backend does not send one.
+    public HashSet<string>? PluginClients { get; private set; }
+
     public bool IsMine(SectorsVolumes.Sector sector) => _owned.Any(o => o.Equals(sector));
 
     // Whoever OzServer says holds the sector: a synthetic record for this session when it is in
@@ -263,6 +267,7 @@ public class OzServerOwnershipTracker
 
         _owned = new List<SectorsVolumes.Sector>();
         _controlled = new Dictionary<string, OzServerControlledSectorOwnerDto>(StringComparer.OrdinalIgnoreCase);
+        PluginClients = null;
         _hasBaseline = false;
         _pendingRequestSignature = null;
         MyRequests = new OzServerMyRequestsDto();
@@ -926,6 +931,10 @@ public class OzServerOwnershipTracker
         _controlled = sync.Controlled
             .Where(c => c.Owner != null)
             .ToDictionary(c => c.Name, c => c.Owner!, StringComparer.OrdinalIgnoreCase);
+
+        PluginClients = sync.PluginClients == null
+            ? null
+            : new HashSet<string>(sync.PluginClients.Select(c => c.Callsign), StringComparer.OrdinalIgnoreCase);
 
         ApplyRequests(sync.Requests);
 
