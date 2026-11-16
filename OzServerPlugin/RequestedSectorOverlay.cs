@@ -13,9 +13,12 @@ namespace OzServerPlugin;
 //                                    Yellow.
 //   Outgoing ("Requested By Me")   - this controller is asking for, or has staged, sectors.
 //                                    Light green.
+//   Releasing                      - sectors staged out of Owned in the Sectors window, which
+//                                    Apply will give back. Soft red.
 //
-// OzServerSectorsWindow draws a swatch of each colour beside its headings from IncomingColour and
-// OutgoingColour (SectorsView_DrawNode), so the legend cannot drift from the highlight.
+// OzServerSectorsWindow draws a swatch of each colour from IncomingColour, OutgoingColour and
+// ReleasingColour (SectorsView_DrawNode, the Owned heading), so the legend cannot drift from the
+// highlight.
 //
 // Shown only while the Sectors window is open (SetRevealed). The highlight answers "which airspace
 // is this", and painting the scope before the controller has gone to look would interrupt someone
@@ -31,18 +34,24 @@ public class RequestedSectorOverlay
 
     const byte IncomingRed = 255, IncomingGreen = 235, IncomingBlue = 0; // yellow
     const byte OutgoingRed = 144, OutgoingGreen = 238, OutgoingBlue = 144; // light green
+    // Red for "going away", softened to the lightness of the other two so the three read as one
+    // family, and kept clear of vatSys's own saturated alert reds.
+    const byte ReleasingRed = 255, ReleasingGreen = 120, ReleasingBlue = 110; // soft red
     const byte FillAlpha = 70;
     const byte BorderAlpha = 255;
     const float BorderWidth = 2f;
 
     public static Color IncomingColour { get; } = Color.FromArgb(IncomingRed, IncomingGreen, IncomingBlue);
     public static Color OutgoingColour { get; } = Color.FromArgb(OutgoingRed, OutgoingGreen, OutgoingBlue);
+    public static Color ReleasingColour { get; } = Color.FromArgb(ReleasingRed, ReleasingGreen, ReleasingBlue);
 
     readonly OzServerOwnershipTracker _tracker;
     readonly AsdMapLayer _incomingFill;
     readonly AsdMapLayer _incomingBorder;
     readonly AsdMapLayer _outgoingFill;
     readonly AsdMapLayer _outgoingBorder;
+    readonly AsdMapLayer _releasingFill;
+    readonly AsdMapLayer _releasingBorder;
 
     // Tracked whether or not anything is on screen, so opening the window shows what is already
     // pending.
@@ -53,6 +62,8 @@ public class RequestedSectorOverlay
     // one list to the other.
     List<SectorsVolumes.Sector> _stagedOutgoing = new();
     List<SectorsVolumes.Sector> _confirmedOutgoing = new();
+    // Staged releases, expanded to everything each gives back (see SetStaged).
+    List<SectorsVolumes.Sector> _stagedReleases = new();
     bool _revealed;
     // The last line ApplyNow logged. RequestsChanged fires on every sync, so a line is written
     // only when it differs.
@@ -71,6 +82,11 @@ public class RequestedSectorOverlay
             OutgoingRed, OutgoingGreen, OutgoingBlue, FillAlpha, PoolSize, lineWidth: null);
         _outgoingBorder = new AsdMapLayer("OzServer Requesting Border", "OzServerRequestingSectorBorder",
             OutgoingRed, OutgoingGreen, OutgoingBlue, BorderAlpha, PoolSize, BorderWidth);
+
+        _releasingFill = new AsdMapLayer("OzServer Releasing", "OzServerReleasingSector",
+            ReleasingRed, ReleasingGreen, ReleasingBlue, FillAlpha, PoolSize, lineWidth: null);
+        _releasingBorder = new AsdMapLayer("OzServer Releasing Border", "OzServerReleasingSectorBorder",
+            ReleasingRed, ReleasingGreen, ReleasingBlue, BorderAlpha, PoolSize, BorderWidth);
 
         _tracker.IncomingRequestsChanged += (_, requests) => SetIncoming(SectorsIn(requests));
         // Unlike IncomingRequestsChanged, RequestsChanged fires on every sync whether or not the
@@ -129,10 +145,13 @@ public class RequestedSectorOverlay
     //                    which is what a claim asks for (claimGroup in the API).
     //   stagedRequests - narrowed to the covered sectors held by the named sector's current owner.
     //                    Nothing has been sent, so there is no TargetCid; that owner stands in.
+    //   stagedReleases - expanded through the covered group and narrowed to what this controller
+    //                    owns, which is what a release gives back (releaseGroup in the API).
     //
     // Called from OzServerSectorsWindow.RefreshStagedHighlight, which every staging change goes
     // through.
-    public void SetStaged(IReadOnlyList<SectorsVolumes.Sector> stagedClaims, IReadOnlyList<SectorsVolumes.Sector> stagedRequests)
+    public void SetStaged(IReadOnlyList<SectorsVolumes.Sector> stagedClaims, IReadOnlyList<SectorsVolumes.Sector> stagedRequests,
+        IReadOnlyList<SectorsVolumes.Sector> stagedReleases)
     {
         if (OzServerMode.Disabled)
             return;
@@ -146,6 +165,13 @@ public class RequestedSectorOverlay
         });
 
         _stagedOutgoing = claimed.Concat(requested)
+            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+
+        _stagedReleases = stagedReleases
+            .SelectMany(PrimaryPosition.CoveredBy)
+            .Where(_tracker.IsMine)
             .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
             .Select(group => group.First())
             .ToList();
@@ -172,6 +198,7 @@ public class RequestedSectorOverlay
         _incoming = new List<SectorsVolumes.Sector>();
         _stagedOutgoing = new List<SectorsVolumes.Sector>();
         _confirmedOutgoing = new List<SectorsVolumes.Sector>();
+        _stagedReleases = new List<SectorsVolumes.Sector>();
         Apply();
     }
 
@@ -192,15 +219,18 @@ public class RequestedSectorOverlay
                 .Select(group => group.First())
                 .ToList()
             : new List<SectorsVolumes.Sector>();
+        var releasing = _revealed ? _stagedReleases : new List<SectorsVolumes.Sector>();
         // The same sectors as last time need no new shapes. This runs after every sync, and the
         // merge is the most expensive thing it does - on the UI thread.
-        var shapesKey = string.Join(",", incoming.Select(s => s.Name)) + "|" + string.Join(",", outgoing.Select(s => s.Name));
+        var shapesKey = string.Join(",", incoming.Select(s => s.Name)) + "|" + string.Join(",", outgoing.Select(s => s.Name))
+                        + "|" + string.Join(",", releasing.Select(s => s.Name));
         if (shapesKey != _lastShapesKey)
         {
             _lastShapesKey = shapesKey;
 
             var incomingPolygons = incoming.SelectMany(Boundaries).ToList();
             var outgoingPolygons = outgoing.SelectMany(Boundaries).ToList();
+            var releasingPolygons = releasing.SelectMany(Boundaries).ToList();
 
             // The border outlines every volume, so the sector boundaries show inside the shading;
             // the fill is their merged outline, so overlapping volumes are shaded once (see
@@ -209,13 +239,16 @@ public class RequestedSectorOverlay
             _incomingBorder.SetPolygons(incomingPolygons);
             _outgoingFill.SetPolygons(SectorFill.Merge(outgoingPolygons));
             _outgoingBorder.SetPolygons(outgoingPolygons);
+            _releasingFill.SetPolygons(SectorFill.Merge(releasingPolygons));
+            _releasingBorder.SetPolygons(releasingPolygons);
         }
 
-        var message = incoming.Count == 0 && outgoing.Count == 0
-            ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing pending, revealed={_revealed})"
-            : $"{incoming.Count} incoming, {outgoing.Count} outgoing sector(s) highlighted"
+        var message = incoming.Count == 0 && outgoing.Count == 0 && releasing.Count == 0
+            ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing, {_stagedReleases.Count} releasing pending, revealed={_revealed})"
+            : $"{incoming.Count} incoming, {outgoing.Count} outgoing, {releasing.Count} releasing sector(s) highlighted"
               + (incoming.Count > 0 ? $" - from me: {string.Join(", ", incoming.Select(s => s.Name))}" : "")
-              + (outgoing.Count > 0 ? $" - by me: {string.Join(", ", outgoing.Select(s => s.Name))}" : "");
+              + (outgoing.Count > 0 ? $" - by me: {string.Join(", ", outgoing.Select(s => s.Name))}" : "")
+              + (releasing.Count > 0 ? $" - releasing: {string.Join(", ", releasing.Select(s => s.Name))}" : "");
 
         if (message == _lastLogged)
             return;

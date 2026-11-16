@@ -39,8 +39,13 @@ public class OzServerSectorsWindow : BaseForm
     const string NothingControlled = "No sectors controlled by anyone else";
     const string ControlledUnavailable = "Not connected - can't list controlled sectors";
     const string LoadingControlled = "Loading controlled sectors...";
-    const string RequestedByMeName = "Requested By Me";
-    const string RequestedFromMeName = "Requested From Me";
+    // The three headings of Requested Changes. Each carries the swatch of the colour its sectors
+    // are shaded with on the scope (RequestedSectorOverlay): green, yellow, red. Matched by text
+    // throughout, so the wording lives only here.
+    const string RequestedByMeName = "Request Sector Jurisdiction";
+    const string RequestedFromMeName = "Transfer Sector Authority";
+    const string DropSectorsName = "Drop Sectors";
+    const string NoSectorsToDrop = "No sectors to drop";
     // Plain ASCII rather than an arrow glyph: vatSys's UI font (Terminus, the GenericButton
     // default) is not guaranteed to include one, and vatsys.SectorsWindow uses "<<"/">>"/"<<>>"
     // for the same meaning.
@@ -904,9 +909,11 @@ public class OzServerSectorsWindow : BaseForm
     // directions: a sector staged into Owned, and one staged out that reappears in Available.
     bool IsStagedNode(TreeNode node)
     {
+        // Every row under Drop Sectors is staged, including group members released with a staged
+        // sector, which are not in _stagedNames themselves.
         return node.Tag is SectorsVolumes.Sector sector
                && !sector.IsDummy
-               && _stagedNames.Contains(sector.Name);
+               && (_stagedNames.Contains(sector.Name) || CategoryNameOf(node) == DropSectorsName);
     }
 
     // Whether this row, or anything nested under it, has an incoming request waiting on it. Holds
@@ -1049,24 +1056,88 @@ public class OzServerSectorsWindow : BaseForm
         // list is shaded with on the scope, read from RequestedSectorOverlay so the legend cannot
         // drift from the highlight. Drawn after the clip is restored: an unselected row's clip is
         // only the text's bounding box, and a swatch placed past the text would be clipped away.
-        if (IsCategoryNode(e.Node) && (e.Node.Text == RequestedByMeName || e.Node.Text == RequestedFromMeName))
+        if (IsCategoryNode(e.Node))
         {
-            var swatchColour = e.Node.Text == RequestedByMeName
-                ? RequestedSectorOverlay.OutgoingColour
-                : RequestedSectorOverlay.IncomingColour;
+            if (e.Node.Text == RequestedByMeName)
+                DrawSwatch(e, RequestedSectorOverlay.OutgoingColour);
+            else if (e.Node.Text == RequestedFromMeName)
+                DrawSwatch(e, RequestedSectorOverlay.IncomingColour);
+            else if (e.Node.Text == DropSectorsName)
+                DrawSwatch(e, RequestedSectorOverlay.ReleasingColour);
+        }
+    }
 
-            var textWidth = TextRenderer.MeasureText(e.Graphics, e.Node.Text, e.Node.NodeFont).Width;
-            const int swatchSize = 10;
-            const int swatchGap = 8;
-            var swatchRect = new Rectangle(
-                e.Node.Bounds.Left + textWidth + swatchGap,
-                e.Node.Bounds.Top + (e.Node.Bounds.Height - swatchSize) / 2,
-                swatchSize, swatchSize);
+    static void DrawSwatch(DrawTreeNodeEventArgs e, Color colour)
+    {
+        var textWidth = TextRenderer.MeasureText(e.Graphics, e.Node.Text, e.Node.NodeFont).Width;
+        const int swatchSize = 10;
+        const int swatchGap = 8;
+        var swatchRect = new Rectangle(
+            e.Node.Bounds.Left + textWidth + swatchGap,
+            e.Node.Bounds.Top + (e.Node.Bounds.Height - swatchSize) / 2,
+            swatchSize, swatchSize);
 
-            using var swatchBrush = new SolidBrush(swatchColour);
-            e.Graphics.FillRectangle(swatchBrush, swatchRect);
-            using var swatchPen = new Pen(Color.FromArgb(180, Color.Black));
-            e.Graphics.DrawRectangle(swatchPen, swatchRect);
+        using var swatchBrush = new SolidBrush(colour);
+        e.Graphics.FillRectangle(swatchBrush, swatchRect);
+        using var swatchPen = new Pen(Color.FromArgb(180, Color.Black));
+        e.Graphics.DrawRectangle(swatchPen, swatchRect);
+    }
+
+    // The staged releases (ApplyButton_Click's toRelease) as Drop Sectors' top-level rows. One
+    // covered by another staged release is left to appear nested under it, as in Owned.
+    List<SectorsVolumes.Sector> DropRoots()
+    {
+        if (_stagedNames.Count == 0)
+            return new List<SectorsVolumes.Sector>();
+
+        var released = _tracker.Owned
+            .Where(o => !o.IsDummy && _stagedNames.Contains(o.Name) && !IsSelected(o))
+            .ToList();
+
+        return released
+            .Where(sector => !released.Any(other => other.Name != sector.Name
+                && PrimaryPosition.CoveredBy(other).Any(c => c.Name == sector.Name)))
+            .OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    // Mirrors BuildOwnedSectorNodeCore: a group is a dropdown of its dataset sub-sectors, listing
+    // only those OzServer records as this controller's - what the release gives back (the same
+    // set RequestedSectorOverlay shades red). The self-reference is a leaf, and depth bounds any
+    // cycle, as there.
+    TreeNode BuildDropSectorNode(SectorsVolumes.Sector sector, int depth)
+    {
+        var node = new TreeNode { Tag = sector, NodeFont = _requestedChangesView.Font };
+
+        if (sector.SubSectors.Count > 0 && depth < 8 && SectorsVolumes.SectorGroupings.TryGetValue(sector, out var children))
+        {
+            foreach (var child in children)
+            {
+                if (ReferenceEquals(child, sector))
+                {
+                    var text = LeafText(FormatSectorText(child));
+                    node.Nodes.Add(new TreeNode(text) { Tag = child, NodeFont = node.NodeFont, ToolTipText = text });
+                }
+                else if (_tracker.IsMine(child))
+                {
+                    node.Nodes.Add(BuildDropSectorNode(child, depth + 1));
+                }
+            }
+        }
+
+        ApplySectorNodeText(node, FormatSectorText(sector));
+        return node;
+    }
+
+    void ExpandDropGroups(TreeNode parent)
+    {
+        foreach (TreeNode child in parent.Nodes)
+        {
+            if (child.Nodes.Count == 0)
+                continue;
+            child.Expand();
+            RefreshDropdownNodeText(child);
+            ExpandDropGroups(child);
         }
     }
 
@@ -1462,7 +1533,16 @@ public class OzServerSectorsWindow : BaseForm
         var stagedClaims = _sectorsSelected.Where(s => !s.IsDummy && _stagedNames.Contains(s.Name))
             .Where(s => !owned.Any(o => o.Name == s.Name))
             .ToList();
-        _overlay.SetStaged(stagedClaims, _stagedRequests);
+        // And ApplyButton_Click's toRelease - owned on the server, staged out of the selection. The
+        // overlay widens each to the group it gives back.
+        var stagedReleases = owned
+            .Where(o => _stagedNames.Contains(o.Name) && !IsSelected(o))
+            .ToList();
+        _overlay.SetStaged(stagedClaims, _stagedRequests, stagedReleases);
+
+        // Drop Sectors lists the same releases, so it follows every staging change too. The
+        // signature check inside makes this cheap when nothing moved.
+        PopulateRequestedChanges();
 
         _currSectorsView.Invalidate();
         _availSectorsView.Invalidate();
@@ -2738,7 +2818,19 @@ public class OzServerSectorsWindow : BaseForm
         _fromMeHasPending = _requestsFromMe.Count > 0;
         AddRequestNodes(fromMeNode, _requestsFromMe, NoRequestsFromMe, RequestListDirection.Incoming);
 
-        var rootNodes = new[] { byMeNode, fromMeNode };
+        // Staged releases, which nothing has sent yet. Tagged with the sector, like a staged
+        // request, so IsStagedNode marks them and neither Accept nor Reject acts on them (both
+        // need a SectorChangeRequest - see FindOwningRequest). Cancel withdraws them.
+        // Grouped as Owned groups them: a released group is one dropdown with the members it gives
+        // back nested under it.
+        var dropNode = CreateCategoryNode(_requestedChangesView, DropSectorsName, collapsible: false);
+        var dropRoots = DropRoots();
+        if (dropRoots.Count == 0)
+            dropNode.Nodes.Add(new TreeNode(NoSectorsToDrop) { NodeFont = _requestedChangesView.Font });
+        foreach (var sector in dropRoots)
+            dropNode.Nodes.Add(BuildDropSectorNode(sector, depth: 0));
+
+        var rootNodes = new[] { byMeNode, fromMeNode, dropNode };
         var signature = "requested|" + TreeSignature(rootNodes);
         if (signature == _requestedTreeSignature)
         {
@@ -2768,6 +2860,9 @@ public class OzServerSectorsWindow : BaseForm
                 // _rebuildingTree permits it (see TreeView_BeforeMouseExpandCollapse).
                 foreach (var root in rootNodes)
                     root.Expand();
+                // Drop Sectors' groups open on every rebuild, so everything Apply will give back is
+                // on screen. A group closed by hand stays closed until the next staging change.
+                ExpandDropGroups(dropNode);
                 RestoreExpandedAndSelection(_requestedChangesView, state);
             }
             finally
