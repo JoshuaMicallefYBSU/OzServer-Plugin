@@ -8,19 +8,20 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// What the tracking controller has put on a tag's label, beyond the flight plan itself: the cleared
-// level, the scratchpad, global ops, and the "C". See OzServerFdrUpdateDto.LabelOpData for what
-// each one is and why vatSys loses it - in short, the CFL and the C are local to vatSys, and the
-// scratchpad and global ops are only shared by whoever is tracking the tag at the time.
+// What the tracking controller has put on a tag's label beyond the flight plan: the cleared level,
+// the scratchpad, global ops and the "C". The CFL and the C are local to vatSys, and the scratchpad
+// and global ops are only shared by whoever is tracking the tag at the time - see
+// OzServerFdrUpdateDto.LabelOpData.
 //
 // FdrSync pushes all of it from the tracking controller's client. This puts it back onto a tag that
-// has just become this controller's, by reconnect (TagResumeRecovery) or by sector change
-// (SectorTagHandoff) - the two moments vatSys starts the label over from nothing.
+// has just become this controller's - by reconnect (TagResumeRecovery), by sector change
+// (SectorTagHandoff) or by pickup (FdrSync.AdoptLabelAsync) - when vatSys starts the label from
+// nothing.
 public static class LabelStateRestore
 {
-    // replaceCfl: a sector change takes the previous controller's cleared level as it stands, since
-    // they were the one working the aircraft a moment ago; a reconnect fills it in only where vatSys
-    // has none, since anything the controller entered after reconnecting is newer than the record.
+    // replaceCfl: a sector change takes the previous controller's cleared level as it stands; a
+    // reconnect or pickup fills it in only where vatSys has none, since anything this controller
+    // has entered is newer than the record.
     //
     // Returns what was written, for the log, or null if nothing was.
     public static string? Apply(FDP2.FDR fdr, OzServerFdrUpdateDto stored, bool replaceCfl)
@@ -48,10 +49,10 @@ public static class LabelStateRestore
                 applied.Add($"CFL {stored.CflLower?.ToString() ?? "-"}/{stored.CflUpper?.ToString() ?? "-"}");
         }
 
-        // Through vatSys's own setters, which also send them on to every other controller - this
-        // controller is the one tracking the tag now, so it is the one vatSys expects to say. Only
-        // into an empty field: vatSys shares these itself between controllers, and a value already
-        // here arrived that way and is at least as new as the record.
+        // Through vatSys's own setters, which also send the value to every other controller - as
+        // the tracking controller, this client is the one vatSys expects to send it. Only into an
+        // empty field: a value already here was shared by vatSys and is at least as new as the
+        // record.
         if (!string.IsNullOrEmpty(stored.LabelOpData) && string.IsNullOrEmpty(fdr.LabelOpData))
         {
             FDP2.SetLabelData(fdr, stored.LabelOpData);
@@ -64,9 +65,8 @@ public static class LabelStateRestore
             applied.Add($"global ops \"{stored.GlobalOpData}\"");
         }
 
-        // The CFL's colour (Track.NewCFL, new or acknowledged) is deliberately not carried: vatSys
-        // marks the CFL new again whenever a track enters Jurisdiction, at a moment a restore cannot
-        // reliably get behind, so it is left as vatSys shows it.
+        // The CFL's colour (Track.NewCFL, new or acknowledged) is not carried: vatSys marks the CFL
+        // new again whenever a track enters Jurisdiction, so it is left as vatSys shows it.
         if (MMI.FindTrack(fdr) is { } track && stored.CPrompt is { } cPrompt && track.CPrompt != cPrompt)
         {
             track.CPrompt = cPrompt;
@@ -81,21 +81,20 @@ public static class LabelStateRestore
 // Shows every controller the label the tracking controller has put on a tag: the cleared level,
 // the scratchpad, global ops and the "C".
 //
-// vatSys shares the first three itself, but only live, from whoever is tracking the tag, to whoever
-// is connected at that moment. A controller who connects afterwards sees none of it until the
-// tracking controller changes something again, and once the tracking controller has logged off,
-// nobody ever sends it. The C vatSys sends nowhere at all. OzServer holds all four (FdrSync pushes
-// them from the tracking controller's client), so every tag this controller is *not* tracking is
-// filled in from there.
+// vatSys shares the first three only live, from whoever is tracking the tag to whoever is connected
+// at that moment: a controller who connects later sees none of it until the tracking controller
+// changes something, and the C is never sent at all. OzServer holds all four (FdrSync pushes them
+// from the tracking controller's client), so every tag this controller is not tracking is filled
+// in from there.
 //
-// Each field is applied only when OzServer's value changes, never re-asserted over the top: a
-// controller who changes one on someone else's tag for their own reference keeps it until the
-// tracking controller changes theirs. Written straight into the local FDR and track, never through
-// vatSys's sending setters - those would announce it to the network as if this controller had made it.
+// Each field is applied only when OzServer's value changes, never re-asserted: a controller who
+// changes one on someone else's tag for their own reference keeps it until the tracking controller
+// changes theirs. Values are written locally, never sent - sending would announce them to the
+// network as this controller's own.
 public sealed class LabelStateMirror
 {
-    // A signal is a hint, not an instruction - several FDR pushes a second across every controller
-    // would otherwise each fetch the whole set. The timer covers a signal that never arrives.
+    // A signal is a hint: FDR pushes arrive several a second across all controllers, and each
+    // would otherwise fetch the whole set. The timer covers a signal that never arrives.
     static readonly TimeSpan MinInterval = TimeSpan.FromSeconds(3);
     static readonly TimeSpan FallbackInterval = TimeSpan.FromSeconds(15);
 
@@ -179,8 +178,8 @@ public sealed class LabelStateMirror
             Applied? last;
             lock (_applied)
             {
-                // A tag this controller tracks speaks for itself (FdrSync). Forgotten here, so if
-                // it is handed on again whatever the next controller has is taken in full.
+                // A tag this controller tracks is reported by FdrSync. Forgotten here so that, once
+                // it is handed on, the next controller's label is taken in full.
                 if (fdr.IsTrackedByMe)
                 {
                     _applied.Remove(record.Callsign);
@@ -204,9 +203,9 @@ public sealed class LabelStateMirror
             MMI.RequestRedraw();
     }
 
-    // The first time a tag is seen, only what OzServer actually holds is written - an empty field is
-    // left alone, since a value already here came from vatSys and is at least as new. After that,
-    // any change is written, a cleared field included.
+    // The first time a tag is seen, only what OzServer holds is written - an empty field is left
+    // alone, since a value already here came from vatSys and is at least as new. After that, any
+    // change is written, a cleared field included.
     static bool ApplyOne(FDP2.FDR fdr, OzServerFdrRecordDto record, Applied last)
     {
         var changed = false;
@@ -272,8 +271,8 @@ public sealed class LabelStateMirror
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

@@ -5,20 +5,20 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Sets the display level filter to 998-999 for FMP positions, which hides the labels of every
-// non-jurisdiction track. FMP doesn't work traffic, so departure and overflight tags are only clutter.
+// Sets the display level filter to 998-999 on FMP positions, which hides the labels of every
+// non-jurisdiction track. FMP does not work traffic, so those tags are only clutter.
 //
-// Positions.xml has nothing for this: LogicalPositions.Load reads no filter attribute, and vatSys
-// keeps the filter as one global value in MMI.LowerLevelFilter/UpperLevelFilter, not per position.
-// So it's applied here whenever the position looks like an FMP:
-//   - the Positions.xml position just selected lists an "_FMP" callsign under <ControllerInfo>, or
+// Positions.xml cannot express this: LogicalPositions.Load reads no filter attribute, and vatSys
+// keeps the filter as one global value in MMI.LowerLevelFilter/UpperLevelFilter. A position counts
+// as FMP when:
+//   - the selected Positions.xml position lists an "_FMP" callsign under <ControllerInfo>, or
 //   - this session is connected under an "_FMP" callsign.
 //
-// Only tracks the scope treats as non-jurisdiction are affected (ASDControlDX checks the band only
-// for tracks that aren't jurisdiction, quicklooked or alerting), so anything handed to FMP still shows.
+// ASDControlDX applies the band only to tracks that are not jurisdiction, quicklooked or alerting,
+// so anything handed to FMP still shows.
 //
-// Moving to a non-FMP position puts back whatever was set before, unless the controller has
-// changed the filter by hand in the meantime. In that case it's their filter, and it's left alone.
+// Leaving an FMP position restores the previous filter, unless the controller has changed it by
+// hand in the meantime.
 public class FmpLevelFilter
 {
     const string FmpMarker = "_FMP";
@@ -47,7 +47,7 @@ public class FmpLevelFilter
     static bool Contains(string? callsign) =>
         !string.IsNullOrEmpty(callsign) && callsign!.IndexOf(FmpMarker, StringComparison.OrdinalIgnoreCase) >= 0;
 
-    // Disabling OzServer: the controller's own display levels back, if the FMP filter was applied.
+    // Called when OzServer is disabled, to restore the controller's own display levels.
     public void Shutdown() => RunOnUiThread(Evaluate);
 
     void Evaluate()
@@ -88,7 +88,7 @@ public class FmpLevelFilter
 
         _saved = null;
 
-        // Changed by hand since it was applied: that's the controller's filter now.
+        // Changed by hand since it was applied, so it is the controller's filter and is left alone.
         if (MMI.LowerLevelFilter != FmpLower * 100 || MMI.UpperLevelFilter != FmpUpper * 100)
             return;
 
@@ -106,8 +106,8 @@ public class FmpLevelFilter
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

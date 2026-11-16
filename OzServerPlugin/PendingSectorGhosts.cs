@@ -6,62 +6,42 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Shows, before anything is committed, which aircraft a sector request would actually bring with
-// it - drawn as Ghost Jurisdiction, the state vatSys already uses for "in your airspace, not yours
-// to work".
+// Shows which aircraft a staged or requested sector would bring with it, drawn as Ghost
+// Jurisdiction - the state vatSys uses for "in your airspace, not yours to work".
 //
-// Live while a sector is staged in the Sectors window, and while a request for it is still open.
-// Both are the same question - "what am I asking for?" - and it stops the moment the answer is
-// known: accepted, and the aircraft arrive for real (SectorTagHandoff); rejected, cancelled or
-// unstaged, and they were never coming.
+// Live while a sector is staged in the Sectors window and while a request for it is open. An
+// aircraft is ghosted only if it would transfer: inside the sector and held by the controller who
+// owns it. A tag a third controller is working would not move - SectorTagHandoff applies the same
+// rule on the transferring side.
 //
-// Ghosted aircraft are exactly the ones that would transfer, no more: inside the sector, and held
-// by the controller who owns it. A tag a third controller is working would not move, so showing it
-// as incoming would be a lie - see SectorTagHandoff for the same rule on the transferring side.
-//
-// ---------------------------------------------------------------------------------------------
-// Why this paints the state itself
-//
-// vatSys computes Ghost in MMI.SetTrackState, but only inside a branch guarded by
-// MMI.SectorsControlled.Contains(fdr.ControllingSector) - within it, IsTrackedByMe picks
-// Jurisdiction over GhostJurisdiction. A staged sector is deliberately not in SectorsControlled
-// (putting it there would claim it, which is the entire thing the controller has not decided to do
-// yet), so that branch is unreachable and the state has to be written directly.
-//
-// Which means vatSys will recompute over it on its next update for that track, so it is reasserted
-// - on the FDR and radar callbacks that follow such a recompute, and on a timer for the frames in
-// between. Nothing here changes an FDR: only Track.State, which is presentation.
+// The state is written directly. vatSys computes Ghost in MMI.SetTrackState only inside a branch
+// guarded by MMI.SectorsControlled.Contains(fdr.ControllingSector), and a staged sector is not in
+// SectorsControlled - putting it there would claim it. vatSys recomputes over the written state on
+// its next update for that track, so it is reasserted on the FDR and radar callbacks and on a
+// timer. Only Track.State is written, which is presentation; no FDR is changed.
 public class PendingSectorGhosts
 {
-    // Short, because this fights vatSys's own recompute and a slow correction reads as a flicker.
+    // Short, because a slow correction after vatSys's recompute reads as a flicker.
     static readonly TimeSpan ReassertInterval = TimeSpan.FromSeconds(1);
 
     readonly OzServerOwnershipTracker _tracker;
     readonly System.Threading.Timer _timer;
     readonly object _lock = new();
 
-    // One Apply at a time. vatSys dispatches OnFDRUpdate and OnRadarTrackUpdate through Task.Run -
-    // one fire-and-forget task per update, with no serialisation of its own - so Reassert() is
-    // entered by many thread-pool threads at once, alongside the timer's own pass. Two overlapping
-    // passes race on _painted: one enumerates it while the other Clears and re-Adds, which throws
-    // "Collection was modified; enumeration operation may not execute." and aborts the whole apply,
-    // leaving ghosts stuck on. That is the error every client was logging several times a minute.
+    // One Apply at a time. vatSys dispatches OnFDRUpdate and OnRadarTrackUpdate through Task.Run
+    // with no serialisation, so Reassert is entered from many pool threads at once, alongside the
+    // timer. Overlapping passes race on _painted: one enumerates it while another clears it -
+    // which invalidates an enumerator even when the set is empty - and the exception aborts the
+    // pass, leaving ghosts stuck on.
     //
-    // Note this is the *only* collection in the pass that can throw it - HashSet.Clear() invalidates
-    // a live enumerator even when the set is already empty, so a client with nothing staged hit it
-    // just as often. FDP2.GetFDRs is snapshotted below, but List<T>.ToList() copies via CopyTo and
-    // never enumerates, so that snapshot could never have been the cause.
-    //
-    // TryEnter and skip, rather than lock and queue: a skipped pass costs nothing because the
-    // one-second timer re-asserts anyway, whereas queueing would pile pool threads up behind a pass
-    // that is about to be repeated.
+    // TryEnter and skip rather than lock and queue: the timer repeats a skipped pass within
+    // ReassertInterval, and queueing would pile pool threads up behind it.
     readonly object _applyGate = new();
 
-    // Sectors staged in the window right now. Pushed in by the window, which owns that state.
+    // Sectors staged in the Sectors window, which owns that state and pushes it in.
     List<SectorsVolumes.Sector> _staged = new();
 
-    // Callsigns currently painted by us, so they can be handed back when they stop qualifying
-    // rather than left ghosted forever.
+    // Callsigns painted by this class, so they can be handed back when they stop qualifying.
     readonly HashSet<string> _painted = new(StringComparer.OrdinalIgnoreCase);
 
     public PendingSectorGhosts(OzServerOwnershipTracker tracker)
@@ -73,8 +53,8 @@ public class PendingSectorGhosts
             ReassertInterval, ReassertInterval);
     }
 
-    // Called by the Sectors window whenever staging changes, including being cleared by Cancel or
-    // by closing the window.
+    // Called by the Sectors window whenever staging changes, including when Cancel or closing the
+    // window clears it.
     public void SetStaged(IEnumerable<SectorsVolumes.Sector> staged)
     {
         lock (_lock)
@@ -83,10 +63,9 @@ public class PendingSectorGhosts
         RunOnUiThread(Apply);
     }
 
-    // Called on every FDR and radar update, which is where vatSys has just recomputed the state
-    // this needs to overwrite. Marshalled like every other entry point: Apply writes Track.State and
-    // calls MMI.RequestRedraw, both of which are vatSys UI state, and these callbacks arrive on
-    // pool threads.
+    // Called on every FDR and radar update, when vatSys has just recomputed the state. Marshalled
+    // because Apply writes Track.State and calls MMI.RequestRedraw, which are vatSys UI state, and
+    // these callbacks arrive on pool threads.
     public void Reassert() => RunOnUiThread(Apply);
 
     void Apply()
@@ -94,31 +73,27 @@ public class PendingSectorGhosts
         if (!Network.IsConnected)
             return;
 
-        // See _applyGate. RunOnUiThread is not enough on its own - it falls back to running inline
-        // on the calling thread whenever MainForm isn't there to marshal through, so the gate is
-        // what actually holds.
+        // See _applyGate. RunOnUiThread alone is not enough: it runs inline on the calling thread
+        // when there is no MainForm to marshal through.
         if (!System.Threading.Monitor.TryEnter(_applyGate))
             return;
 
         try
         {
             var pending = PendingSectors();
-            // Disabled: nothing is pending any more, so whatever is painted is handed back to vatSys.
+            // Disabled: nothing is pending, so whatever is painted is handed back to vatSys.
             if (OzServerMode.Disabled)
                 pending.Clear();
 
-            // The overwhelmingly common case: nothing staged or requested, nothing painted. Reassert
-            // runs on every FDR and radar update, and each pass otherwise walks every flight - and
-            // scans the radar tracks for each uncoupled one - to conclude there is nothing to do.
+            // The common case - nothing pending and nothing painted - returns before walking every
+            // flight, since this runs on every FDR and radar update.
             if (pending.Count == 0 && _painted.Count == 0)
                 return;
 
             var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // One snapshot for the whole pass. FDP2.GetFDRs is vatSys's live collection and it is
-            // mutated from vatSys's own threads, so every enumeration of it needs its own copy -
-            // the release loop below used to walk it again and threw "Collection was modified" on
-            // most passes, which aborted the whole apply and left ghosts stuck on.
+            // One snapshot for the whole pass. FDP2.GetFDRs is vatSys's live collection, mutated
+            // from its own threads, so it is never enumerated directly.
             var fdrs = FDP2.GetFDRs.ToList();
 
             foreach (var fdr in fdrs)
@@ -132,8 +107,8 @@ public class PendingSectorGhosts
                     track.State = MMI.HMIStates.GhostJurisdiction;
             }
 
-            // Anything we painted that no longer qualifies is handed back to vatSys rather than
-            // left as we last set it - the request resolved, or the aircraft left the sector.
+            // Anything painted that no longer qualifies is handed back to vatSys: the request
+            // resolved, or the aircraft left the sector.
             var released = _painted.Where(callsign => !wanted.Contains(callsign)).ToList();
             foreach (var callsign in released)
             {
@@ -162,8 +137,7 @@ public class PendingSectorGhosts
         }
     }
 
-    // Staged, plus anything already asked for and still waiting on an answer. A request that has
-    // been rejected is not pending - the answer is known and it is not coming.
+    // Staged sectors plus requests still waiting on an answer. A rejected request is not pending.
     List<SectorsVolumes.Sector> PendingSectors()
     {
         List<SectorsVolumes.Sector> staged;
@@ -177,13 +151,8 @@ public class PendingSectorGhosts
             .Where(s => s != null)
             .Select(s => s!);
 
-        // Expanded to the whole group each one carries, because that is what actually transfers: a
-        // request for BLA moves ELW and the Melbourne Approach sectors with it, since the backend
-        // resolves a transfer through the same responsible-sectors chain a claim expands through.
-        //
-        // Previewing only the sector named in the request understated it every time a group changed
-        // hands - asking for Benalla ghosted nothing in Eildon Weir, so an aircraft that was about
-        // to arrive looked like it was staying put.
+        // Expanded to every sector each one covers, since a claim or transfer acts on the covered
+        // sectors and not only the one named. WouldTransfer then narrows by who holds each tag.
         return staged.Concat(open)
             .SelectMany(PrimaryPosition.CoveredBy)
             .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
@@ -191,11 +160,11 @@ public class PendingSectorGhosts
             .ToList();
     }
 
-    // The transfer rule, matched to SectorTagHandoff: inside one of the pending sectors, and held
-    // by the controller who owns that sector.
+    // The transfer rule, matched to SectorTagHandoff: inside one of the pending sectors and held by
+    // the controller who owns that sector.
     bool WouldTransfer(FDP2.FDR fdr, List<SectorsVolumes.Sector> pending)
     {
-        // Already ours - nothing is coming to us that we have.
+        // Already tracked by this controller, so it is not incoming.
         if (fdr.IsTrackedByMe || fdr.ControllingSector == null)
             return false;
 
@@ -203,9 +172,7 @@ public class PendingSectorGhosts
         if (inside == null)
             return false;
 
-        // Whoever holds the tag has to be the same controller who owns the sector being asked for.
-        // A third controller working an aircraft inside it keeps that aircraft, so it is not
-        // ghosted - the preview would otherwise promise traffic that will never arrive.
+        // A third controller working an aircraft inside the sector keeps it, so it is not ghosted.
         var holder = _tracker.OwnerOf(fdr.ControllingSector)?.Callsign;
         var owner = _tracker.OwnerOf(inside)?.Callsign;
 
@@ -216,8 +183,8 @@ public class PendingSectorGhosts
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }
