@@ -723,7 +723,9 @@ public class FdrSync
                 if (stored == null || !fdr.IsTrackedByMe)
                     return;
 
-                var applied = LabelStateRestore.Apply(fdr, stored, replaceCfl: false);
+                // Without the C: a reconnect (TagResumeRecovery) and a sector change
+                // (SectorTagHandoff) bring it with them, a handoff or assume does not.
+                var applied = LabelStateRestore.Apply(fdr, stored, replaceCfl: false, includeCPrompt: false);
                 if (applied != null)
                 {
                     ActionLog.Log("FDR", $"Took {callsign}'s label from OzServer on pickup: {applied}", new

@@ -19,9 +19,9 @@ namespace OzServerPlugin;
 //  - it is placed where the record last had it, as a floating flight plan track on its route - a
 //    position report at that point, so vatSys carries it on along the route from there;
 //  - auto-couple is left on, so the tag becomes available when the radar track turns up;
-//  - if that position is inside a sector this controller holds, it is offered to them - the
-//    flashing first handoff vatSys gives a flight activated into a controller's airspace;
-//    otherwise it is activated with no handoff to anyone.
+//  - on connecting, if that position is inside a sector this controller holds and nobody has the
+//    tag, it is taken straight into their jurisdiction, as a reconnect takes back its own tags;
+//    otherwise (and for any flight that comes into view later) it is only activated.
 //
 // A tag the server has as this controller's own is left to TagResumeRecovery. An FDR vatSys already
 // has tracked by someone is left alone, as is the position of one with a coupled track.
@@ -269,6 +269,15 @@ public class FdrResumeActivation
         }
 
         var expired = DateTime.UtcNow >= deadline;
+        bool connectPass;
+        lock (_gate)
+            connectPass = DateTime.UtcNow - _connectedAt < RetryWindow;
+
+        // Nothing is picked up before vatSys has validated the controllers online: until then it
+        // may not know who is tracking a flight (VOZ233 was taken from ML_APP that way).
+        if (connectPass && !expired && PrimaryPosition.AwaitingValidationForAny(
+                MMI.SectorsControlled.Where(s => !s.IsDummy), Network.Me?.Callsign))
+            return;
         var mine = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
         var fdrs = FDP2.GetFDRs.Where(f => !string.IsNullOrEmpty(f.Callsign))
                                .GroupBy(f => f.Callsign, StringComparer.OrdinalIgnoreCase)
@@ -331,9 +340,13 @@ public class FdrResumeActivation
                 // Resolved against the position just applied when the record named none of ours.
                 inMine ??= SectorLocator.Resolve(fdr, mine);
 
-                if (inMine != null && Network.ValidATC)
+                // Picked up only on connecting - an aircraft in this controller's airspace as they
+                // log on is theirs, taken straight into jurisdiction like a reconnect's own tags
+                // (no flashing offer). One that comes into view later in the session is crossing
+                // airspace, and is only activated: it reaches this controller by handoff.
+                if (inMine != null && connectPass && Network.ValidATC && !OwnedElsewhere(record)
+                    && TagResumeRecovery.TryTakeJurisdiction(fdr, inMine))
                 {
-                    OfferTo(fdr, inMine);
                     offered.Add($"{record.Callsign} ({inMine.Name})");
                     brought.Add(fdr);
                 }
@@ -365,7 +378,7 @@ public class FdrResumeActivation
         if (activated.Count > 0 || offered.Count > 0 || skipped.Count > 0)
         {
             ActionLog.Log("FdrResume",
-                $"Activated: {List(activated)}; offered to you: {List(offered)}; left alone: {List(skipped)}",
+                $"Activated: {List(activated)}; picked up for you: {List(offered)}; left alone: {List(skipped)}",
                 new { action = "fdr_resume_pass", activated, offered, skipped });
         }
     }
@@ -399,7 +412,7 @@ public class FdrResumeActivation
     // Records the departure without FDP2.DepartFDR. That path (and PositionReport, when there is no
     // ATD yet) ends in vatSys's FDRDeparted, which accepts jurisdiction by itself for an FDR whose
     // controlling sector is one of this controller's - taking the tag without the controller being
-    // asked. Who is offered the flight is decided by OfferTo alone.
+    // asked. Whether the flight is picked up is decided in Attempt alone.
     static void MarkDeparted(FDP2.FDR fdr, DateTime atd)
     {
         fdr.ATD = atd;
@@ -489,21 +502,15 @@ public class FdrResumeActivation
         MarkDeparted(fdr, passedAt - elapsed);
     }
 
-    // The flashing first handoff vatSys gives a flight activated into a controller's airspace:
-    // offered to this sector, for the controller to accept or leave like any other.
-    static void OfferTo(FDP2.FDR fdr, SectorsVolumes.Sector sector)
+    // Somebody's tag already, as far as OzServer knows: another OzServer controller's (the record
+    // names them), or one tracked by a controller without the plugin (tracked_by). Never picked up.
+    static bool OwnedElsewhere(OzServerFdrRecordDto record)
     {
-        if (fdr.State == FDP2.FDR.FDRStates.STATE_HANDOVER_FIRST && fdr.HandoffSector == sector)
-            return;
-
-        fdr.ControllingSector = sector;
-        FDP2.HandoffFirst(fdr);
-        fdr.HandoffSector = sector;
-        FDP2.Process(fdr, true);
-
-        var track = MMI.FindTrack(fdr);
-        if (track != null)
-            MMI.SetTrackState(track);
+        var me = Network.Me?.Callsign;
+        if (record.ControllingCid != null && record.ControllingCid != NetworkIdentity.Current?.Cid)
+            return true;
+        return !string.IsNullOrEmpty(record.TrackedBy)
+               && !string.Equals(record.TrackedBy, me, StringComparison.OrdinalIgnoreCase);
     }
 
     static void RunOnUiThread(Action action)

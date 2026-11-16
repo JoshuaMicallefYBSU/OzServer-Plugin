@@ -23,8 +23,12 @@ public static class LabelStateRestore
     // reconnect or pickup fills it in only where vatSys has none, since anything this controller
     // has entered is newer than the record.
     //
+    // includeCPrompt: the C comes back to its owner on reconnect and goes with the tag on a sector
+    // change, but not to a controller who picks the tag up any other way (a handoff, an assume) -
+    // it is the previous controller's working mark, not part of the clearance.
+    //
     // Returns what was written, for the log, or null if nothing was.
-    public static string? Apply(FDP2.FDR fdr, OzServerFdrUpdateDto stored, bool replaceCfl)
+    public static string? Apply(FDP2.FDR fdr, OzServerFdrUpdateDto stored, bool replaceCfl, bool includeCPrompt = true)
     {
         if (!fdr.IsTrackedByMe)
             return null;
@@ -78,7 +82,7 @@ public static class LabelStateRestore
             applied.Add($"deviation right {otdRight}");
         }
 
-        if (stored.CPrompt is { } cPrompt)
+        if (includeCPrompt && stored.CPrompt is { } cPrompt)
         {
             if (MMI.FindTrack(fdr) is { } track)
             {
@@ -129,11 +133,12 @@ public static class LabelStateRestore
 }
 
 // Shows every controller the label the tracking controller has put on a tag: the cleared level,
-// the scratchpad, global ops and the "C".
+// the scratchpad, global ops and off-track deviations. Not the "C", which stays the tracking
+// controller's own (see ApplyOne).
 //
 // vatSys shares the first three only live, from whoever is tracking the tag to whoever is connected
 // at that moment: a controller who connects later sees none of it until the tracking controller
-// changes something, and the C is never sent at all. OzServer holds all four (FdrSync pushes them
+// changes something, and deviations are never sent at all. OzServer holds them (FdrSync pushes them
 // from the tracking controller's client), so every tag this controller is not tracking is filled
 // in from there.
 //
@@ -155,7 +160,6 @@ public sealed class LabelStateMirror
         // resets the CFL when the tracking controller drops a tag (FDP2.HandoffToNone), while the
         // record keeps it, so with only changes applied the label would stay blank on this scope.
         public string? Tracker;
-        public bool? CPrompt;
         public bool CflSeen;
         public int? CflLower;
         public int? CflUpper;
@@ -334,17 +338,9 @@ public sealed class LabelStateMirror
             last.OtdRight = otdRight;
         }
 
-        if (record.CPrompt is { } cPrompt && cPrompt != last.CPrompt && MMI.FindTrack(fdr) is { } track)
-        {
-            // On first sight only a C that is on is shown, as for the fields above: one this
-            // controller put on for their own reference is not taken off by a record without it.
-            if ((last.CPrompt != null || cPrompt) && track.CPrompt != cPrompt)
-            {
-                track.CPrompt = cPrompt;
-                changed = true;
-            }
-            last.CPrompt = cPrompt;
-        }
+        // The C is deliberately not shown here: it is the tracking controller's own working mark,
+        // kept on OzServer only so it comes back to them (reconnect) or goes with the tag to whoever
+        // takes their sector (LabelStateRestore).
 
         return changed;
     }

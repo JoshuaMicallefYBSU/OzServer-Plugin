@@ -346,7 +346,7 @@ public class TagResumeRecovery
     // flashing in STATE_HANDOVER_FIRST.
     //
     // Returns whether it worked, checked against the resulting state.
-    static bool TryTakeJurisdiction(FDP2.FDR fdr, SectorsVolumes.Sector sector)
+    internal static bool TryTakeJurisdiction(FDP2.FDR fdr, SectorsVolumes.Sector sector)
     {
         FDP2.HandoffFirst(fdr);
         fdr.HandoffSector = sector;
