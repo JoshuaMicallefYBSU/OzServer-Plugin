@@ -90,6 +90,8 @@ public class FdrSync
                 // Likewise every tag's label state, the first time it is seen tracked again.
                 _labelStateKeys.Clear();
             }
+            // And every tag is taken over from the record again when next tracked.
+            LabelAdopted.Clear();
             Landed.Clear();
         };
     }
@@ -707,6 +709,91 @@ public class FdrSync
     static bool IsLabelStateHeld(string? callsign) =>
         !string.IsNullOrEmpty(callsign) && LabelStateHeld.TryGetValue(callsign!, out var until) && DateTime.UtcNow < until;
 
+    // Whether this session has taken over a tag's label from OzServer's record yet. Every way a tag
+    // becomes this controller's goes through here, not only the two that used to read the record
+    // back (a reconnect - TagResumeRecovery - and an OzServer transfer - SectorTagHandoff). A tag
+    // simply assumed in vatSys, after the controller who had it logged off, arrives with a bare
+    // label: vatSys only shares the CFL, scratchpad and global ops live, from whoever is tracking it
+    // at the time, and there was nobody. Its first push then stated that bare label as fact and
+    // erased the record - EFA69 on 16 Nov: CFL 350, "MEOW" and "SSSS" set by ML-ASP_CTR, gone the
+    // moment ML-BLA_CTR picked the tag up after ASP had logged off.
+    //
+    // So the label is left out of every push (as a non-tracking client's is) until the record has
+    // been read and anything it holds put into whatever the label is missing; only then does this
+    // client speak for it. Anything the controller has already typed is kept.
+    //
+    // false while the read is in flight, true once done. Forgotten when the tag stops being ours, so
+    // picking it up again reads the record again.
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> LabelAdopted =
+        new(StringComparer.OrdinalIgnoreCase);
+    static readonly OzServerApiClient AdoptApi = new();
+
+    static bool IsLabelAdopted(FDP2.FDR fdr)
+    {
+        if (LabelAdopted.TryGetValue(fdr.Callsign, out var done))
+            return done;
+        if (LabelAdopted.TryAdd(fdr.Callsign, false))
+            _ = AdoptLabelAsync(fdr);
+        return false;
+    }
+
+    static async Task AdoptLabelAsync(FDP2.FDR fdr)
+    {
+        var callsign = fdr.Callsign;
+        OzServerFdrUpdateDto? stored = null;
+        try
+        {
+            stored = await AdoptApi.GetFlightAsync(callsign);
+        }
+        catch (Exception ex)
+        {
+            // Taken over anyway: a label this client never speaks for is worse than one that starts
+            // from what the controller has in front of them.
+            ActionLog.Log("FDR", $"Couldn't read {callsign}'s label from OzServer on pickup: {ex.Message}");
+        }
+
+        RunOnUiThread(() =>
+        {
+            try
+            {
+                if (stored == null || !fdr.IsTrackedByMe)
+                    return;
+
+                var applied = LabelStateRestore.Apply(fdr, stored, replaceCfl: false);
+                if (applied != null)
+                {
+                    ActionLog.Log("FDR", $"Took {callsign}'s label from OzServer on pickup: {applied}", new
+                    {
+                        action = "pickup_label_state_applied",
+                        fdr_callsign = callsign,
+                        cfl_lower = stored.CflLower,
+                        cfl_upper = stored.CflUpper,
+                        label_op_data = stored.LabelOpData,
+                        global_op_data = stored.GlobalOpData,
+                        c_prompt = stored.CPrompt
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                ErrorThrottle.Report("label-adopt", $"Couldn't apply {callsign}'s label from OzServer: {ex.Message}", ex);
+            }
+            finally
+            {
+                // The next flush pushes the whole label (QueueLabelStateChanges has no key for it yet).
+                LabelAdopted.TryUpdate(callsign, true, false);
+            }
+        });
+    }
+
+    static void RunOnUiThread(Action action)
+    {
+        if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Control mainForm && mainForm.InvokeRequired)
+            mainForm.BeginInvoke(action);
+        else
+            action();
+    }
+
     void QueueLabelStateChanges()
     {
         // Copied first and guarded throughout, like the two sweeps above: this runs on the flush
@@ -727,7 +814,20 @@ public class FdrSync
         {
             try
             {
-                if (string.IsNullOrEmpty(fdr.Callsign) || !fdr.IsTrackedByMe || !fdr.ESTed || IsLabelStateHeld(fdr.Callsign))
+                if (string.IsNullOrEmpty(fdr.Callsign))
+                    continue;
+
+                // No longer ours: forget the takeover, and the label last sent, so a later pickup
+                // reads the record again and then pushes the label in full.
+                if (!fdr.IsTrackedByMe)
+                {
+                    if (LabelAdopted.TryRemove(fdr.Callsign, out _))
+                        lock (_lock)
+                            _labelStateKeys.Remove(fdr.Callsign);
+                    continue;
+                }
+
+                if (!fdr.ESTed || !IsLabelAdopted(fdr) || IsLabelStateHeld(fdr.Callsign))
                     continue;
 
                 var track = MMI.FindTrack(fdr);
@@ -840,7 +940,9 @@ public class FdrSync
             // CFL a disconnected controller had set - JST516 came back to ML-BLA_CTR with no level
             // because ML-SNO_CTR had reported it in the meantime. Left unstated, the backend keeps
             // what the tracking controller last said.
-            ClearanceKnown = fdr.IsTrackedByMe && !IsLabelStateHeld(fdr.Callsign),
+            // And only once this session has taken the label over from OzServer's record - see
+            // LabelAdopted.
+            ClearanceKnown = fdr.IsTrackedByMe && IsLabelAdopted(fdr) && !IsLabelStateHeld(fdr.Callsign),
             AssignedSsrCode = fdr.AssignedSSRCode == -1 ? null : fdr.AssignedSSRCode,
             Atd = fdr.ATD == DateTime.MaxValue ? null : fdr.ATD,
             Etd = fdr.ETD == DateTime.MaxValue ? null : fdr.ETD,

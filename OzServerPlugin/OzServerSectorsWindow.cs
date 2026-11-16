@@ -1961,10 +1961,14 @@ public class OzServerSectorsWindow : BaseForm
         var sectorNodes = new List<TreeNode>();
         foreach (var sector in controlled)
         {
-            // Same subordination rule PopulateOwnedList applies: a sector covered by another
-            // controlled sector belongs nested under it, not at top level.
+            // Same subordination rule PopulateOwnedList applies - a sector covered by another
+            // controlled sector belongs nested under it, not at top level - but only under a sector
+            // the same controller holds. The grouping says what a sector *could* cover, not who has
+            // it: GUN's covers SAS, so SY_APP's SAS was folded under ML-GUN_CTR's GUN and listed
+            // under Centre, as if GUN held it, while SY_APP was online holding it themselves.
             var isSubordinate = controlled.Any(other =>
                 !other.Equals(sector)
+                && SameOwner(other, sector, owners)
                 && SectorsVolumes.SectorGroupings.TryGetValue(other, out var covered)
                 && covered.Contains(sector));
 
@@ -1994,6 +1998,11 @@ public class OzServerSectorsWindow : BaseForm
                 if (!ReferenceEquals(child, sector) && !_controlledNames.Contains(child.Name))
                     continue;
 
+                // And only if it is the same somebody - see RenderControlledList. A child held by a
+                // different controller is a top-level row of its own instead.
+                if (!ReferenceEquals(child, sector) && !SameOwner(sector, child, owners))
+                    continue;
+
                 node.Nodes.Add(ReferenceEquals(child, sector)
                     ? new TreeNode(LeafText(ControlledSectorText(child, owners))) { Tag = child, NodeFont = node.NodeFont, ToolTipText = LeafText(ControlledSectorText(child, owners)) }
                     : BuildControlledSectorNode(child, owners, depth + 1));
@@ -2003,6 +2012,11 @@ public class OzServerSectorsWindow : BaseForm
         ApplySectorNodeText(node, ControlledSectorText(sector, owners));
         return node;
     }
+
+    static bool SameOwner(SectorsVolumes.Sector a, SectorsVolumes.Sector b, Dictionary<string, string> owners) =>
+        owners.TryGetValue(a.Name, out var ownerA)
+        && owners.TryGetValue(b.Name, out var ownerB)
+        && string.Equals(ownerA, ownerB, StringComparison.OrdinalIgnoreCase);
 
     static string ControlledSectorText(SectorsVolumes.Sector sector, Dictionary<string, string> owners) =>
         owners.TryGetValue(sector.Name, out var callsign)
