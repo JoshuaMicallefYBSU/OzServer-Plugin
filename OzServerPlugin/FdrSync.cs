@@ -34,6 +34,8 @@ public class FdrSync
                     && p.Name != nameof(OzServerFdrUpdateDto.LabelOpData)
                     && p.Name != nameof(OzServerFdrUpdateDto.GlobalOpData)
                     && p.Name != nameof(OzServerFdrUpdateDto.CPrompt)
+                    && p.Name != nameof(OzServerFdrUpdateDto.OtdLeft)
+                    && p.Name != nameof(OzServerFdrUpdateDto.OtdRight)
                     && p.Name != nameof(OzServerFdrUpdateDto.ClearanceKnown))
         .ToArray();
 
@@ -793,7 +795,8 @@ public class FdrSync
                     continue;
 
                 var track = MMI.FindTrack(fdr);
-                var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.CPrompt}";
+                // The deviation menu writes OTDLeft/OTDRight and raises nothing either.
+                var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.CPrompt}\u001f{fdr.OTDLeft}\u001f{fdr.OTDRight}";
 
                 lock (_lock)
                 {
@@ -912,6 +915,9 @@ public class FdrSync
             // (see OzServerFdrUpdateDto.LabelOpData). Serialised only when ClearanceKnown.
             LabelOpData = fdr.LabelOpData ?? "",
             GlobalOpData = fdr.GlobalOpData ?? "",
+            // Off-track deviations, 0 for none - see OzServerFdrUpdateDto.OtdLeft.
+            OtdLeft = fdr.OTDLeft,
+            OtdRight = fdr.OTDRight,
             Remarks = NullIfEmpty(fdr.Remarks),
         };
 
@@ -1136,6 +1142,8 @@ public class FdrSync
             // Null here means no track was read, not "off" - see BuildFdrDto.
             if (source.CPrompt != null)
                 target.CPrompt = source.CPrompt;
+            target.OtdLeft = source.OtdLeft;
+            target.OtdRight = source.OtdRight;
         }
 
         foreach (var prop in MergeProperties)

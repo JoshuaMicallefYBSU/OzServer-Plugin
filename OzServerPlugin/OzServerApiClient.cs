@@ -235,6 +235,14 @@ public class OzServerFdrUpdateDto
     public bool ShouldSerializeGlobalOpData() => ClearanceKnown;
     // Null when there was no track to read it from: left out, not stated as "off".
     public bool ShouldSerializeCPrompt() => ClearanceKnown && CPrompt != null;
+
+    // Off-track deviations either side, in nm (FDR.OTDLeft / OTDRight, 0 for none). Local to each
+    // vatSys client - nothing on the network carries them - so OzServer is the only way another
+    // controller sees one. Same rule as the label above: stated only by the tag's owner.
+    [JsonProperty("otd_left")] public int? OtdLeft { get; set; }
+    [JsonProperty("otd_right")] public int? OtdRight { get; set; }
+    public bool ShouldSerializeOtdLeft() => ClearanceKnown && OtdLeft != null;
+    public bool ShouldSerializeOtdRight() => ClearanceKnown && OtdRight != null;
     [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
     [JsonProperty("atd")] public DateTime? Atd { get; set; }
     [JsonProperty("etd")] public DateTime? Etd { get; set; }

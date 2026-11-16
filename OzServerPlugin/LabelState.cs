@@ -65,6 +65,19 @@ public static class LabelStateRestore
 
         // The CFL's colour (Track.NewCFL, new or acknowledged) is not carried: vatSys marks the CFL
         // new again whenever a track enters Jurisdiction, so it is left as vatSys shows it.
+        // Off-track deviations, under the same rule as the CFL: a sector change takes the previous
+        // controller's as they stand; a reconnect or pickup fills in only a side vatSys has none for.
+        if (stored.OtdLeft is { } otdLeft && fdr.OTDLeft != otdLeft && (replaceCfl || fdr.OTDLeft == 0))
+        {
+            fdr.OTDLeft = otdLeft;
+            applied.Add($"deviation left {otdLeft}");
+        }
+        if (stored.OtdRight is { } otdRight && fdr.OTDRight != otdRight && (replaceCfl || fdr.OTDRight == 0))
+        {
+            fdr.OTDRight = otdRight;
+            applied.Add($"deviation right {otdRight}");
+        }
+
         if (stored.CPrompt is { } cPrompt)
         {
             if (MMI.FindTrack(fdr) is { } track)
@@ -148,6 +161,8 @@ public sealed class LabelStateMirror
         public int? CflUpper;
         public string? LabelOpData;
         public string? GlobalOpData;
+        public int? OtdLeft;
+        public int? OtdRight;
     }
 
     readonly OzServerApiClient _api = new();
@@ -296,6 +311,27 @@ public sealed class LabelStateMirror
                 changed = true;
             }
             last.GlobalOpData = record.GlobalOpData;
+        }
+
+        // Off-track deviations, 0 for none. As for the fields above, a side is written on first
+        // sight only if OzServer has a deviation for it.
+        if (record.OtdLeft is { } otdLeft && otdLeft != last.OtdLeft)
+        {
+            if ((last.OtdLeft != null || otdLeft != 0) && fdr.OTDLeft != otdLeft)
+            {
+                fdr.OTDLeft = otdLeft;
+                changed = true;
+            }
+            last.OtdLeft = otdLeft;
+        }
+        if (record.OtdRight is { } otdRight && otdRight != last.OtdRight)
+        {
+            if ((last.OtdRight != null || otdRight != 0) && fdr.OTDRight != otdRight)
+            {
+                fdr.OTDRight = otdRight;
+                changed = true;
+            }
+            last.OtdRight = otdRight;
         }
 
         if (record.CPrompt is { } cPrompt && cPrompt != last.CPrompt && MMI.FindTrack(fdr) is { } track)
