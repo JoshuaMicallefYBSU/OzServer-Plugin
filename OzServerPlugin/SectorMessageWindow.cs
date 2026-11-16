@@ -21,7 +21,7 @@ public abstract class SectorMessageWindow : BaseForm
     const int Edge = 10;
     // OzServerSectorsWindow's Apply/Cancel are 80x30; 90 wide here so "Accept" and "Reject" do not
     // fill the button edge to edge.
-    const int ButtonWidth = 90;
+    const int ButtonWidth = 110;
     const int ButtonHeight = 30;
     const int ButtonGap = 8;
     const int MinMessageHeight = 76;

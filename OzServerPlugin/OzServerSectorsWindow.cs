@@ -175,8 +175,9 @@ public class OzServerSectorsWindow : BaseForm
     readonly FlowLayoutPanel _requestedChangesPanel;
 
     // Suffixed with the connected server (see UpdateTitleForServer), so a SweatBox session cannot
-    // be mistaken for the live network.
-    const string BaseTitle = "OzServer - Sector Configuration Window";
+    // be mistaken for the live network. Carries the running plugin version, so a controller (and
+    // anyone reading their screenshot) can tell which build they are on.
+    static readonly string BaseTitle = $"OzServer {PluginUpdater.RunningVersionDisplay} - Sector Configuration Window";
 
     void UpdateTitleForServer()
     {

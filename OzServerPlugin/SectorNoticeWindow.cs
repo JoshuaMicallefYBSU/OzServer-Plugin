@@ -1,3 +1,5 @@
+using System;
+
 namespace OzServerPlugin;
 
 // A one-way notice: something has already happened and the controller is being told about it -
@@ -13,5 +15,18 @@ public class SectorNoticeWindow : SectorMessageWindow
         Name = nameof(SectorNoticeWindow);
 
         AddButtonRow(CreateButton("OK", Close));
+    }
+
+    // A notice whose one button does something beyond dismissing it - the update notice's
+    // "Close vatSys". The notice closes first; the title bar's close button only dismisses.
+    public SectorNoticeWindow(string message, string caption, string buttonText, Action onClick) : base(message, caption)
+    {
+        Name = nameof(SectorNoticeWindow);
+
+        AddButtonRow(CreateButton(buttonText, () =>
+        {
+            Close();
+            onClick();
+        }));
     }
 }

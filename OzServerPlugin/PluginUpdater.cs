@@ -159,10 +159,11 @@ public class PluginUpdater
         var message = $"A new version of OzServer has been found: {Display(installed)}."
                       + (running != null ? $" You are running {Display(running)}." : "")
                       + Environment.NewLine + Environment.NewLine
-                      + "It is recommended you update. The new version is already downloaded and loads the next time vatSys starts, so "
+                      + "Updating is highly recommended - the new version fixes issues in the one you are running. "
+                      + "It is already downloaded and loads the next time vatSys starts, so "
                       + (Network.IsConnected
-                          ? "restart vatSys as soon as it is convenient."
-                          : "close and reopen vatSys now, before you connect.");
+                          ? "close vatSys and reopen it as soon as it is convenient."
+                          : "close vatSys and reopen it now, before you connect.");
 
         var waitedUntil = DateTime.UtcNow + NoticeWait;
         while (DateTime.UtcNow < waitedUntil)
@@ -173,7 +174,14 @@ public class PluginUpdater
                 {
                     mainForm.BeginInvoke(UiThread.Guard(() =>
                     {
-                        var notice = new SectorNoticeWindow(message, "OzServer update");
+                        // The button closes vatSys through its main window, so vatSys's own exit
+                        // path runs - its disconnect prompt when connected, and the plugin's
+                        // graceful sector release with it. The title bar's X just dismisses.
+                        var notice = new SectorNoticeWindow(message, "OzServer update", "Close vatSys", () =>
+                        {
+                            if (!mainForm.IsDisposed)
+                                mainForm.Close();
+                        });
                         notice.Show(mainForm);
                         notice.BringToFront();
                     }));
@@ -195,6 +203,10 @@ public class PluginUpdater
             new OzServerNotice($"A new version ({Display(installed)}) was found and installed. It is recommended you restart vatSys to update."),
             "OzServer");
     }
+
+    // The version of this running build, as Display writes it - e.g. "v0.2.3".
+    internal static string RunningVersionDisplay =>
+        Assembly.GetExecutingAssembly().GetName().Version is { } v ? Display(v) : "";
 
     // "v0.2.3" - the assembly's fourth part is dropped when it is unset or zero.
     static string Display(Version version) =>
