@@ -281,6 +281,23 @@ public sealed class AsdMapLayer
             pool[i].Points = i < polygons.Count ? polygons[i] : Hidden;
     }
 
+    // Looked up once per scope type rather than on every reassert of every layer.
+    static readonly Dictionary<Type, (MethodInfo? Set, MethodInfo? Is)> VisibilityMethodCache = new();
+
+    static (MethodInfo? Set, MethodInfo? Is) VisibilityMethods(Type type)
+    {
+        lock (VisibilityMethodCache)
+        {
+            if (!VisibilityMethodCache.TryGetValue(type, out var methods))
+            {
+                methods = (type.GetMethod("SetMapVisible", new[] { typeof(DisplayMaps.Map), typeof(bool) }),
+                           type.GetMethod("IsMapVisible", new[] { typeof(DisplayMaps.Map) }));
+                VisibilityMethodCache[type] = methods;
+            }
+            return methods;
+        }
+    }
+
     // Returns whether any scope had to be told to show the layer.
     bool EnsureVisible()
     {
@@ -291,14 +308,12 @@ public sealed class AsdMapLayer
 
         foreach (var asd in AsdControls())
         {
-            var type = asd.GetType();
-            var setVisible = type.GetMethod("SetMapVisible", new[] { typeof(DisplayMaps.Map), typeof(bool) });
+            var (setVisible, isVisible) = VisibilityMethods(asd.GetType());
             if (setVisible == null)
                 continue;
 
             // Checked first: SetMapVisible ends in SetRenderParams, which forces a full redraw of
             // that scope, and this runs every ReassertInterval.
-            var isVisible = type.GetMethod("IsMapVisible", new[] { typeof(DisplayMaps.Map) });
             if (isVisible?.Invoke(asd, new object[] { map }) is true)
                 continue;
 

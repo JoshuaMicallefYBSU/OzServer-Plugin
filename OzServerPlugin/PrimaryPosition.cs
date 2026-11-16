@@ -313,6 +313,16 @@ public static class PrimaryPosition
             .SelectMany(atc => DefaultSectorsForCurrentSession(atc.Callsign).Select(sector => (Sector: sector, Callsign: atc.Callsign)))
             .ToList();
 
+    // A TMA (approach or departure) sector, by its callsign - the rule the Sectors window groups
+    // "Approach" by, and the API's APP/DEP sector types. Its aircraft are never handed over
+    // automatically when it changes owner: the volumes stacked inside a TMA cannot be relied on to
+    // say which controller an aircraft belongs to, so the controllers hand each one over themselves
+    // (SectorTagHandoff; the API's TMA_SECTOR_TYPES_SQL leaves them alone to match).
+    public static bool IsTmaSector(SectorsVolumes.Sector? sector) =>
+        sector?.Callsign is { Length: > 0 } callsign
+        && (callsign.EndsWith("_APP", StringComparison.OrdinalIgnoreCase)
+            || callsign.EndsWith("_DEP", StringComparison.OrdinalIgnoreCase));
+
     // A callsign of the form vatSys's IsRealATC accepts as a controller position.
     public static bool IsControllerCallsign(string? callsign) =>
         !string.IsNullOrEmpty(callsign) && ControllerCallsign.IsMatch(callsign);

@@ -649,6 +649,12 @@ public class OzServerSectorsWindow : BaseForm
             _ = _tracker.RefreshFromServerIfIdleAsync();
             _ = RefreshRequestedChangesAsync();
             RefreshControlledSnapshot();
+            // Changes to who is online while hidden were not drawn - see RefreshAvailableList.
+            if (_availableStale)
+            {
+                _availableStale = false;
+                PopulateAvailableList();
+            }
         }
         else
         {
@@ -1493,7 +1499,43 @@ public class OzServerSectorsWindow : BaseForm
         if (_sectorListMode != SectorListMode.Available)
             return;
 
-        PopulateAvailableList();
+        // OnlineATCChanged fires for every update from every controller online - several a second
+        // on a busy night - and each rebuild clears and refills the whole tree on the UI thread.
+        // Hidden, nothing is drawn: the list is rebuilt when the window opens. Shown, a burst is
+        // folded into one rebuild a second. Rebuilding on every event, hidden or not, starved
+        // slower PCs' UI thread (ML-BLA_CTR and ML-GUN_CTR, 16 Nov).
+        if (!Visible)
+        {
+            _availableStale = true;
+            return;
+        }
+        if (!_availableRebuildTimer.Enabled)
+            _availableRebuildTimer.Start();
+    }
+
+    bool _availableStale;
+    System.Windows.Forms.Timer? _availableRebuildTimerField;
+    System.Windows.Forms.Timer _availableRebuildTimer
+    {
+        get
+        {
+            if (_availableRebuildTimerField == null)
+            {
+                _availableRebuildTimerField = new System.Windows.Forms.Timer { Interval = 1000 };
+                _availableRebuildTimerField.Tick += (_, _) =>
+                {
+                    _availableRebuildTimerField.Stop();
+                    if (IsDisposed || !Visible || _sectorListMode != SectorListMode.Available)
+                    {
+                        _availableStale = true;
+                        return;
+                    }
+                    _availableStale = false;
+                    PopulateAvailableList();
+                };
+            }
+            return _availableRebuildTimerField;
+        }
     }
 
     void PopulateLists()
@@ -1800,6 +1842,13 @@ public class OzServerSectorsWindow : BaseForm
             return;
 
         _controlledSignature = signature;
+
+        // The snapshot above is kept current regardless; drawing it waits for the window to open.
+        if (!Visible)
+        {
+            _availableStale = true;
+            return;
+        }
 
         PopulateAvailableList();
     }

@@ -362,13 +362,30 @@ public class SectorTagHandoff
         // ordinary handoff and leaves the tag pending again, while this client already counts it
         // as accepted - and nobody is tracking the aircraft.
         var handedOver = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var transfer in diff.Lost)
+        // TMA sectors first: an aircraft inside one is also inside the enroute sector stacked over
+        // it, and must be kept for a manual handoff (KeepForManualHandoff) before that sector's
+        // pass would hand it over.
+        foreach (var transfer in diff.Lost.OrderBy(t => PrimaryPosition.IsTmaSector(t.Sector) ? 0 : 1))
             GiveAway(transfer, handedOver);
 
         foreach (var transfer in diff.Gained)
         {
             if (transfer.Counterparty?.Callsign is not { Length: > 0 } from)
                 continue;
+
+            // A TMA sector's aircraft are handed over by hand (see PrimaryPosition.IsTmaSector), so
+            // nothing is expected with it: a handoff that arrives flashes, to be accepted like any
+            // other.
+            if (PrimaryPosition.IsTmaSector(transfer.Sector))
+            {
+                ActionLog.Log("Tag", $"Gained {transfer.Sector.Name} from {from} - TMA sector, its tags are handed over by hand", new
+                {
+                    action = "sector_gained_tma_manual",
+                    sector = transfer.Sector.Name,
+                    from_callsign = from
+                });
+                continue;
+            }
 
             lock (_lock)
                 AddOrRefreshIncoming(transfer.Sector, from);
@@ -388,6 +405,54 @@ public class SectorTagHandoff
         }
     }
 
+    // A TMA sector given away: its aircraft are not handed over, but they must not be dropped either.
+    // When the sector leaves MMI.SectorsControlled, vatSys stops tracking every tag whose
+    // ControllingSector it was. Each tag this controller tracks inside the sector, or controlled
+    // from it, is pointed at this session's own login sector (OwnAnchor), which nothing removes, so
+    // it stays tracked here until the controller hands it over.
+    void KeepForManualHandoff(SectorTransfer transfer, string toCallsign, HashSet<string> handedOver)
+    {
+        var anchor = OwnAnchor();
+        var kept = new List<string>();
+
+        foreach (var fdr in FDP2.GetFDRs.ToList())
+        {
+            if (string.IsNullOrEmpty(fdr.Callsign) || !fdr.IsTrackedByMe || handedOver.Contains(fdr.Callsign))
+                continue;
+
+            var controlledFromIt = fdr.ControllingSector != null && fdr.ControllingSector.Equals(transfer.Sector);
+            if (!controlledFromIt && SectorLocator.Resolve(fdr, new[] { transfer.Sector }) == null)
+                continue;
+
+            if (anchor != null && !anchor.Equals(transfer.Sector))
+            {
+                fdr.ControllingSector = anchor;
+                if (MMI.FindTrack(fdr) is { } track)
+                    MMI.SetTrackState(track);
+            }
+
+            // ReassertConfirmations would point it back at the sector being given away.
+            lock (_lock)
+                _confirming.Remove(fdr.Callsign);
+
+            // Not handed over by a later sector in the same change either.
+            handedOver.Add(fdr.Callsign);
+            kept.Add(fdr.Callsign);
+        }
+
+        ActionLog.Log("Tag", kept.Count > 0
+            ? $"{transfer.Sector.Name} went to {toCallsign} - TMA sector, kept {string.Join(", ", kept)} for a manual handoff"
+            : $"{transfer.Sector.Name} went to {toCallsign} - TMA sector, no tags of ours inside it",
+            new
+            {
+                action = "sector_lost_tma_manual",
+                sector = transfer.Sector.Name,
+                to_callsign = toCallsign,
+                fdr_callsigns = kept.ToArray(),
+                anchored_to = anchor?.Name
+            });
+    }
+
     // The giving side. Hands each aircraft this controller tracks inside the lost sector to the
     // controller who now owns it. handedOver holds aircraft already handed off earlier in the same
     // ownership change (see OnOwnershipChanged); they are never handed a second time.
@@ -400,6 +465,14 @@ public class SectorTagHandoff
         // are rather than dropped to uncontrolled.
         if (transfer.Counterparty?.Callsign is not { Length: > 0 } toCallsign)
             return;
+
+        // A TMA sector: its aircraft stay with this controller until they hand each one over
+        // themselves (see PrimaryPosition.IsTmaSector).
+        if (PrimaryPosition.IsTmaSector(transfer.Sector))
+        {
+            KeepForManualHandoff(transfer, toCallsign, handedOver);
+            return;
+        }
 
         // The sector to hand to is the new owner's own, not the one that changed hands: vatSys
         // addresses a handoff to a sector, and it has to be one that controller is working.

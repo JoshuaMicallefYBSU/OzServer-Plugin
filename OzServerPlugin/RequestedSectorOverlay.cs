@@ -181,6 +181,8 @@ public class RequestedSectorOverlay
     // controller has just closed.
     void Apply() => AsdMapLayer.RunOnUiThread(ApplyNow);
 
+    string? _lastShapesKey;
+
     void ApplyNow()
     {
         var incoming = _revealed ? _incoming : new List<SectorsVolumes.Sector>();
@@ -190,15 +192,24 @@ public class RequestedSectorOverlay
                 .Select(group => group.First())
                 .ToList()
             : new List<SectorsVolumes.Sector>();
-        var incomingPolygons = incoming.SelectMany(Boundaries).ToList();
-        var outgoingPolygons = outgoing.SelectMany(Boundaries).ToList();
+        // The same sectors as last time need no new shapes. This runs after every sync, and the
+        // merge is the most expensive thing it does - on the UI thread.
+        var shapesKey = string.Join(",", incoming.Select(s => s.Name)) + "|" + string.Join(",", outgoing.Select(s => s.Name));
+        if (shapesKey != _lastShapesKey)
+        {
+            _lastShapesKey = shapesKey;
 
-        // The border outlines every volume, so the sector boundaries show inside the shading; the
-        // fill is their merged outline, so overlapping volumes are shaded once (see SectorFill).
-        _incomingFill.SetPolygons(SectorFill.Merge(incomingPolygons));
-        _incomingBorder.SetPolygons(incomingPolygons);
-        _outgoingFill.SetPolygons(SectorFill.Merge(outgoingPolygons));
-        _outgoingBorder.SetPolygons(outgoingPolygons);
+            var incomingPolygons = incoming.SelectMany(Boundaries).ToList();
+            var outgoingPolygons = outgoing.SelectMany(Boundaries).ToList();
+
+            // The border outlines every volume, so the sector boundaries show inside the shading;
+            // the fill is their merged outline, so overlapping volumes are shaded once (see
+            // SectorFill).
+            _incomingFill.SetPolygons(SectorFill.Merge(incomingPolygons));
+            _incomingBorder.SetPolygons(incomingPolygons);
+            _outgoingFill.SetPolygons(SectorFill.Merge(outgoingPolygons));
+            _outgoingBorder.SetPolygons(outgoingPolygons);
+        }
 
         var message = incoming.Count == 0 && outgoing.Count == 0
             ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing pending, revealed={_revealed})"

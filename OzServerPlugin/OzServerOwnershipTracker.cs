@@ -1635,11 +1635,16 @@ public class OzServerOwnershipTracker
         //   - Anything a transmit press is already asking about (IsHeldForTransmitPrompt).
         //
         // Both are still left out of the claim below, like any conflict.
+        //   - A sector held by the controller logged on as it (the sector's own callsign - vatSys's
+        //     rule for giving a sector to its controller). It is theirs, not cover to take back:
+        //     BLA logging on while ML_APP was online asked ML_APP for MAE, which BLA only works
+        //     top-down when ML_APP is away.
         var reliefCover = conflicts.Where(c => PrimaryPosition.IsFlowCallsign(c.Owner?.Callsign)
-                                               || IsHeldForTransmitPrompt(c.Sector)).ToList();
+                                               || IsHeldForTransmitPrompt(c.Sector)
+                                               || HeldByItsOwnController(c)).ToList();
         if (reliefCover.Count > 0)
             ActionLog.Log("Ownership",
-                $"Left {string.Join(", ", reliefCover.Select(c => c.Sector))} with {string.Join(", ", reliefCover.Select(c => c.Owner?.Callsign).Distinct())} - FMP relief cover, or already being asked about from a transmit press",
+                $"Left {string.Join(", ", reliefCover.Select(c => c.Sector))} with {string.Join(", ", reliefCover.Select(c => c.Owner?.Callsign).Distinct())} - their own position, FMP relief cover, or already being asked about from a transmit press",
                 new
                 {
                     action = "conflict_left_with_flow_relief",
@@ -1729,6 +1734,15 @@ public class OzServerOwnershipTracker
                     freq.Transmit = false;
             }
         });
+    }
+
+    static bool HeldByItsOwnController(OzServerSectorConflictDto conflict)
+    {
+        var owner = conflict.Owner?.Callsign;
+        if (string.IsNullOrEmpty(owner))
+            return false;
+        var sector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == conflict.Sector);
+        return sector != null && string.Equals(sector.Callsign, owner, StringComparison.OrdinalIgnoreCase);
     }
 
     static bool Covers(string root, string name)

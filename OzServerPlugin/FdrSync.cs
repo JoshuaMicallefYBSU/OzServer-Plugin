@@ -74,6 +74,10 @@ public class FdrSync
             LabelStateRestore.ForgetAllPending();
             lock (_trackedHere)
                 _trackedHere.Clear();
+            lock (_outsideLabel)
+                _outsideLabel.Clear();
+            lock (_lastRadarPush)
+                _lastRadarPush.Clear();
             Landed.Clear();
         };
     }
@@ -94,6 +98,9 @@ public class FdrSync
 
         Merge(BuildFdrDto(fdr, forceRoute: false));
     }
+
+    static readonly TimeSpan RadarEvery = TimeSpan.FromSeconds(2);
+    readonly Dictionary<string, DateTime> _lastRadarPush = new(StringComparer.OrdinalIgnoreCase);
 
     // Tags this session has tracked, to recognise the moment one is dropped.
     readonly HashSet<string> _trackedHere = new(StringComparer.OrdinalIgnoreCase);
@@ -176,6 +183,18 @@ public class FdrSync
         var fdr = track.CoupledFDR;
         if (string.IsNullOrEmpty(fdr?.Callsign))
             return;
+
+        // At most one position per aircraft every RadarEvery. The batch goes out every
+        // FlushInterval and keeps only the latest position, while vatSys raises an update for every
+        // fast-position report - several a second per aircraft nearby - and each one works out the
+        // responsible sector and the sector the aircraft is in. Slower PCs could not spare that.
+        var now = DateTime.UtcNow;
+        lock (_lastRadarPush)
+        {
+            if (_lastRadarPush.TryGetValue(fdr!.Callsign, out var last) && now - last < RadarEvery)
+                return;
+            _lastRadarPush[fdr.Callsign] = now;
+        }
 
         if (!ShouldPush(fdr!))
             return;
@@ -997,7 +1016,60 @@ public class FdrSync
         var dto = BuildFdrDto(fdr);
         FillResponsibleSector(dto, fdr);
         FillRoute(dto, fdr, forceRoute);
+        FillOutsideLabel(dto, fdr);
         return dto;
+    }
+
+    // The label of a tag tracked by a controller not on OzServer (TrackedOutsideOzServer): nobody's
+    // client saves it, so it went stale on OzServer - ML-BLA_CTR, with OzServer turned off, changed
+    // JST520's level and the record kept ML_APP's. vatSys shares the tracking controller's cleared
+    // level, scratchpad and global ops live with every connected controller, so the client
+    // reporting the flight has their real values, and states them.
+    //
+    // Only those three. The C and off-track deviations exist only on the tracking controller's own
+    // vatSys; what this client holds is its own, and is left out.
+    //
+    // And only once something has changed while this client watched. A client that connected
+    // after the controller set them holds empty fields - vatSys sends them only when they change -
+    // and stating those would erase the record. A change of tracker starts the watch again.
+    readonly Dictionary<string, (string? Tracker, string Key, bool Live)> _outsideLabel =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    void FillOutsideLabel(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
+    {
+        if (fdr.IsTrackedByMe || string.IsNullOrEmpty(fdr.Callsign))
+            return;
+
+        var tracker = fdr.ControllerTracking?.Callsign;
+        if (!TrackedOutsideOzServer(fdr))
+        {
+            lock (_outsideLabel)
+                _outsideLabel.Remove(fdr.Callsign);
+            return;
+        }
+
+        var key = $"{fdr.CFLLower}\u001f{fdr.CFLUpper}\u001f{fdr.LabelOpData}\u001f{fdr.GlobalOpData}";
+        bool live;
+        lock (_outsideLabel)
+        {
+            if (!_outsideLabel.TryGetValue(fdr.Callsign, out var seen)
+                || !string.Equals(seen.Tracker, tracker, StringComparison.OrdinalIgnoreCase))
+            {
+                _outsideLabel[fdr.Callsign] = (tracker, key, false);
+                return;
+            }
+
+            live = seen.Live || seen.Key != key;
+            _outsideLabel[fdr.Callsign] = (tracker, key, live);
+        }
+
+        if (!live)
+            return;
+
+        dto.ClearanceKnown = true;
+        dto.CPrompt = null;
+        dto.OtdLeft = null;
+        dto.OtdRight = null;
     }
 
     void FillRoute(OzServerFdrUpdateDto dto, FDP2.FDR fdr, bool force)

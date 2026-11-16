@@ -61,6 +61,7 @@ public class Plugin : IPlugin
     readonly PluginUpdater _updater;
     // Copies this session's decisions to OzServer so every controller's log can be read together.
     readonly ClientLogForwarder _clientLogForwarder;
+    readonly UiStallWatchdog _uiStallWatchdog;
 
     // Incoming requests waiting on this controller, driving the Settings header's flash.
     int _pendingRequests;
@@ -87,6 +88,8 @@ public class Plugin : IPlugin
         _clientLogForwarder = new ClientLogForwarder();
         // Straight after it, so an error raised by anything constructed below is forwarded too.
         ErrorReporter.Install();
+        // Logs when vatSys's UI thread stalls, whatever is holding it - see UiStallWatchdog.
+        _uiStallWatchdog = new UiStallWatchdog();
         // Before anything that writes MMI.SectorsControlled, so its first snapshot predates any
         // change this plugin makes to the list.
         MmiSectorWatch.Install();
