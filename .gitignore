@@ -10,6 +10,7 @@ obj/
 
 # Local decompiled vatSys reference project - not ours to redistribute
 .reference-plugin
+.csproj/
 
 # Credential file used by early token-authenticated builds. No longer compiled; never commit one.
 OzServerPlugin/Secrets.cs
