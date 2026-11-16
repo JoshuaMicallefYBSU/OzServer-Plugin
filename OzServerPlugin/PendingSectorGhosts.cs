@@ -64,9 +64,29 @@ public class PendingSectorGhosts
     }
 
     // Called on every FDR and radar update, when vatSys has just recomputed the state. Marshalled
-    // because Apply writes Track.State and calls MMI.RequestRedraw, which are vatSys UI state, and
-    // these callbacks arrive on pool threads.
-    public void Reassert() => RunOnUiThread(Apply);
+    // because Apply writes Track.State, which is vatSys UI state, and these callbacks arrive on
+    // pool threads.
+    //
+    // Posted only while there is something to paint or hand back, and at most one pass waits on
+    // the UI thread at a time. Posting one per update queued hundreds of passes a second onto
+    // vatSys's UI thread in busy airspace - each forcing a full map redraw while a request was
+    // pending - and froze the scope on slower PCs (ML-BLA_CTR and ML-GUN_CTR, 16 Nov).
+    public void Reassert()
+    {
+        if (!_active)
+            return;
+        if (System.Threading.Interlocked.Exchange(ref _queued, 1) == 1)
+            return;
+        RunOnUiThread(() =>
+        {
+            System.Threading.Interlocked.Exchange(ref _queued, 0);
+            Apply();
+        });
+    }
+
+    // Whether the last pass had anything pending or painted. Read by Reassert from pool threads.
+    volatile bool _active;
+    int _queued;
 
     void Apply()
     {
@@ -86,8 +106,9 @@ public class PendingSectorGhosts
                 pending.Clear();
 
             // The common case - nothing pending and nothing painted - returns before walking every
-            // flight, since this runs on every FDR and radar update.
-            if (pending.Count == 0 && _painted.Count == 0)
+            // flight, and turns the per-update reassert off until the timer finds work again.
+            _active = pending.Count > 0 || _painted.Count > 0;
+            if (!_active)
                 return;
 
             var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -123,8 +144,9 @@ public class PendingSectorGhosts
             foreach (var callsign in wanted)
                 _painted.Add(callsign);
 
-            if (wanted.Count > 0 || released.Count > 0)
-                MMI.RequestRedraw(true, false, false);
+            // No redraw request: tracks are drawn from Track.State on every frame of the scope's
+            // render loop. A background redraw (RequestRedraw(true)) recomputes every map on every
+            // scope, and was being asked for on every radar update.
         }
         catch (Exception ex)
         {

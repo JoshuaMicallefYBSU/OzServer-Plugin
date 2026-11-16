@@ -83,12 +83,37 @@ public sealed class AsdMapLayer
 
     // The shapes this layer draws, in lat/lon. Any beyond the pool size are dropped: the pool is
     // fixed (see MutationSafety).
+    //
+    // The same shapes again change nothing and are dropped here: every apply ends in a background
+    // redraw, which recomputes every map on every scope - see Reassert.
     public void SetPolygons(IEnumerable<List<Coordinate>> polygons)
     {
+        var next = polygons.Take(_poolSize).ToList();
         lock (_lock)
-            _polygons = polygons.Take(_poolSize).ToList();
+        {
+            if (SameShapes(_polygons, next))
+                return;
+            _polygons = next;
+        }
 
         RunOnUiThread(ApplyNow);
+    }
+
+    static bool SameShapes(List<List<Coordinate>> a, List<List<Coordinate>> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (a[i].Count != b[i].Count)
+                return false;
+            for (var j = 0; j < a[i].Count; j++)
+            {
+                if (a[i][j].Latitude != b[i][j].Latitude || a[i][j].Longitude != b[i][j].Longitude)
+                    return false;
+            }
+        }
+        return true;
     }
 
     // The fast path: swaps the points and requests a repaint. Creating the map and asserting its
@@ -133,12 +158,19 @@ public sealed class AsdMapLayer
         if (!DisplayMaps.Loaded)
             return;
 
+        // A background redraw only when this pass changed something - the layer re-added after a
+        // map reload, or made visible on a scope that did not show it. MMI.RequestRedraw(true)
+        // makes every scope drop its cached map image and recompute every map, as on a pan or
+        // zoom; asked for unconditionally, four layers every two seconds, it was steady load the
+        // slower PCs could not carry.
         try
         {
-            EnsureMap();
-            ApplyPolygons();
-            EnsureVisible();
-            MMI.RequestRedraw(true, false, false);
+            var changed = EnsureMap();
+            if (changed)
+                ApplyPolygons();
+            changed |= EnsureVisible();
+            if (changed)
+                MMI.RequestRedraw(true, false, false);
         }
         catch (Exception ex)
         {
@@ -169,12 +201,13 @@ public sealed class AsdMapLayer
     //    not read Points - it works from the table.
     // ---------------------------------------------------------------------------------------------
 
-    void EnsureMap()
+    // Returns whether the layer had to be (re)created.
+    bool EnsureMap()
     {
         // Detects a map reload having dropped the layer. Contains only reads, and concurrent reads
         // of a List are safe.
         if (_map != null && DisplayMaps.Maps.Contains(_map))
-            return;
+            return false;
 
         RegisterColour(_colourName, _red, _green, _blue, _alpha);
 
@@ -230,6 +263,7 @@ public sealed class AsdMapLayer
         var replacement = DisplayMaps.Maps.Where(existing => existing.Name != _mapName).ToList();
         replacement.Add(map);
         SetMaps(replacement);
+        return true;
     }
 
     void ApplyPolygons()
@@ -247,11 +281,13 @@ public sealed class AsdMapLayer
             pool[i].Points = i < polygons.Count ? polygons[i] : Hidden;
     }
 
-    void EnsureVisible()
+    // Returns whether any scope had to be told to show the layer.
+    bool EnsureVisible()
     {
+        var changed = false;
         var map = _map;
         if (map == null)
-            return;
+            return false;
 
         foreach (var asd in AsdControls())
         {
@@ -267,7 +303,9 @@ public sealed class AsdMapLayer
                 continue;
 
             setVisible.Invoke(asd, new object[] { map, true });
+            changed = true;
         }
+        return changed;
     }
 
     // Registers a colour in the Colours custom table so CustomColourName resolves. Done by
