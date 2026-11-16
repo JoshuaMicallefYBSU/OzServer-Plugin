@@ -241,6 +241,12 @@ public class OzServerFdrUpdateDto
     // controller sees one. Same rule as the label above: stated only by the tag's owner.
     [JsonProperty("otd_left")] public int? OtdLeft { get; set; }
     [JsonProperty("otd_right")] public int? OtdRight { get; set; }
+    // True once the controller tracking the tag has dropped it to nobody; false once somebody
+    // tracks it again. A dropped tag is not picked up by the next controller to connect
+    // (FdrResumeActivation) - the drop was a decision, not a gap. Left out when not known.
+    [JsonProperty("dropped")] public bool? Dropped { get; set; }
+    public bool ShouldSerializeDropped() => Dropped != null;
+
     public bool ShouldSerializeOtdLeft() => ClearanceKnown && OtdLeft != null;
     public bool ShouldSerializeOtdRight() => ClearanceKnown && OtdRight != null;
     [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }

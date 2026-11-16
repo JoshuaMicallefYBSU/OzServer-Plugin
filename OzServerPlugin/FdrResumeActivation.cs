@@ -502,10 +502,14 @@ public class FdrResumeActivation
         MarkDeparted(fdr, passedAt - elapsed);
     }
 
-    // Somebody's tag already, as far as OzServer knows: another OzServer controller's (the record
-    // names them), or one tracked by a controller without the plugin (tracked_by). Never picked up.
+    // Not to be picked up: dropped by its controller, another OzServer controller's tag (the record
+    // names them), or one tracked by a controller without the plugin (tracked_by).
     static bool OwnedElsewhere(OzServerFdrRecordDto record)
     {
+        // Dropped by its controller: left for whoever chooses to pick it up.
+        if (record.Dropped == true)
+            return true;
+
         var me = Network.Me?.Callsign;
         if (record.ControllingCid != null && record.ControllingCid != NetworkIdentity.Current?.Cid)
             return true;

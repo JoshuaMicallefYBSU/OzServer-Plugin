@@ -72,6 +72,8 @@ public class FdrSync
             // And adopts every tag's label from the record again when next tracked.
             LabelAdopted.Clear();
             LabelStateRestore.ForgetAllPending();
+            lock (_trackedHere)
+                _trackedHere.Clear();
             Landed.Clear();
         };
     }
@@ -84,10 +86,51 @@ public class FdrSync
         if (string.IsNullOrEmpty(fdr.Callsign))
             return;
 
+        if (ReportDrop(fdr))
+            return;
+
         if (!ShouldPush(fdr))
             return;
 
         Merge(BuildFdrDto(fdr, forceRoute: false));
+    }
+
+    // Tags this session has tracked, to recognise the moment one is dropped.
+    readonly HashSet<string> _trackedHere = new(StringComparer.OrdinalIgnoreCase);
+
+    // A tag this controller was tracking that now has no tracker at all has been dropped by them -
+    // a handoff leaves it tracked by the receiver. Reported as dropped, from here whether or not
+    // this session would otherwise report the flight, so the next controller to connect does not
+    // pick it straight back up (FdrResumeActivation). QLK1035, dropped by ML-MUN_CTR, was taken
+    // again by their own next connect two seconds later.
+    bool ReportDrop(FDP2.FDR fdr)
+    {
+        bool wasMine;
+        lock (_trackedHere)
+        {
+            if (fdr.IsTrackedByMe)
+            {
+                _trackedHere.Add(fdr.Callsign);
+                return false;
+            }
+            wasMine = _trackedHere.Remove(fdr.Callsign);
+        }
+
+        // Not while disconnecting: vatSys lets every tag go then, and that is not a drop.
+        if (!wasMine || fdr.IsTracked || !Network.IsConnected)
+            return false;
+
+        var dto = BuildFdrDto(fdr, forceRoute: false);
+        dto.Dropped = true;
+        Merge(dto);
+
+        ActionLog.Log("FDR", $"Dropped {fdr.Callsign} - it will not be picked up automatically", new
+        {
+            action = "fdr_dropped",
+            fdr_callsign = fdr.Callsign,
+            state = fdr.State.ToString()
+        });
+        return true;
     }
 
     // Sends without waiting for the flush timer. A change of authority cannot ride the next batch:
@@ -934,6 +977,9 @@ public class FdrSync
         }
 
         FillAuthority(dto, fdr);
+        // Tracked again, so no longer dropped - see OzServerFdrUpdateDto.Dropped.
+        if (fdr.IsTrackedByMe)
+            dto.Dropped = false;
         FillPredictedPosition(dto, fdr);
         FillCurrentSector(dto, fdr);
         FillAerodromes(dto, fdr);
