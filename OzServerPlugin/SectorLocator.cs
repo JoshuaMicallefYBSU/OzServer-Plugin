@@ -21,7 +21,7 @@ public static class SectorLocator
     // Never falls back to fdr.GetLocation(): with no track that returns PredictedPosition.Location,
     // the flight plan's guess, which can resolve an aircraft into a sector it is laterally outside.
     // No radar return means no position.
-    static RDP.RadarTrack? LiveTrack(FDP2.FDR fdr)
+    internal static RDP.RadarTrack? LiveTrack(FDP2.FDR fdr)
     {
         if (fdr.CoupledTrack is { } coupled)
             return coupled;

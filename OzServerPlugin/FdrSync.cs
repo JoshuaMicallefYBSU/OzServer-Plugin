@@ -267,8 +267,11 @@ public class FdrSync
 
         // An untracked FDR is reported only from a radar return, so it has to be coupled: a
         // floating one's position is a prediction. (A finish that passed the test above was seen
-        // on radar too - see IsCredibleFinish.)
-        if (fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED && fdr.CoupledTrack == null)
+        // on radar too - see IsCredibleFinish.) The exception is an aircraft still on the ground:
+        // vatSys couples nothing below 50 kt (RDP.TryAutoCouple), so an activated flight at the
+        // gate or taxiing is uncoupled until its take-off roll, and nobody reported it at all. Its
+        // own return, matched by callsign, is a real position, so it stands in for the coupling.
+        if (fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED && fdr.CoupledTrack == null && GroundReturn(fdr) == null)
             return false;
 
         return ResponsibleSectorForUntracked(fdr, out _);
@@ -662,6 +665,21 @@ public class FdrSync
                 ErrorThrottle.Report("fdr-floating", $"Couldn't read FDR {fdr.Callsign} for OzServer: {ex.Message}", ex);
             }
         }
+    }
+
+    // The radar return of an activated flight that is uncoupled only because it has not started
+    // its take-off roll: below vatSys's 50 kt auto-couple floor, matched by callsign. Null for
+    // anything moving faster - an uncoupled return at speed is CoupleAssist's to couple, and its
+    // flight plan is not reported until it is.
+    const double GroundSpeedFloor = 50;
+
+    static RDP.RadarTrack? GroundReturn(FDP2.FDR fdr)
+    {
+        if (fdr.CoupledTrack != null || !fdr.ESTed)
+            return null;
+        return SectorLocator.LiveTrack(fdr) is { LatLong: not null } track && track.GroundSpeed < GroundSpeedFloor
+            ? track
+            : null;
     }
 
     // Every SweepEvery-th flush, every FDR this session answers for is queued again in full. An FDR
@@ -1174,6 +1192,14 @@ public class FdrSync
     {
         if (fdr.CoupledTrack != null)
             return;
+
+        // On the ground the aircraft's own return is where it is, not the flight plan's guess at
+        // the aerodrome (see GroundReturn).
+        if (GroundReturn(fdr) is { } ground)
+        {
+            FillPosition(dto, ground);
+            return;
+        }
 
         var location = fdr.GetLocation();
         if (location == null)
