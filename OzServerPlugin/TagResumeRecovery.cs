@@ -209,6 +209,12 @@ public class TagResumeRecovery
         var canAccept = Network.ValidATC;
         var mine = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
+        // Worked out once a pass, on first need, not once a tag: each walks every online
+        // controller's position, on the UI thread.
+        var awaitingValidation = new Lazy<bool>(() => PrimaryPosition.AwaitingValidationForAny(mine, Network.Me?.Callsign));
+        var staffedByOthers = new Lazy<List<(SectorsVolumes.Sector Sector, string Callsign)>>(
+            () => PrimaryPosition.StaffedByOthers(Network.Me?.Callsign));
+
         foreach (var fdr in FDP2.GetFDRs)
         {
             if (string.IsNullOrEmpty(fdr.Callsign) || !waiting.ContainsKey(fdr.Callsign))
@@ -249,7 +255,7 @@ public class TagResumeRecovery
             // Not before vatSys has validated the controllers online: until then it knows neither
             // whose position the aircraft is in nor, often, who is tracking it - VOZ233 was taken
             // from ML_APP this way, BLA reconnecting before vatSys had heard from them.
-            if (PrimaryPosition.AwaitingValidationForAny(mine, Network.Me?.Callsign))
+            if (awaitingValidation.Value)
             {
                 waiting[fdr.Callsign] = "waiting for vatSys to validate the controllers online";
                 continue;
@@ -257,7 +263,7 @@ public class TagResumeRecovery
 
             // Inside another online controller's position: theirs, even if a sector of it is still
             // listed here for a moment (it is being handed to them - PrimaryPositionWatcher).
-            var staffed = PrimaryPosition.StaffedByOthers(Network.Me?.Callsign);
+            var staffed = staffedByOthers.Value;
             if (staffed.Count > 0 && SectorLocator.Resolve(fdr, staffed.Select(s => s.Sector)) is { } theirs)
             {
                 waiting.Remove(fdr.Callsign);
