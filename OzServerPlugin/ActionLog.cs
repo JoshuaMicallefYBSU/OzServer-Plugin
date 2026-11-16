@@ -4,27 +4,22 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Plain-text audit trail of what this plugin does to sectors and tags - one file per calendar
-// day, in Documents\vatSys Files\ (vatsys.Helpers.GetFilesFolder(), the same folder vatSys itself
-// uses for profiles and its own logs), named ozserver_<yyyyMMdd>.txt. The path is recomputed from
-// the current date on every write rather than cached, so multiple plugin sessions started on the
-// same day append to the same file, and a session still running when the date rolls over at
-// midnight rolls over to the new day's file with it, with nothing extra needed to make that happen.
+// Plain-text audit trail of what the plugin does to sectors and tags: one file per calendar day,
+// ozserver_<yyyyMMdd>.txt, in vatSys's own files folder (Helpers.GetFilesFolder()). The path is
+// derived from the current date on every write, so sessions started on the same day share a file
+// and a session running past midnight moves to the next day's.
 //
-// Two ways in: Log for a plain record of something that happened, LogAttempt for the
-// "attempts to do anything" requirement - every call OzServerApiClient makes, successful or not
-// (see its own PostRawAsync/GetAsync). Both funnel through the same file/lock; the split exists
-// only so callers don't have to invent their own "ok"/"failed" wording every time.
+// Log records something that happened; LogAttempt records an API call and its outcome, in one
+// wording for every caller.
 //
-// Deliberately cannot throw into a caller: a sync loop's actual job (claiming a sector, pushing
-// an FDR, activating a tag) must never fail because the audit trail couldn't be written to.
+// Never throws into a caller: claiming a sector, pushing an FDR or activating a tag must not fail
+// because the log could not be written.
 public static class ActionLog
 {
     static readonly object Lock = new();
 
-    // Raised for every line, after it has been written. Lets ClientLogForwarder copy the decisions
-    // to OzServer without this class knowing anything about the network - the file remains the
-    // complete record whether or not anything is listening.
+    // Raised for every line, before it is written to the file. ClientLogForwarder subscribes to
+    // copy lines to OzServer; the file remains the complete record.
     public static event Action<string, string>? LineWritten;
     public static event Action<string, string, object?>? StructuredLineWritten;
 
@@ -54,12 +49,12 @@ public static class ActionLog
         }
         catch
         {
-            // Logging must never be the reason a real action fails - see the class comment.
+            // See the class comment.
         }
     }
 
-    // Outside the file lock and swallowing everything: a subscriber must not be able to hold up the
-    // audit trail, nor break the operation whose log line this is.
+    // Outside the file lock and swallowing everything: a subscriber must not hold up the file
+    // write or break the operation being logged.
     static void Notify(string category, string message, object? context)
     {
         try

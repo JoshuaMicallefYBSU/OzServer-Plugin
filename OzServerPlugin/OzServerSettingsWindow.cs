@@ -102,9 +102,7 @@ public class OzServerSettingsWindow : BaseForm
     void SaveButton_Click(object? sender, EventArgs e)
     {
         var url = _baseUrlBox.Text.Trim();
-        // Shares OzServerSettings' own rule rather than re-checking here, so a URL typed into this
-        // box and one hand-edited into settings.json are held to the same standard - see
-        // IsValidBaseUrl for why an absolute-URI check on its own isn't enough.
+        // The same rule OzServerSettings applies to a hand-edited settings.json.
         if (!OzServerSettings.IsValidBaseUrl(url, out var error))
         {
             _statusLabel.Text = error;

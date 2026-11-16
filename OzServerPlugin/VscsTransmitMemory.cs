@@ -10,26 +10,22 @@ namespace OzServerPlugin;
 // Remembers which VSCS lines were transmitting, so a reconnect puts the controller back on the
 // frequencies they were working.
 //
-// OzServer already restores the *sectors* across a disconnect (POST /sectors/resume), but the VSCS
-// panel is vatSys's own state and comes back Idle every time. The controller was left owning
-// airspace on OzServer, with the infill on their scope, and silently off every frequency for it -
-// the one part of the position that does not announce it is missing, because a frequency you are
-// not transmitting on looks exactly like one nobody is calling on.
+// OzServer restores the sectors across a disconnect (POST /sectors/resume), but the VSCS panel is
+// vatSys's own state and comes back Idle. Without this a resumed controller owns the airspace and
+// is off every frequency for it, with nothing on the panel to show that.
 //
-// Written to %AppData% rather than beside the DLL, for the reason OzServerSettings gives: the
-// vatSys Plugins folder is not guaranteed writable. Its own file rather than a key in settings.json
-// because this is session scratch - it expires, it is rewritten on every transmit press, and losing
-// it should never cost someone their backend URL.
+// Written to %AppData% because the vatSys Plugins folder is not guaranteed writable (see
+// OzServerSettings), and to its own file rather than settings.json because it is session state: it
+// expires and is rewritten on every transmit press.
 //
-// Saved on every change rather than on disconnect: a disconnect is not always something this plugin
-// is told about in time to write a file - vatSys being killed, the machine losing power, a crash in
-// another plugin's handler - and those are exactly the sessions a controller most wants back the
-// way they left it.
+// Saved on every change rather than on disconnect: the plugin is not told about every disconnect in
+// time to write a file - vatSys being killed, the machine losing power, a crash in another
+// plugin's handler.
 public static class VscsTransmitMemory
 {
-    // How stale a memory may be before it is ignored. Comfortably past the backend's own resume
-    // window (RESUME_WINDOW_MINUTES), so this is never the reason a resume comes back without its
-    // frequencies, and short enough that tomorrow's session does not inherit today's panel.
+    // How stale a memory may be before it is ignored. Well past the backend's resume window
+    // (RESUME_WINDOW_MINUTES), and short enough that the next day's session does not inherit this
+    // one's panel.
     static readonly TimeSpan MaxAge = TimeSpan.FromHours(2);
 
     static readonly string MemoryPath = Path.Combine(
@@ -45,10 +41,9 @@ public static class VscsTransmitMemory
         [JsonProperty("lines")] public List<string> Lines { get; set; } = new();
     }
 
-    // The VSCS line names currently transmitting, recorded against the callsign they belong to. A
-    // line is remembered by Name (the sector callsign vatSys builds the line from), which is what
-    // identifies it again in a later session - the VSCSFrequency instances themselves do not
-    // survive a position change, let alone a restart.
+    // Records the VSCS lines currently transmitting against this session's callsign. A line is
+    // remembered by Name (the sector callsign vatSys builds the line from): the VSCSFrequency
+    // instances do not survive a position change or a restart.
     public static void Remember()
     {
         var callsign = Network.Me?.Callsign;
@@ -65,10 +60,9 @@ public static class VscsTransmitMemory
         Write(new Memory { Callsign = callsign!, SavedAt = DateTime.UtcNow, Lines = lines });
     }
 
-    // What was transmitting last time this callsign was connected, or an empty list. Keyed by
-    // callsign: coming back as a different position is a different panel, and restoring the last
-    // position's frequencies onto it would put the controller on frequencies belonging to airspace
-    // that is not theirs.
+    // What was transmitting when this callsign was last connected, or an empty list. Keyed by
+    // callsign: a different position has a different panel, and the previous position's
+    // frequencies belong to airspace that is not this controller's.
     public static IReadOnlyList<string> Recall(string? callsign)
     {
         if (string.IsNullOrEmpty(callsign))
@@ -99,9 +93,8 @@ public static class VscsTransmitMemory
         }
         catch (Exception)
         {
-            // A memory that cannot be read is simply a session that does not get its frequencies
-            // back. Never worth an error in front of a controller, and never worth throwing into
-            // whoever asked - this is read from a connect path.
+            // An unreadable memory means a session that does not get its frequencies back. Read
+            // from a connect path, so it neither throws nor reports an error.
             return null;
         }
     }
@@ -118,9 +111,8 @@ public static class VscsTransmitMemory
         }
         catch (Exception)
         {
-            // Same rule as Read, and more so: this runs from a TransmitChanged handler, inside
-            // vatSys's own VSCS click handling. A failed write costs the next reconnect its
-            // frequencies; an exception here would cost the click.
+            // Runs from a TransmitChanged handler, inside vatSys's own VSCS click handling. A failed
+            // write costs the next reconnect its frequencies; an exception would cost the click.
         }
     }
 }

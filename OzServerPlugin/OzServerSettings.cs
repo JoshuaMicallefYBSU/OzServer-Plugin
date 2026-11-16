@@ -4,9 +4,9 @@ using Newtonsoft.Json;
 
 namespace OzServerPlugin;
 
-// Persists the OzServer backend's base URL so it's a one-time edit to jump between the local dev
-// server and production, rather than a hardcoded value that needs a recompile. Stored under
-// %AppData% (not next to the DLL) since the vatSys Plugins folder isn't guaranteed writable.
+// Persists the OzServer base URL, so switching between a local dev server and production is a
+// settings edit rather than a recompile. Stored under %AppData% because the vatSys Plugins folder
+// is not guaranteed writable.
 public static class OzServerSettings
 {
     public const string DefaultBaseUrl = "https://api.ozserver.org";
@@ -18,7 +18,7 @@ public static class OzServerSettings
 
     static string? _baseUrl;
 
-    // Always trailing-slash-free, so callers can just append "/api/v1/...".
+    // Never ends in a slash, so callers can append "/api/v1/...".
     public static string BaseUrl
     {
         get
@@ -34,14 +34,9 @@ public static class OzServerSettings
         }
     }
 
-    // Keep remote traffic encrypted and reject URI schemes HttpClient was never intended to use.
-    // Two things are checked:
-    //   - The scheme must be http or https. Uri.TryCreate(..., UriKind.Absolute) on its own is far
-    //     too permissive for this: "mailto:x", "file:///c:/", and "foo:bar" are all absolute URIs
-    //     and all passed the old check, leaving every call to fail in a way that pointed nowhere
-    //     near the actual cause.
-    //   - Plain http is allowed only for a loopback host, so a dev server on localhost still
-    //     works while remote traffic cannot be sent in cleartext.
+    // The scheme must be http or https - Uri.TryCreate alone accepts any absolute URI, "mailto:x"
+    // and "file:///c:/" included - and plain http is allowed only for a loopback host, so a local
+    // dev server works while remote traffic is never sent in cleartext.
     public static bool IsValidBaseUrl(string? url, out string error)
     {
         error = "";
@@ -74,19 +69,15 @@ public static class OzServerSettings
             if (File.Exists(SettingsPath))
             {
                 var data = JsonConvert.DeserializeObject<StoredSettings>(File.ReadAllText(SettingsPath));
-                // Validated on the way in, not just on the way out through the settings window -
-                // settings.json is a plain file under %AppData% that anything can edit, so a value
-                // that never went through the window still has to clear the same bar before the
-                // token gets sent to it.
+                // Validated on load as well as in the settings window: settings.json is a plain
+                // file that anything can edit.
                 if (!string.IsNullOrWhiteSpace(data?.BaseUrl))
                 {
                     var stored = data!.BaseUrl!.TrimEnd('/');
 
-                    // Older releases persisted the then-default website host on first save. Once
-                    // the API moved to its own host that indistinguishable copy of the old default
-                    // otherwise became a permanent override, so an upgraded DLL kept sending its
-                    // (new API) token to the old Laravel API and received a 401. Only migrate the
-                    // exact former production default; real custom/dev endpoints stay untouched.
+                    // A settings file saved by an early release holds the former default, the
+                    // website host, which would otherwise override the API's own host for good.
+                    // Only that exact value is migrated; custom and dev endpoints are left alone.
                     if (string.Equals(stored, LegacyDefaultBaseUrl, StringComparison.OrdinalIgnoreCase))
                     {
                         _baseUrl = DefaultBaseUrl;
@@ -108,7 +99,7 @@ public static class OzServerSettings
         }
         catch (Exception ex)
         {
-            // A corrupt/unreadable settings file shouldn't block the plugin - fall back to default.
+            // A corrupt or unreadable settings file falls back to the default.
             vatsys.Errors.Add(ex, "OzServer Settings");
         }
 

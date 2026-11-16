@@ -6,29 +6,21 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Records who takes a sector out of MMI.SectorsControlled.
+// Logs what removes a sector from MMI.SectorsControlled.
 //
-// MMI.SectorsControlled is process-wide state with exactly one setter (MMI.SetControlledSectors)
-// and no record of who called it, and *every* plugin loaded into vatSys can write it. When a sector
-// this controller owns silently disappears from the scope, nothing in vatSys or in this plugin says
-// which code did it - the symptom (no infill, no jurisdiction over the sector's tags, a VSCS line
-// that no longer drops anything because the sector is already gone) shows up long after the write,
-// and reads as a bug in whatever noticed it last. Two rounds of this were spent reasoning backwards
-// from an ownership log that could only show what reached the backend.
+// MMI.SectorsControlled is process-wide state with one setter (MMI.SetControlledSectors), which
+// any plugin loaded into vatSys can call and which keeps no record of its caller. When a sector
+// this controller owns disappears from the scope, the symptoms show up well after the write and
+// nothing identifies the code that made it.
 //
-// So this watches the list itself. Every MMI.SectorsControlledChanged is diffed against the last
-// snapshot; a removal is logged with the sectors that went and the managed stack that was running
-// at the time, which names the assembly and method that called SetControlledSectors - this plugin's
-// own paths included.
+// Each MMI.SectorsControlledChanged is diffed against the previous snapshot. A removal is logged
+// with the sectors that went and the managed stack at the time, which names the method that called
+// SetControlledSectors - this plugin's own paths included. Additions are not logged, so an
+// ordinary session writes little.
 //
-// Only removals, and only the frames outside vatSys's own event plumbing, so an ordinary session
-// writes nothing: sectors are added far more often than they are taken away, and a deliberate drop
-// is a handful of lines an hour rather than a running commentary.
-//
-// Note for reading the output: vatSys raises SectorsControlledChanged from inside
-// MMI.SetControlledSectors, synchronously, so the caller really is on this stack. A write marshalled
-// onto the UI thread (BeginInvoke) shows only the message pump above it - that frame is this
-// plugin's own RunOnUiThread, and the action's origin is in the log line that follows it.
+// Reading the output: vatSys raises SectorsControlledChanged synchronously from inside
+// SetControlledSectors, so the caller is on the stack. A write marshalled onto the UI thread with
+// BeginInvoke shows only the marshalling frames; its origin is in the log line that follows it.
 public static class MmiSectorWatch
 {
     static readonly object Gate = new();
@@ -76,8 +68,8 @@ public static class MmiSectorWatch
         });
     }
 
-    // The first frame that is neither this class nor the plumbing every write goes through, which
-    // is the one that actually decided to change the list.
+    // The first frame that is neither this class nor the plumbing every write goes through: the
+    // one that decided to change the list.
     static string CallerSummary() => CallerFrames().FirstOrDefault() ?? "an unidentified caller";
 
     static string[] CallerFrames()
@@ -88,8 +80,8 @@ public static class MmiSectorWatch
                 .Select(frame => frame.GetMethod())
                 .Where(method => method?.DeclaringType != null)
                 .Select(method => $"{method!.DeclaringType!.FullName}.{method.Name}")
-                // This class's own frames say nothing; MMI.SetControlledSectors and the event
-                // invocation are on every single one of these stacks by construction.
+                // Frames that are on every one of these stacks: this class,
+                // MMI.SetControlledSectors and the event invocation.
                 .Where(name => !name.StartsWith("OzServerPlugin.MmiSectorWatch", StringComparison.Ordinal)
                                && !name.StartsWith("vatsys.MMI.SetControlledSectors", StringComparison.Ordinal)
                                && !name.StartsWith("System.", StringComparison.Ordinal))
@@ -99,8 +91,8 @@ public static class MmiSectorWatch
         }
         catch (Exception)
         {
-            // A diagnostic must never be the thing that breaks a session. Nothing here is worth
-            // failing an MMI write for, and this runs on the UI thread inside vatSys's own event.
+            // A diagnostic must not fail an MMI write: this runs on the UI thread inside vatSys's
+            // own event.
             return Array.Empty<string>();
         }
     }

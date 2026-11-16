@@ -3,20 +3,16 @@ using System.Threading;
 
 namespace OzServerPlugin;
 
-// The session-wide "Disable OzServer" switch (Tools > Disable OzServer).
+// The session-wide "Disable OzServer" switch (Tools > Disable OzServer), which lets a controller
+// who hits a problem carry on with plain vatSys. Once disabled, for the rest of the session:
 //
-// OzServer is going into testing, and a controller who hits a problem needs to be able to take it out
-// of their session completely and carry on with plain vatSys. Once disabled, for the rest of the
-// session:
+//  - nothing is sent to OzServer: OzServerApiClient refuses every request and the event stream
+//    closes;
+//  - the plugin changes nothing in vatSys: every event handler and timer that would touch
+//    controlled sectors, VSCS, tags, FDRs or the scope checks Disabled first and returns.
 //
-//  - nothing is sent to OzServer (OzServerApiClient refuses every request, and the event stream
-//    closes), so no claims, heartbeats, FDR pushes, ATIS or logs;
-//  - nothing in the plugin changes anything in vatSys: every event handler and timer that would
-//    touch controlled sectors, VSCS, tags, FDRs or the scope checks Disabled first and returns.
-//
-// One-way on purpose: switching every subsystem back on mid-session, against whatever the controller
-// has done in plain vatSys meanwhile, is exactly the kind of state the switch exists to escape.
-// Restarting vatSys brings OzServer back.
+// One-way by design: re-enabling mid-session would have to reconcile every subsystem with whatever
+// the controller has done in plain vatSys meanwhile. Restarting vatSys brings OzServer back.
 public static class OzServerMode
 {
     static volatile bool _disabled;
@@ -37,9 +33,9 @@ public static class OzServerMode
         DisabledChanged?.Invoke(null, EventArgs.Empty);
     }
 
-    // The clean-up made while disabling - releasing this controller's sectors so nobody else is left
-    // blocked by them, and sending the last of the log - has to get through after everything else is
-    // already shut off. Scoped to the async flow that opened it, so nothing else slips out alongside.
+    // Lets the clean-up made while disabling - releasing this controller's sectors and sending the
+    // last of the log - through after Disabled is set. Scoped to the async flow that opened it, so
+    // no other request gets out alongside.
     static readonly AsyncLocal<bool> FinalCalls = new();
 
     public static bool RequestsAllowed => !_disabled || FinalCalls.Value;

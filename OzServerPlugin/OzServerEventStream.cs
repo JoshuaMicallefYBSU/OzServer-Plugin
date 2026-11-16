@@ -9,73 +9,61 @@ namespace OzServerPlugin;
 
 // Consumes GET /api/v1/events, the backend's Server-Sent Events channel.
 //
-// The server sends signals, never data: an "event: sectors" line means "something under sectors
-// changed, go re-read it", and the caller answers with the same sync call it already makes on its
-// poll timer. So nothing here parses a payload, and no DTO change can reach this class - it decides
-// only *when* to refresh, never what the answer is. That is also why the endpoint asks for no
-// identity: it carries nothing worth protecting.
+// An event is a signal, not data: "event: sectors" means something under sectors changed, and the
+// subscriber answers with the same sync call its poll timer makes. Nothing here parses a payload;
+// this class decides only when to refresh. The endpoint asks for no identity for the same reason.
 //
-// The stream is per server. The backend keeps live VATSIM and each SweatBox entirely apart, and
-// requires ?server= to know which one this subscriber is watching - without it the request is
-// answered 400. This class used to connect once, at plugin load, with no server at all: every
-// attempt was refused, the failure was (deliberately) silent, and the plugin ran on its fallback
-// polls alone from the day the backend gained server isolation. Now it connects only while there is
-// a session on a server OzServer operates on, names that server, and drops the connection when the
-// session ends so the next one - possibly on a different server - starts its own.
+// The stream is per server: the backend keeps live VATSIM and each SweatBox apart, and answers 400
+// without ?server=. A connection is therefore held only while there is a session on a server
+// OzServer operates on, and dropped when that session ends, so the next one - possibly on a
+// different server - opens its own.
 //
-// The poll timers elsewhere are deliberately left running as a fallback. If this stream is down -
-// server restarting, network blip, a proxy that eats long-lived responses - the plugin degrades to
-// polling rather than silently freezing, which for an ATC tool matters considerably more than the
-// latency it wins.
+// The poll timers elsewhere keep running as a fallback. If the stream is down - a server restart,
+// a network blip, a proxy that cuts long-lived responses - the plugin degrades to polling rather
+// than freezing.
 public sealed class OzServerEventStream : IDisposable
 {
-    // Its own client, with no timeout. The shared one in OzServerApiClient has a request timeout
-    // (correct for a request/response call, fatal for a connection meant to stay open all session).
+    // Its own client with no timeout: the request timeout on OzServerApiClient's shared client
+    // would end a connection meant to stay open all session.
     static readonly HttpClient Http = new HttpClient { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
 
     static readonly TimeSpan MinBackoff = TimeSpan.FromSeconds(2);
     static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(30);
-    // How often to look for a session to subscribe on behalf of while there is none.
+    // How often to look for a session while there is none.
     static readonly TimeSpan IdleCheck = TimeSpan.FromSeconds(1);
-    // The server writes a keepalive comment every 20 seconds. Three missed in a row is not a quiet
-    // channel, it is a dead socket that nothing has told us about - and a read on one of those
-    // otherwise waits forever, looking connected and delivering nothing.
+    // The server writes a keepalive comment every 20 seconds. Three missed in a row means a dead
+    // socket, on which a read would otherwise wait forever.
     static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(65);
     static readonly TimeSpan WatchdogInterval = TimeSpan.FromSeconds(10);
-    // When the open connection last delivered a line of any kind, keepalives included. There is
-    // only ever one connection at a time, so one field serves.
+    // When the open connection last delivered a line, keepalives included. One field serves
+    // because there is only one connection at a time.
     long _lastLineTicks;
 
-    // What subscribers are told to re-read the moment a connection comes up. Whatever was signalled
-    // while there was no stream was never seen, so "connected" has to mean "assume everything
-    // changed" - once - rather than "nothing has happened yet".
+    // What subscribers are told to re-read when a connection comes up: anything signalled while
+    // there was no stream was missed.
     static readonly string[] CatchUpEvents = { "sectors" };
 
-    // One connection for the whole plugin. Several components could care about the same stream
-    // and opening a socket per subscriber would multiply long-lived
-    // connections per controller for no benefit - the server fans out to all of them identically.
+    // One connection for the whole plugin; the server sends every subscriber the same events.
     public static OzServerEventStream Shared { get; } = new OzServerEventStream();
 
-    // Carries the event name only ("sectors", "fdr", "atis") - see the class comment
-    // on why there is deliberately no payload to hand out.
+    // Carries the event name only ("sectors", "fdr", "atis") - see the class comment.
     public event Action<string>? EventReceived;
 
     readonly CancellationTokenSource _cancel = new();
-    // The connection currently open, if any - cancelled on its own when the session it belongs to
-    // ends, without stopping the stream as a whole.
+    // The connection currently open, if any. Cancelled when its session ends, without stopping
+    // the stream as a whole.
     readonly object _connectionGate = new();
     CancellationTokenSource? _connection;
 
     OzServerEventStream()
     {
         Network.Disconnected += (_, _) => DropConnection();
-        // Disabled is permanent for the session - the loop below then never connects again.
+        // Disabled is permanent for the session, so RunAsync never connects again.
         OzServerMode.DisabledChanged += (_, _) => DropConnection();
         _ = RunAsync(_cancel.Token);
     }
 
-    // One subscriber throwing must not tear the stream down for the others, or a single bad
-    // handler silently costs every other component its push updates for the rest of the session.
+    // A subscriber that throws must not end the stream for the others.
     void Raise(string name)
     {
         var handlers = EventReceived;
@@ -116,8 +104,8 @@ public sealed class OzServerEventStream : IDisposable
 
         while (!token.IsCancellationRequested)
         {
-            // Nothing to subscribe to without a session, and nothing to subscribe *as* on a server
-            // OzServer does not operate on (LocalHost, an unrecognised SweatBox).
+            // Nothing to subscribe to without a session, or on a server OzServer does not operate
+            // on (LocalHost, an unrecognised SweatBox).
             var server = Network.IsConnected && !OzServerMode.Disabled ? NetworkServer.Current : null;
             if (server == null)
             {
@@ -142,8 +130,8 @@ public sealed class OzServerEventStream : IDisposable
             try
             {
                 await ConsumeAsync(server, connection.Token).ConfigureAwait(false);
-                // A clean end of stream is an ordinary server restart or redeploy, not a fault -
-                // reconnect promptly rather than carrying a punitive backoff into it.
+                // A clean end of stream is an ordinary server restart or redeploy, so reconnect
+                // promptly.
                 backoff = MinBackoff;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -152,11 +140,9 @@ public sealed class OzServerEventStream : IDisposable
             }
             catch
             {
-                // Deliberately silent. The fallback polls keep everything correct without this
-                // stream, so a flapping connection must not fill the controller's vatSys error
-                // list mid-session with something that isn't costing them anything.
-                //
-                // Dropped on purpose (the session ended) is not a failure to back off from.
+                // Silent: the fallback polls keep everything correct, so a flapping stream must not
+                // fill the Errors window. A connection dropped because its session ended is not a
+                // failure to back off from.
                 backoff = connection.IsCancellationRequested
                     ? MinBackoff
                     : TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, MaxBackoff.Ticks));
@@ -185,9 +171,8 @@ public sealed class OzServerEventStream : IDisposable
     {
         var url = $"{OzServerSettings.BaseUrl}/api/v1/events?server={Uri.EscapeDataString(server)}";
 
-        // ResponseHeadersRead is required, not an optimisation: the default buffers the entire
-        // response before returning, and this response is designed never to end - so the await
-        // would simply never complete and no event would ever be delivered.
+        // ResponseHeadersRead is required: the default buffers the whole response before
+        // returning, and this response never ends.
         using (var response = await Http
             .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token)
             .ConfigureAwait(false))
@@ -195,8 +180,8 @@ public sealed class OzServerEventStream : IDisposable
             response.EnsureSuccessStatusCode();
 
             using (var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
-            // ReadLineAsync takes no token on .NET Framework, so cancelling has to pull the stream
-            // out from under the read instead - which is what ends it when the session does.
+            // ReadLineAsync takes no token on .NET Framework, so cancellation disposes the stream
+            // to end the read.
             using (token.Register(() =>
                    {
                        try
@@ -208,10 +193,9 @@ public sealed class OzServerEventStream : IDisposable
                            // Racing its own disposal below; either one closing it is enough.
                        }
                    }))
-            // One watchdog for the life of the connection rather than a timeout per read: on a busy
-            // server a line arrives several times a second, and a fresh 65 second timer for each
-            // would leave hundreds of them pending at any moment. It closes the stream the same way
-            // cancellation does, which fails the read below and sends RunAsync round again.
+            // One watchdog for the connection rather than a timeout per read, which on a busy
+            // server would leave hundreds of timers pending. It closes the stream as cancellation
+            // does, which fails the read below and sends RunAsync round again.
             using (new System.Threading.Timer(_ =>
                    {
                        if (DateTime.UtcNow.Ticks - Volatile.Read(ref _lastLineTicks) < ReadTimeout.Ticks)
@@ -242,13 +226,13 @@ public sealed class OzServerEventStream : IDisposable
                     if (line == null)
                         return;
 
-                    // The session this connection was opened for is over, or has become one on a
-                    // different server. Either way this stream is no longer the right one.
+                    // The session this connection was opened for is over, or has moved to a
+                    // different server.
                     if (!Network.IsConnected || NetworkServer.Current != server)
                         return;
 
-                    // Lines starting with ':' are SSE comments - the server's keepalive pings,
-                    // which exist purely to stop an idle intermediary dropping the connection.
+                    // Only event lines are acted on. Lines starting with ':' are SSE comments -
+                    // the server's keepalives.
                     if (line.StartsWith("event:", StringComparison.Ordinal))
                         Raise(line.Substring("event:".Length).Trim());
                 }

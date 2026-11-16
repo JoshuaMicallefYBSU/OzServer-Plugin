@@ -11,39 +11,32 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Mirrors AtisSync, but for badvectors/ATISPlugin (https://github.com/badvectors/ATISPlugin) - the
-// third-party multi-position ATIS plugin most Australian/Pacific profiles ship by default, which
-// manages its own up-to-four broadcasts on vatSys's other ATIS slots (see AtisSync's own comment for
-// why those aren't reachable through the public vatSys SDK/vatsys.ATIS).
+// The counterpart of AtisSync for badvectors/ATISPlugin (https://github.com/badvectors/ATISPlugin),
+// the multi-position ATIS plugin most Australian/Pacific profiles ship, which manages up to four
+// broadcasts on vatSys's other ATIS slots (see AtisSync for why those cannot be read through
+// vatsys.ATIS).
 //
-// ATISPlugin was never designed for inter-plugin use - there is no reference assembly to compile
-// against, and no public contract beyond "these members currently exist" (its own Plugin class
-// exposes static ATIS1..ATIS4 ATISControl instances). Everything here goes through reflection rather
-// than a project reference, so a vatSys install without ATISPlugin - or a future ATISPlugin release
-// that renamed/removed these members - just finds nothing and this class quietly does nothing,
-// rather than failing to build or throwing at runtime.
+// ATISPlugin has no reference assembly and no public contract beyond the members that currently
+// exist (its Plugin class exposes static ATIS1..ATIS4 ATISControl instances), so everything here
+// goes through reflection. A vatSys install without ATISPlugin, or a release that renames these
+// members, finds nothing and this class does nothing.
 public class BadVectorsAtisSync
 {
     static readonly string[] SlotPropertyNames = { "ATIS1", "ATIS2", "ATIS3", "ATIS4" };
 
-    // Re-scanned on every tick rather than resolved once: vatSys's plugin load order between two
-    // separate plugins isn't guaranteed, so if OzServerPlugin's own constructor runs before
-    // ATISPlugin's, ATIS1..4 are all still null the first few ticks. Cheap enough at this interval to
-    // just keep checking rather than build a one-shot-with-retry state machine.
+    // Re-scanned on every tick rather than resolved once: plugin load order is not guaranteed, so
+    // ATIS1..4 can still be null for the first few ticks.
     static readonly TimeSpan RescanInterval = TimeSpan.FromSeconds(5);
 
     readonly OzServerApiClient _api = new();
     readonly Timer _timer;
 
-    // Every ATISControl instance we've already attached our handler to, by reference - once a slot
-    // is found and hooked, later ticks must not hook it again (that would fire PushAsync multiple
-    // times per real broadcast). The control objects live for the plugin's lifetime once created,
-    // so there's nothing to remove this on.
+    // Every ATISControl already hooked, by reference, so a later tick does not hook it again and
+    // push more than once per broadcast. The controls live for the plugin's lifetime, so nothing
+    // is ever removed.
     readonly List<object> _subscribed = new();
 
-    // Every station still on the air is pushed again this often, for the reason AtisSync gives: the
-    // backend drops an entry 60 minutes after its last push, and an ATIS that has not changed for an
-    // hour is still an ATIS.
+    // Every station still on the air is pushed again this often - see AtisSync.
     static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(20);
     DateTime _nextRefresh = DateTime.UtcNow + RefreshInterval;
 
@@ -76,10 +69,9 @@ public class BadVectorsAtisSync
 
             foreach (var propName in SlotPropertyNames)
             {
-                // ATIS1..4 are plain public static fields on ATISPlugin.Plugin (confirmed against its
-                // source), not properties - GetProperty silently returns null for these, which is why
-                // this used to never find anything. GetField first, with a GetProperty fallback in
-                // case a future ATISPlugin release turns them into auto-properties instead.
+                // ATIS1..4 are public static fields on ATISPlugin.Plugin, for which GetProperty
+                // returns null. GetProperty is the fallback in case a later release makes them
+                // properties.
                 var member = pluginType.GetField(propName, BindingFlags.Public | BindingFlags.Static) as MemberInfo
                              ?? pluginType.GetProperty(propName, BindingFlags.Public | BindingFlags.Static);
                 var control = member switch
@@ -120,38 +112,35 @@ public class BadVectorsAtisSync
         var letter = type.GetProperty("ID")?.GetValue(control) as char?;
         var lines = type.GetProperty("Lines")?.GetValue(control) as IEnumerable;
         var frequencyDisplay = type.GetProperty("FrequencyDisplay")?.GetValue(control) as string;
-        // IsZulu is the only thing that distinguishes a closed tower's free-text broadcast from a
-        // sectioned one (ATISControl.GetInfo branches on exactly this), and DateTimeUtc is the only
-        // time it keeps - set to UtcNow in Save, so it is when this letter was issued.
+        // IsZulu distinguishes a closed tower's free-text broadcast from a sectioned one
+        // (ATISControl.GetInfo branches on it). DateTimeUtc is set to UtcNow in Save, so it is
+        // when this letter was issued.
         var isZulu = type.GetProperty("IsZulu")?.GetValue(control) as bool? ?? false;
         var issued = type.GetProperty("DateTimeUtc")?.GetValue(control) as DateTime?;
-        // ATISControl.Callsign is private ($"{icao}_ATIS", set in Create), so NonPublic - and the
-        // same thing is rebuilt below if a future release renames or hides it differently.
+        // ATISControl.Callsign is private ($"{icao}_ATIS", set in Create), hence NonPublic. It is
+        // rebuilt below if it cannot be read.
         var callsign = type.GetProperty("Callsign", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
             ?.GetValue(control) as string;
 
-        // Deliberately NOT gated on Broadcasting: ATISControl.Save() (source confirmed) sets
-        // Broadcasting = false via BroadcastStop() *before* updating ID/Lines and firing
-        // StatusChanged, and only BroadcastStart() - which never raises StatusChanged - sets it back
-        // to true afterwards. Gating on Broadcasting here meant this fired for every real update and
-        // discarded it every time. Empty icao/letter/content is what actually distinguishes
-        // ATISControl.Create() (station just opened, nothing broadcast yet - Lines exists but every
-        // line's Value is still blank) and Delete() (station torn down, ICAO/Lines cleared) from a
-        // real Save(), so that's the guard instead. The entry already on the server (if any) just
-        // ages out via PruneStaleAtisJob rather than being cleared explicitly here.
+        // Not gated on Broadcasting: ATISControl.Save sets it false (BroadcastStop) before
+        // updating ID/Lines and raising StatusChanged, and BroadcastStart - which raises nothing -
+        // sets it back afterwards, so a gate on it would discard every real update. Empty icao,
+        // letter or content is what tells Create (station opened, every line still blank) and
+        // Delete (ICAO/Lines cleared) from a real Save. Any entry already on the server is left
+        // to age out rather than cleared from here.
         if (string.IsNullOrEmpty(icao) || letter == null)
             return;
 
         var content = ReadContent(lines);
         var zuluText = isZulu ? ReadZulu(lines) : null;
-        // A zulu broadcast carries nothing but its own text - ReadContent skips the ZULU line the
-        // same way ATISControl.GetInfo does - so "nothing on this station" is a different question
-        // for each kind.
+        // A zulu broadcast carries only its own text - ReadContent skips the ZULU line, as
+        // ATISControl.GetInfo does - so "nothing on this station" is tested differently for each
+        // kind.
         if (isZulu ? string.IsNullOrWhiteSpace(zuluText) : content.Count == 0)
             return;
 
-        // The handover record (POST /atis), unchanged: per server, sections only, for the next
-        // controller on this station rather than for anyone reading publicly.
+        // The handover record (POST /atis): per server, sections only, for the next controller on
+        // this station rather than for public readers.
         if (content.Count > 0)
         {
             var dto = new OzServerAtisUpdateDto
@@ -173,19 +162,18 @@ public class BadVectorsAtisSync
             }
         }
 
-        // And the broadcast itself (PUT /vatsim/atis/{icao}), which is what the website map and
-        // every public reader of /vatsim/atis draw from.
+        // The broadcast itself (PUT /vatsim/atis/{icao}), which the website map and public
+        // readers of /vatsim/atis use.
         //
-        // Live only, deliberately: that record has no server of its own (an ATIS is a broadcast on
-        // the network), so publishing from a SweatBox session would put training weather on the
-        // public map for everyone. The handover push above stays per-server and still happens.
+        // Live only: that record has no server of its own, so publishing from a SweatBox session
+        // would put training weather on the public map. The handover push above is per server and
+        // still happens.
         if (NetworkServer.Current != NetworkServer.Live)
             return;
 
-        // MODE and TIME_CHECK are editor settings, not broadcast information - the backend drops
-        // both and refuses an ATIS with nothing else left in it. A station whose mode auto-selected
-        // on Create but which nobody has filled in yet is exactly that, and is not worth publishing
-        // (or reporting as a failure to the controller).
+        // MODE and TIME_CHECK are editor settings, not broadcast information: the backend drops
+        // both and refuses an ATIS with nothing else in it. A station whose mode was auto-selected
+        // on Create but is otherwise unfilled is not worth publishing, or reporting as a failure.
         if (!isZulu && content.Keys.All(name => EditorOnlyLines.Contains(name)))
             return;
 
@@ -220,16 +208,13 @@ public class BadVectorsAtisSync
 
     static readonly HashSet<string> EditorOnlyLines = new() { "MODE", "TIME_CHECK" };
 
-    // The backend takes the frequency as the text it is read out as ("126.250") and refuses
-    // anything that is not one. A station whose display string is empty or shaped oddly should
-    // still publish its ATIS - without a frequency - rather than have the whole thing rejected.
+    // The backend takes the frequency as displayed text ("126.250") and refuses anything else. A
+    // station whose display string is empty or oddly shaped still publishes its ATIS, without a
+    // frequency.
     //
-    // Reformatted, not just checked. ATISControl.FrequencyDisplay is not the "126.250" this was
-    // written against: Create builds it with Normalize25KhzFrequency, which pads the number out to
-    // hertz and puts the point back after the third digit - "126.250000". Matching that against a
-    // three-decimal pattern failed for every station, so every ATIS was published with no
-    // frequency at all (YSWS on 13 Nov: 127.000 in the handover record, null in the public one).
-    // Read as a number and written back the way a frequency is displayed.
+    // Reformatted, not just checked: ATISControl.FrequencyDisplay is built by
+    // Normalize25KhzFrequency, which pads the number out to hertz ("126.250000"), so it is read as
+    // a number and written back to three decimals.
     static readonly Regex DisplayFrequency = new(@"^\d{3}(\.\d+)?$", RegexOptions.Compiled);
 
     static string? PublishableFrequency(string? display)
@@ -238,16 +223,15 @@ public class BadVectorsAtisSync
         if (string.IsNullOrEmpty(trimmed) || !DisplayFrequency.IsMatch(trimmed!))
             return null;
 
-        // Invariant culture for the reason ParseFsdFrequency gives: the point is always ".".
+        // Invariant culture - see ParseFsdFrequency.
         return decimal.TryParse(trimmed, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var mhz)
             ? mhz.ToString("000.000", CultureInfo.InvariantCulture)
             : null;
     }
 
-    // ATISControl.DateTimeUtc is UTC by construction (Save sets it from DateTime.UtcNow), but a
-    // value restored from a saved ATIS can come back with no Kind at all - labelled, not shifted,
-    // so a 09:14Z broadcast is never published as 09:14 local. Nothing set at all (a slot whose
-    // ATIS predates this field, say) falls back to now, which is the one time we do know.
+    // ATISControl.DateTimeUtc is UTC (Save sets it from DateTime.UtcNow), but a value restored from
+    // a saved ATIS can come back with no Kind; it is labelled UTC, not shifted. An unset value
+    // falls back to now.
     static string IsoUtc(DateTime? value)
     {
         var moment = value == null || value.Value == default
@@ -256,9 +240,8 @@ public class BadVectorsAtisSync
         return moment.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
     }
 
-    // ATISPlugin's own assembly version - 4.3 at the time of writing. Reported so a broadcast that
-    // arrives malformed can be tied to the build that sent it; "4.3.0.0" is noise, so the trailing
-    // zeroes come off.
+    // ATISPlugin's assembly version, reported so a malformed broadcast can be tied to the build
+    // that sent it. Trailing zero components are dropped: "4.3.0.0" is sent as "4.3".
     static string PluginVersion(Type controlType)
     {
         var version = controlType.Assembly.GetName().Version;
@@ -270,8 +253,8 @@ public class BadVectorsAtisSync
     }
 
     // The sections this letter changed. ATISLine.Changed is the flag ATISControl.GetInfo turns into
-    // the leading "+" on a line of broadcast text ("+[RWY] 34"); it is cleared for every line at
-    // the top of Save and set again only on the ones whose value actually moved.
+    // the leading "+" on a line of broadcast text ("+[RWY] 34"); Save clears it on every line and
+    // sets it on those whose value changed.
     static List<string> ReadChanged(IEnumerable? lines)
     {
         var changed = new List<string>();
@@ -292,8 +275,7 @@ public class BadVectorsAtisSync
         return changed;
     }
 
-    // The free text a closed tower broadcasts, which ATISPlugin keeps in a pseudo-line named ZULU
-    // rather than in any field of its own.
+    // The free text a closed tower broadcasts, which ATISPlugin keeps in a pseudo-line named ZULU.
     static string? ReadZulu(IEnumerable? lines)
     {
         if (lines == null)
@@ -309,11 +291,10 @@ public class BadVectorsAtisSync
         return null;
     }
 
-    // Same field name/value shape as vatsys.ATIS.Content (see OzServerAtisUpdateDto) - one entry per
-    // visible ATISLine, keyed by its Name (WIND, VIS, QNH, ...). OFCW_NOTIFY/ZULU are ATISPlugin's own
-    // pseudo-lines (an internal notify flag and the raw spoken-Zulu text), not real ATIS fields -
-    // skipped the same way ATISControl.GetInfo() skips them when building the text it actually
-    // broadcasts.
+    // The same name/value shape as vatsys.ATIS.Content (see OzServerAtisUpdateDto): one entry per
+    // visible ATISLine, keyed by its Name (WIND, VIS, QNH, ...). OFCW_NOTIFY and ZULU are
+    // ATISPlugin's pseudo-lines (a notify flag and the Zulu free text), skipped as
+    // ATISControl.GetInfo skips them.
     static Dictionary<string, string> ReadContent(IEnumerable? lines)
     {
         var content = new Dictionary<string, string>();
@@ -341,17 +322,13 @@ public class BadVectorsAtisSync
         return content;
     }
 
-    // Inverse of vatSys's own Conversions.FSDFrequencyToString ("1" + (freq/1000.0).ToString("00.0##")
-    // - see the decompiled reference under .csproj/Conversions.cs). ATISPlugin's FrequencyDisplay is
-    // set from the same Normalize25KhzFrequency formatting ("1xx.xxx"), so this round-trips a value
-    // like "132.500" back to 32500 - the same FSD frequency Network.ATISFrequency?.GetFSDFrequency()
-    // would report for the equivalent vatsys.ATIS station, keeping this consistent with AtisSync's
-    // own Frequency field.
+    // Inverse of vatSys's Conversions.FSDFrequencyToString: "132.500" becomes 32500, the FSD
+    // frequency Network.ATISFrequency?.GetFSDFrequency() reports for the equivalent vatsys.ATIS
+    // station, so the field matches AtisSync's.
     //
-    // Invariant culture, not the current one: FrequencyDisplay always uses "." as its decimal point.
-    // On a Windows install whose locale uses "." as the thousands separator (de-DE, for one) the
-    // culture-default overload read "132.500" as 132500 and pushed a frequency of 132400000 to
-    // OzServer; in most other comma-decimal locales it failed to parse and sent none at all.
+    // Invariant culture, not the current one: FrequencyDisplay always uses "." as its decimal
+    // point, which a locale with "." as its thousands separator (de-DE) reads as 132500 and most
+    // other comma-decimal locales fail to parse.
     static int? ParseFsdFrequency(string? display) =>
         double.TryParse(display, NumberStyles.Float, CultureInfo.InvariantCulture, out var mhz)
             ? (int)Math.Round((mhz - 100) * 1000)
