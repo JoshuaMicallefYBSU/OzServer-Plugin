@@ -9,22 +9,19 @@ namespace OzServerPlugin;
 // Couples an activated flight plan to its radar track when vatSys's own auto-couple will not.
 //
 // vatSys only auto-couples a radar return that agrees with where the flight plan predicts the
-// aircraft to be (RDP's route check). An FDR activated by hand for an aircraft that has been airborne
-// for hours gets an ETD of "now + 10 minutes", and departing it then makes vatSys believe it has just
-// taken off: its flight plan track sits at the departure aerodrome while the real aircraft is far
-// along the route. GIA716 was activated and departed out of Perth while the aircraft itself was
-// descending into Bali - nearly 1,900 nm on - and it never coupled, because the radar return could
-// not be where vatSys was looking for it.
+// aircraft to be (RDP's route check). An FDR activated by hand for an aircraft already airborne gets
+// an ETD of "now + 10 minutes", so its flight plan track sits at the departure aerodrome while the
+// aircraft is far along the route, and the two never couple.
 //
-// The callsign says which track it is. So when an activated, uncoupled FDR has a moving radar track
-// carrying exactly its callsign that is not coupled to anything, this couples the two with vatSys's
-// own RDP.Couple - which also runs vatSys's automatic position report from the radar track, moving
-// the flight plan to where the aircraft actually is. Coupling is local to this client; nothing is
-// sent to the network, and the tag's jurisdiction is not touched.
+// The callsign identifies the track. When an activated, uncoupled FDR has a moving, uncoupled radar
+// track carrying its callsign, this couples the two with vatSys's own RDP.Couple - which also runs
+// vatSys's automatic position report from the radar track, moving the flight plan to where the
+// aircraft is. Coupling is local to this client: nothing is sent to the network, and the tag's
+// jurisdiction is not touched.
 public class CoupleAssist
 {
-    // Below this the track is taxiing or parked, and an FDR still at the gate couples on its own once
-    // it is rolling - vatSys applies the same floor.
+    // Below this the track is taxiing or parked, and an FDR still at the gate couples by itself
+    // once it is rolling - vatSys applies the same floor.
     const double MinGroundSpeed = 50;
     static readonly TimeSpan RetryEvery = TimeSpan.FromSeconds(30);
     // How long a moving track has to have stayed uncoupled before this steps in.
@@ -52,7 +49,7 @@ public class CoupleAssist
         lock (_gate)
         {
             // vatSys gets the first chance: an ordinary departure couples by itself a few seconds
-            // into the take-off roll, and this is only for the ones it never will.
+            // into the take-off roll.
             var now = DateTime.UtcNow;
             if (!_firstSeen.TryGetValue(callsign!, out var first) || now - first > ForgetAfter)
             {
@@ -62,7 +59,8 @@ public class CoupleAssist
             if (now - first < LeaveToVatSys)
                 return;
 
-            // Radar updates arrive every few seconds per aircraft; one look per callsign per RetryEvery.
+            // Radar updates arrive every few seconds per aircraft: one look per callsign per
+            // RetryEvery.
             if (_lastTried.TryGetValue(callsign!, out var last) && now - last < RetryEvery)
                 return;
             _lastTried[callsign!] = now;
@@ -87,8 +85,8 @@ public class CoupleAssist
             || fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
             return;
 
-        // A controller or vatSys turned auto-couple off for this flight on purpose - never overridden,
-        // but said once, so a flight that stays uncoupled for this reason is not a mystery in the log.
+        // Auto-couple was turned off for this flight on purpose, so it is never overridden. Logged
+        // once, so the log explains why the flight stays uncoupled.
         if (fdr.InhibitAutoCouple)
         {
             if (_inhibitLogged.Add(callsign))
@@ -101,12 +99,9 @@ public class CoupleAssist
 
     static readonly HashSet<string> _inhibitLogged = new(StringComparer.OrdinalIgnoreCase);
 
-    // The activation path. A flight plan activated by hand for an aircraft already in the air gets an
-    // ETD of "now + 10 minutes", which puts vatSys's flight plan track back at the departure end of
-    // the route - so vatSys's own auto-couple, which only takes a return close to where the plan
-    // expects it, never couples it. Activating it is the controller saying "this is that aircraft":
-    // one radar cycle after activation (vatSys's own chance first), an FDR still uncoupled is coupled
-    // to the moving return carrying its callsign, and vatSys's position report moves the plan there.
+    // The activation path. Activating a flight plan is the controller identifying the aircraft, so
+    // one radar cycle after activation (vatSys's own chance first) an FDR still uncoupled is coupled
+    // to the moving return carrying its callsign - see the class comment.
     static readonly TimeSpan AfterActivation = TimeSpan.FromSeconds(6);
     readonly HashSet<FDP2.FDR> _activationHandled = new();
 
@@ -164,8 +159,25 @@ public class CoupleAssist
             Couple(fdr, match, "on activation");
     }
 
+    // vatSys uncouples a Mode C-only return squawking anything but its assigned code on the next
+    // radar update (RDP.TryAutoDeCouple, which spares 7600 and 7700). Coupling one would be undone
+    // at once and tried again every RetryEvery.
+    static bool WouldBeUncoupled(FDP2.FDR fdr, RDP.RadarTrack track)
+    {
+        var types = track.RadarTypes;
+        if (!types.HasFlag(RDP.RadarTypes.SSR_ModeC) || types.HasFlag(RDP.RadarTypes.SSR_ModeS) || types.HasFlag(RDP.RadarTypes.ADSB))
+            return false;
+
+        var code = track.ActualAircraft?.TransponderCode;
+        return code != null && code != fdr.AssignedSSRCode
+               && code != Convert.ToInt32("7600", 8) && code != Convert.ToInt32("7700", 8);
+    }
+
     static void Couple(FDP2.FDR fdr, RDP.RadarTrack track, string why)
     {
+        if (WouldBeUncoupled(fdr, track))
+            return;
+
         var callsign = fdr.Callsign;
         try
         {
@@ -191,8 +203,8 @@ public class CoupleAssist
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

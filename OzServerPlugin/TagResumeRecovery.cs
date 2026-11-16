@@ -6,61 +6,44 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Puts a controller's tags back after a disconnect, and nothing else.
+// Puts a controller's tags back after a disconnect. Nothing here decides who should hold a tag; it
+// restores what the backend has confirmed is this controller's.
 //
-// This is all that remains of the plugin's tag handling. TagOwnershipSync and FdrActivationSync -
-// which moved tags between controllers, activated flights from server state, and offered pickups as
-// aircraft crossed boundaries - were removed to be rebuilt from scratch. Nothing here decides who
-// should hold a tag; it only restores what the backend has already confirmed was this controller's
-// moments ago.
+// The backend applies every ownership rule before answering (POST /sectors/resume): a flight
+// another controller picked up in the meantime stays with them, and one that has flown out of the
+// airspace this controller took back is not returned. It decides that from the controlling_cid and
+// current_sector FdrSync keeps current on each record. The list arriving here is therefore the
+// answer, and this makes vatSys agree with it.
 //
-// What still has to exist for that to work, and why it is not "tag handling":
-//
-//   FdrSync keeps flight_data_records current, including controlling_cid and current_sector. The
-//   resume endpoint is built entirely on those two columns - it hands back only flights that are
-//   still uncontrolled and still inside a sector this controller holds - so without that push there
-//   is nothing for a resume to restore and disconnect recovery cannot work at all.
-//
-// The backend has already applied every ownership rule by the time this runs (see
-// POST /sectors/resume): a flight another controller picked up while this one was away stays with
-// them, and one that has flown out of the airspace they just took back is not returned either. So
-// the list arriving here is not a proposal to be re-checked - it is the answer, and this simply
-// makes vatSys agree with it.
-//
-// The answer arrives long before vatSys can act on it, which is why this keeps trying rather than
-// making one pass. The resume is answered a fraction of a second after Network.Connected. On a
-// reconnect inside the same run that is fine - every FDR is still in memory. After vatSys itself
-// has been restarted there is nothing in memory at all: flight plans, radar tracks, the sector
-// grant and the server's "you are a valid controller" reply all trickle in over the following
-// seconds. A single pass at that moment found no FDR by any of the returned callsigns, logged
-// "none were restored" with nothing to say why, and never looked again - so closing and reopening
-// vatSys lost every tag, while OzServer went on listing them as this controller's.
+// The answer arrives a fraction of a second after Network.Connected, usually before vatSys can act
+// on it. After a vatSys restart nothing is in memory: flight plans, radar tracks, the sector grant
+// and the server's confirmation of this session as a controller arrive over the following seconds.
+// So outstanding tags are retried for RetryWindow rather than attempted once.
 public class TagResumeRecovery
 {
     // How often the outstanding tags are looked for again, and for how long after the resume. The
     // window has to outlast a cold start - connect, flight plans, a first radar return with Mode C -
     // without leaving a tag liable to be taken minutes later, when the controller may have decided
-    // otherwise. Same cadence as SectorTagHandoff's deferred-handoff retry.
+    // otherwise.
     static readonly TimeSpan RetryInterval = TimeSpan.FromSeconds(2);
     static readonly TimeSpan RetryWindow = TimeSpan.FromSeconds(90);
 
     readonly OzServerOwnershipTracker _tracker;
     readonly System.Threading.Timer _retryTimer;
 
-    // Guards the three fields below. Written from the tracker's continuation (wherever the resume's
-    // await resumes), read from the retry timer's thread, and worked through on the UI thread.
+    // Guards the fields below, which are written from the tracker's continuation, read on the retry
+    // timer's thread and worked through on the UI thread.
     readonly object _gate = new();
-    // Callsigns the backend handed back that vatSys does not hold yet, each with why it is still
-    // outstanding - reported once at the end if it never comes back.
+    // Callsigns the backend handed back that vatSys does not hold yet, each with the reason it is
+    // still outstanding - logged if it never comes back.
     readonly Dictionary<string, string> _pending = new(StringComparer.OrdinalIgnoreCase);
     DateTime _deadline = DateTime.MinValue;
-    // So "waiting on vatSys" is logged once per resume rather than every two seconds.
+    // So the wait is logged once per resume rather than on every retry.
     bool _waitLogged;
 
-    // The label state OzServer held for each resumed tag (CFL, scratchpad, global ops, C),
-    // read when the resume arrives - see FetchLabelStateAsync. _labelStateRead is false until
-    // that read has finished, and no tag is restored before it has. Guarded by _gate like the
-    // fields above.
+    // The label state OzServer held for each resumed tag (CFL, scratchpad, global ops, C), read
+    // when the resume arrives - see FetchLabelStateAsync. _labelStateRead is false until that read
+    // has finished, and no tag is restored before it has.
     readonly Dictionary<string, OzServerFdrUpdateDto> _labelState = new(StringComparer.OrdinalIgnoreCase);
     bool _labelStateRead = true;
     readonly OzServerApiClient _api = new();
@@ -70,8 +53,8 @@ public class TagResumeRecovery
         _tracker = tracker;
         _tracker.TagsResumed += (_, callsigns) => Begin(callsigns);
 
-        // A session that has ended has nothing to take back, and a list left over from it must not
-        // be worked against whatever position this client connects as next.
+        // A list left over from an ended session must not be worked against whatever position this
+        // client connects as next.
         Network.Disconnected += (_, _) =>
         {
             lock (_gate)
@@ -91,7 +74,7 @@ public class TagResumeRecovery
     }
 
     // A new resume replaces whatever an earlier one left outstanding: the backend's latest answer is
-    // the whole truth, not an addition to the previous one.
+    // complete, not an addition to the previous one.
     void Begin(IReadOnlyList<string> callsigns)
     {
         if (OzServerMode.Disabled)
@@ -118,37 +101,42 @@ public class TagResumeRecovery
         }
     }
 
-    // A restored tag comes back with a bare label. Every flight plan arrives fresh from the network
-    // after a reconnect: the CFL and the C are vatSys's own local state, and the
-    // scratchpad and global ops are only sent by whoever is tracking the tag - which, while this
-    // controller was away, nobody was. OzServer has all of it (FdrSync pushes it), so it is read from
-    // there.
+    // A restored tag comes back with a bare label: the CFL and the C are vatSys's local state, and
+    // the scratchpad and global ops are only sent by whoever is tracking the tag - nobody, while
+    // this controller was away. OzServer has all of it (FdrSync pushes it), so it is read back.
     //
-    // Read now, while the tag is still not ours, and finished before any tag is restored (Attempt
-    // waits on _labelStateRead): from the moment a tag is tracked by this controller FdrSync pushes
-    // it, and a push states the label outright - an empty scratchpad as "", no CFL as "none". A
-    // restore that beat this read would have its first push erase the very record it needs.
+    // Read while the tag is not yet ours, and finished before any tag is restored (Attempt waits on
+    // _labelStateRead): once this controller tracks a tag FdrSync pushes it, and a push states the
+    // label outright - an empty scratchpad as "", no CFL as "none". A restore that beat this read
+    // would have its first push erase the record it needs.
+    static readonly TimeSpan LabelReadLimit = TimeSpan.FromSeconds(8);
+
+    async System.Threading.Tasks.Task ReadLabelStateAsync(string callsign)
+    {
+        try
+        {
+            var flight = await _api.GetFlightAsync(callsign);
+            if (flight == null)
+                return;
+
+            lock (_gate)
+                _labelState[callsign] = flight;
+        }
+        catch (Exception ex)
+        {
+            ActionLog.Log("Tag", $"Couldn't read {callsign}'s label state for its restore: {ex.Message}");
+        }
+    }
+
     async System.Threading.Tasks.Task FetchLabelStateAsync(List<string> callsigns)
     {
-        foreach (var callsign in callsigns)
-        {
-            try
-            {
-                var flight = await _api.GetFlightAsync(callsign);
-                if (flight == null)
-                    continue;
+        // Together, and not waited on past LabelReadLimit: one after another, a slow backend could
+        // hold every tag back until the restore's own window had run out.
+        var reads = System.Threading.Tasks.Task.WhenAll(callsigns.Select(ReadLabelStateAsync));
+        await System.Threading.Tasks.Task.WhenAny(reads, System.Threading.Tasks.Task.Delay(LabelReadLimit));
 
-                lock (_gate)
-                    _labelState[callsign] = flight;
-            }
-            catch (Exception ex)
-            {
-                ActionLog.Log("Tag", $"Couldn't read {callsign}'s label state for its restore: {ex.Message}");
-            }
-        }
-
-        // Released even when a read failed: a tag restored without its label is better than a tag
-        // not restored at all.
+        // Released even when a read failed: a tag restored without its label is better than one not
+        // restored at all.
         lock (_gate)
             _labelStateRead = true;
 
@@ -183,7 +171,7 @@ public class TagResumeRecovery
     }
 
     // One pass over everything still outstanding. Always on the UI thread: it changes FDR and track
-    // state, and being single-threaded there is also what keeps two passes from overlapping.
+    // state, and running there also keeps two passes from overlapping.
     void Attempt()
     {
         if (OzServerMode.Disabled)
@@ -215,9 +203,9 @@ public class TagResumeRecovery
         foreach (var callsign in wanted)
             waiting[callsign] = "no flight plan loaded";
 
-        // MMI.AcceptJurisdiction returns without doing anything until the server has confirmed this
-        // session as a controller, which lags Connected by a round trip. Attempting before then
-        // would leave every tag flashing in STATE_HANDOVER_FIRST until the next pass.
+        // MMI.AcceptJurisdiction does nothing until the server has confirmed this session as a
+        // controller, which lags Connected by a round trip. Attempting before then would leave
+        // every tag flashing in STATE_HANDOVER_FIRST until the next pass.
         var canAccept = Network.ValidATC;
         var mine = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
@@ -234,9 +222,8 @@ public class TagResumeRecovery
                 continue;
             }
 
-            // Someone else has it now. The backend's answer was true when it was given, but this
-            // can run well over a minute later, and taking the tag at this point would be
-            // accepting a handoff nobody offered.
+            // Someone else has it now. The backend's answer was true when given, but this can run
+            // over a minute later, and taking the tag would be accepting a handoff nobody offered.
             if (fdr.IsTracked)
             {
                 waiting.Remove(fdr.Callsign);
@@ -256,10 +243,9 @@ public class TagResumeRecovery
                 continue;
             }
 
-            // Resolved against what this controller actually holds right now. Null covers three
-            // things that all clear up on their own: the sector grant has not reached MMI yet, there
-            // is no radar return for the aircraft yet, or there is one without Mode C under two
-            // stacked sectors.
+            // Resolved against what this controller holds now. Null covers three things that clear
+            // up by themselves: the sector grant has not reached MMI, there is no radar return for
+            // the aircraft, or there is one without Mode C under two stacked sectors.
             var sector = SectorLocator.Resolve(fdr, mine);
             if (sector == null)
             {
@@ -271,8 +257,8 @@ public class TagResumeRecovery
             {
                 waiting.Remove(fdr.Callsign);
                 restored.Add(fdr.Callsign);
-                // Straight away, in the same pass: FdrSync's first push of the now-tracked tag
-                // must carry the label back, not an empty one - see FetchLabelStateAsync.
+                // In the same pass: FdrSync's first push of the now-tracked tag must carry the
+                // label, not an empty one - see FetchLabelStateAsync.
                 ApplyLabelState(fdr);
             }
             else
@@ -312,14 +298,12 @@ public class TagResumeRecovery
         if (abandoned.Count > 0)
             ActionLog.Log("Tag", $"Not restored: {string.Join(", ", abandoned)}");
 
-        // Said once, with the reason for each, so a log read mid-wait shows what is being waited on
-        // rather than nothing at all.
+        // Logged once, with the reason for each, so a log read mid-wait shows what is outstanding.
         if (logWait)
             ActionLog.Log("Tag", $"Waiting to restore: {Describe(waiting)}");
 
-        // Why each one failed, not just that it did - whether the aircraft never appeared, sat
-        // outside this controller's sectors, or was in a state that could not be taken is the whole
-        // question when a tag does not come back.
+        // With the reason each one failed: the aircraft never appeared, was outside this
+        // controller's sectors, or was in a state that could not be taken.
         if (expired && waiting.Count > 0)
             ActionLog.Log("Tag", $"Could not restore after {RetryWindow.TotalSeconds:0}s: {Describe(waiting)}");
     }
@@ -328,18 +312,15 @@ public class TagResumeRecovery
         string.Join(", ", waiting.OrderBy(entry => entry.Key, StringComparer.OrdinalIgnoreCase)
                                  .Select(entry => $"{entry.Key} ({entry.Value})"));
 
-    // Takes jurisdiction without the controller ever seeing a handover, by completing the whole
-    // transition inside one UI callback and only repainting at the end. These tags were this
-    // controller's a moment ago and the backend has confirmed nobody else took them, so making them
-    // flash for acceptance would be asking a question that has already been answered.
+    // Takes jurisdiction without the controller seeing a handover: the whole transition completes
+    // inside one UI callback and is painted only at the end. These tags were this controller's and
+    // the backend has confirmed nobody else took them, so there is nothing to ask.
     //
-    // The FDP2.Process call is the part that matters, and the part that took three attempts to get
-    // right. HandoffFirst only queues the state change; accepting has nothing to resolve until that
-    // has been through a process pass, which is why calling the two back to back left the flight
-    // sitting in STATE_HANDOVER_FIRST, flashing.
+    // The order matters. HandoffFirst only queues the state change, and AcceptJurisdiction has
+    // nothing to resolve until FDP2.Process has run it - without the Process call the flight stays
+    // flashing in STATE_HANDOVER_FIRST.
     //
-    // Returns whether it actually worked, checked against the resulting state rather than assumed -
-    // two other orderings were tried and each failed in its own way.
+    // Returns whether it worked, checked against the resulting state.
     static bool TryTakeJurisdiction(FDP2.FDR fdr, SectorsVolumes.Sector sector)
     {
         FDP2.HandoffFirst(fdr);
@@ -356,7 +337,7 @@ public class TagResumeRecovery
         // geometry, which knows nothing about OzServer subsectors.
         fdr.ControllingSector = sector;
 
-        // Only now is anything painted, so the intermediate handover state never reaches the screen.
+        // Painted only now, so the intermediate handover state never reaches the screen.
         var track = MMI.FindTrack(fdr);
         if (track != null)
             MMI.SetTrackState(track);
@@ -367,8 +348,8 @@ public class TagResumeRecovery
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

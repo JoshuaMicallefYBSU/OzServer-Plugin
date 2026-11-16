@@ -10,41 +10,37 @@ namespace OzServerPlugin;
 // On (re)connecting, brings back the traffic picture OzServer still holds for flights vatSys has not
 // activated itself.
 //
-// After a reconnect - and always after vatSys has been restarted - every flight plan arrives fresh
-// from the network as pre-active: no flight plan track, no auto-couple, nothing on the scope, even
-// for an aircraft that was activated and being worked minutes ago. OzServer still has the record
-// (FdrSync keeps it current from whoever held it), so for each recent, activated record that is not
-// this controller's own tag:
+// After a reconnect, and always after a vatSys restart, every flight plan arrives from the network
+// as pre-active: no flight plan track, no auto-couple, nothing on the scope, even for an aircraft
+// that was being worked minutes ago. OzServer still has the record (FdrSync keeps it current), so
+// for each recent, activated record that is not this controller's own tag:
 //
-//  - the FDR is activated (EstFDR) with the record's SSR code, ETD and ATD, without reassigning a code;
+//  - the FDR is activated (EstFDR) with the record's SSR code, ETD and ATD, and no new code;
 //  - it is placed where the record last had it, as a floating flight plan track on its route - a
 //    position report at that point, so vatSys carries it on along the route from there;
-//  - auto-couple is left on, so the tag becomes available the moment the radar track turns up;
-//  - if that position is inside a sector this controller holds, it is offered to them - the same
+//  - auto-couple is left on, so the tag becomes available when the radar track turns up;
+//  - if that position is inside a sector this controller holds, it is offered to them - the
 //    flashing first handoff vatSys gives a flight activated into a controller's airspace;
-//    otherwise it is just activated, with no handoff to anyone.
+//    otherwise it is activated with no handoff to anyone.
 //
-// A tag the server has as this controller's own is not touched here: TagResumeRecovery puts those
-// straight back under this controller's control. Nor is anything vatSys already has tracked by
-// someone, or already activated with a coupled track - vatSys knows better than a record.
+// A tag the server has as this controller's own is left to TagResumeRecovery. An FDR vatSys already
+// has tracked by someone is left alone, as is the position of one with a coupled track.
 //
-// Like TagResumeRecovery this keeps trying for a while: flight plans, routes and the sector grant
-// all arrive over the seconds after connecting, and acting on an FDR with no parsed route yet would
-// have nothing to position it on.
+// Like TagResumeRecovery this retries for a while: flight plans, routes and the sector grant arrive
+// over the seconds after connecting, and an FDR with no parsed route has nothing to be placed on.
 public class FdrResumeActivation
 {
     static readonly TimeSpan StartDelay = TimeSpan.FromSeconds(3);
     static readonly TimeSpan RetryInterval = TimeSpan.FromSeconds(2);
     static readonly TimeSpan RetryWindow = TimeSpan.FromSeconds(90);
-    // Older than this and the record is not a picture of now. Matches the backend's FDR_RETAIN_MINUTES.
+    // A record older than this is not a picture of now. Matches the backend's FDR_RETAIN_MINUTES.
     static readonly TimeSpan MaxRecordAge = TimeSpan.FromMinutes(15);
     // How far off its route a last position may be and still be placed on it.
     const double RouteToleranceNm = 30;
 
     // After the connect pass, how often the server's flights are checked again for ones that have
-    // since come into view here. Aircraft keep arriving all session - JST946 entered CS_APP's
-    // visibility range five minutes after it connected and sat pre-active, because the only pass had
-    // run at connect, when this client had no flight plan for it at all.
+    // since come into view here: aircraft keep entering this client's visibility range all session,
+    // and the connect pass only covers the flight plans it has at that moment.
     static readonly TimeSpan ScanInterval = TimeSpan.FromSeconds(20);
 
     readonly OzServerApiClient _api = new();
@@ -52,10 +48,10 @@ public class FdrResumeActivation
     readonly System.Threading.Timer _scanTimer;
     readonly object _gate = new();
     readonly Dictionary<string, OzServerFdrRecordDto> _pending = new(StringComparer.OrdinalIgnoreCase);
-    // Activated (or offered) by this pass this session. Each flight is brought in once: if the
-    // controller then deliberately puts it back to pre-active, a scan must not keep re-activating it.
-    // Held by reference, not callsign: vatSys deletes a finished FDR after ten minutes and builds a new
-    // one when the pilot is seen again, and that new one is a flight to bring in like any other.
+    // Activated (or offered) here this session. Each flight is brought in once: if the controller
+    // then puts it back to pre-active, a scan must not re-activate it. Held by reference, not
+    // callsign: vatSys deletes a finished FDR after ten minutes and builds a new one when the pilot
+    // is seen again, and that new one is a flight to bring in like any other.
     readonly HashSet<FDP2.FDR> _done = new();
     DateTime _deadline = DateTime.MinValue;
     DateTime _connectedAt = DateTime.MaxValue;
@@ -102,9 +98,9 @@ public class FdrResumeActivation
     }
 
     // The ongoing half: server flights that are activated, not this controller's own tag, and whose
-    // flight plan here is still pre-active - typically one that has only just come into view. They
-    // go through exactly the same pass as the connect-time ones (activate, place, offer if inside a
-    // held sector). Leaves the connect pass's own first window alone so the two never overlap.
+    // flight plan here is still pre-active - typically one that has just come into view. They go
+    // through the same pass as the connect-time ones (Attempt). Queues nothing during the connect
+    // pass's own retry window, so the two never overlap.
     async Task ScanAsync()
     {
         if (OzServerMode.Disabled)
@@ -125,8 +121,8 @@ public class FdrResumeActivation
         try
         {
             var records = await _api.GetAllFlightsAsync();
-            // Also what FdrSync's watchdog reads, so it is kept current from connect - even while the
-            // connect pass below still owns activation.
+            // FdrSync's watchdog reads this too, so it is refreshed even while the connect pass
+            // still owns activation.
             ServerFdrSnapshot.Update(records);
             if (connectPassRunning)
                 return;
@@ -159,8 +155,9 @@ public class FdrResumeActivation
                         continue;
                     if (!local.TryGetValue(record.Callsign, out var fdr) || fdr.ESTed || fdr.IsTracked)
                         continue;
-                    // Finished here only because it went out of view, and back in view now: bring it back
-                    // every time that happens. Any other finish (a controller's, a landing) stays put.
+                    // Finished here only because it went out of view, and now back in view: brought
+                    // back every time that happens. Any other finish (a controller's, a landing)
+                    // stands.
                     var backInView = fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED && IsBackInView(fdr);
                     if (fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED && !backInView)
                         continue;
@@ -239,6 +236,9 @@ public class FdrResumeActivation
     static bool IsBackInView(FDP2.FDR fdr) =>
         !string.IsNullOrEmpty(fdr.Callsign)
         && FdrSync.FinishedOutOfView.ContainsKey(fdr.Callsign)
+        // The pilot, not just a track: the track of an aircraft that has left coasts on for a
+        // while, and bringing its flight back then leaves a ghost nothing will finish.
+        && FdrSync.IsPilotOnline(fdr.Callsign)
         && SectorLocator.LivePosition(fdr) != null;
 
     static bool IsActivatedState(string? state) =>
@@ -310,8 +310,8 @@ public class FdrResumeActivation
                 if (fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
                     FdrSync.FinishedOutOfView.TryRemove(record.Callsign, out _);
 
-                // Where the record last had it - and so whose airspace it is in. Waits for the sector
-                // grant if it is in one of ours by name but MMI has not caught up yet.
+                // The sector the record last had it in, if it is one of ours. With no sectors in MMI
+                // yet, waits for the grant rather than deciding nothing is ours.
                 SectorsVolumes.Sector? inMine = null;
                 if (!string.IsNullOrEmpty(record.CurrentSector))
                     inMine = mine.FirstOrDefault(s => string.Equals(s.Name, record.CurrentSector, StringComparison.OrdinalIgnoreCase));
@@ -328,7 +328,7 @@ public class FdrResumeActivation
                 if (fdr.CoupledTrack == null && record.Lat is double lat && record.Lon is double lon)
                     FloatAt(fdr, new Coordinate(lat, lon), record);
 
-                // Resolved against the position just applied when the record named no sector of ours.
+                // Resolved against the position just applied when the record named none of ours.
                 inMine ??= SectorLocator.Resolve(fdr, mine);
 
                 if (inMine != null && Network.ValidATC)
@@ -389,18 +389,17 @@ public class FdrResumeActivation
             MarkDeparted(fdr, DateTime.SpecifyKind(atd, DateTimeKind.Utc));
         else if (fdr.ATD != DateTime.MaxValue && fdr.State == FDP2.FDR.FDRStates.STATE_COORDINATED)
         {
-            // Already departed (one vatSys finished out of view keeps its ATD): back to what a departed
-            // flight nobody is working is.
+            // Already departed (an FDR vatSys finished out of view keeps its ATD): set to the state
+            // of a departed flight nobody is working.
             fdr.State = FDP2.FDR.FDRStates.STATE_UNCONTROLLED;
             FDP2.Process(fdr);
         }
     }
 
-    // Records the departure without going through FDP2.DepartFDR. That path (and PositionReport, when
-    // there is no ATD yet) ends in vatSys's FDRDeparted, which - for an FDR whose controlling sector is
-    // one of this controller's - accepts jurisdiction on its own: the tag would be taken without the
-    // controller ever being asked. Here the departure is just a fact; who gets offered the flight is
-    // decided by OfferTo alone.
+    // Records the departure without FDP2.DepartFDR. That path (and PositionReport, when there is no
+    // ATD yet) ends in vatSys's FDRDeparted, which accepts jurisdiction by itself for an FDR whose
+    // controlling sector is one of this controller's - taking the tag without the controller being
+    // asked. Who is offered the flight is decided by OfferTo alone.
     static void MarkDeparted(FDP2.FDR fdr, DateTime atd)
     {
         fdr.ATD = atd;
@@ -417,13 +416,13 @@ public class FdrResumeActivation
     }
 
     // Places the flight plan track at the record's last position: a position report at the waypoint
-    // it last passed, timed so that, at its ground speed, it is at that position when the record was
-    // last updated. vatSys then carries it on along the route - a floating track until a radar
-    // return couples to it. Nothing is sent to the network.
+    // it last passed, timed so that at its ground speed it is at that position when the record was
+    // last updated. vatSys then carries it along the route as a floating track until a radar return
+    // couples to it. Nothing is sent to the network.
     static void FloatAt(FDP2.FDR fdr, Coordinate position, OzServerFdrRecordDto record)
     {
         // Still on the ground: vatSys already draws an undeparted flight plan track at its
-        // departure aerodrome, which is where it is.
+        // departure aerodrome.
         var airborne = record.Atd != null || record.OnGround == false || (record.GroundSpeed ?? 0) > 50;
         if (!airborne && fdr.ATD == DateTime.MaxValue)
             return;
@@ -490,8 +489,8 @@ public class FdrResumeActivation
         MarkDeparted(fdr, passedAt - elapsed);
     }
 
-    // The flashing first handoff vatSys gives a flight activated into a controller's airspace: offered
-    // to this sector, accepted (or left to time out) by the controller like any other.
+    // The flashing first handoff vatSys gives a flight activated into a controller's airspace:
+    // offered to this sector, for the controller to accept or leave like any other.
     static void OfferTo(FDP2.FDR fdr, SectorsVolumes.Sector sector)
     {
         if (fdr.State == FDP2.FDR.FDRStates.STATE_HANDOVER_FIRST && fdr.HandoffSector == sector)
@@ -510,8 +509,8 @@ public class FdrResumeActivation
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

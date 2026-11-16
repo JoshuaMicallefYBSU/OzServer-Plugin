@@ -6,76 +6,55 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Drives MMI.SectorsControlled from the VSCS/AFV panel's own Transmit state - ported from
-// badvectors/VatpacPlugin's Sectors.cs (Init/CheckActive), the reference for how a working plugin
-// wires VSCS transmit to vatSys's own sector control. This class never touches OzServerApiClient
-// directly; it writes MMI.SectorsControlled and, for a release only, asks
-// OzServerOwnershipTracker to give the sector back.
+// Drives MMI.SectorsControlled from the VSCS panel's Transmit state, after VatpacPlugin's
+// Sectors.cs (Init/CheckActive). This class never calls OzServerApiClient: it writes
+// MMI.SectorsControlled and goes through OzServerOwnershipTracker for anything on OzServer.
 //
-// Claiming is left entirely downstream: a sector appearing in MMI.SectorsControlled is picked up
-// by OzServerOwnershipTracker's own MMI.SectorsControlledChanged subscription (including asking
-// whether to request a sub-sector that turns out to already be owned by someone else - see
-// OzServerOwnershipTracker.HandleConflictAsync). That's what makes a transmit press show up in
-// both the built-in vatSys Sectors window (which just displays MMI.SectorsControlled - nothing
-// else needed for that one) and the OzServer window, and (as a consequence of
-// MMI.SectorsControlled being correct) is also what makes vatSys's own map display an extension
-// normally - no separate API call needed for that.
+// Claiming is left downstream: a sector appearing in MMI.SectorsControlled is claimed by the
+// tracker's MMI.SectorsControlledChanged handler, which also resolves a sector that turns out to
+// be owned by someone else (OzServerOwnershipTracker.HandleConflictAsync). A correct
+// MMI.SectorsControlled is also all that vatSys's own Sectors window and map infill need.
 //
-// Releasing is not symmetrical, and this is the one place that asymmetry shows. The tracker's MMI
-// handler is claim-only on purpose - inferring a release from a sector's absence in MMI is what
-// used to fight a VSCS transmit claim in a claim/release loop - so a sector dropping out of MMI
-// releases nothing by itself. CheckActive therefore calls the tracker's release path explicitly
-// when a line stops transmitting (see the end of it): dropping a frequency's line takes the
-// sector's infill off the map locally, and OzServer has to stop calling it this controller's at
-// the same moment, or it stays in the Sectors window and stays unavailable to everyone else.
+// Releasing is not symmetrical. The tracker's MMI handler is claim-only - inferring a release
+// from a sector's absence in MMI fights a VSCS transmit claim in a claim/release loop - so a
+// sector dropping out of MMI releases nothing by itself. CheckActive therefore asks the tracker
+// for the release explicitly when a line goes idle; otherwise the sector's infill would leave the
+// map while OzServer still listed it as this controller's, unavailable to everyone else.
 //
-// Controller Info is deliberately not touched here. This used to publish an "Extending ..."
-// line from the same Transmit state; that is another plugin's job now, and two plugins editing
-// the same free-text field would fight over it.
+// Controller Info is not touched here: the "Extending ..." line is another plugin's job, and two
+// plugins editing the same free-text field would fight over it.
 public class AfvSectorClaimer
 {
-    // Used for two things only: RecentlyResumed (read-only - see Init()) and the release a line
-    // going quiet has to make (ReleaseIdleVscsLineAsync - see CheckActive). Everything else here
-    // still only ever touches MMI.SectorsControlled and lets the tracker follow it.
     readonly OzServerOwnershipTracker _tracker;
     readonly HashSet<VSCSFrequency> _subscribed = new();
-    // What Network.Me.Callsign was the last time Init() actually ran - see the
-    // VSCSFrequenciesChanged handler for why this matters: that event fires both for a genuine
-    // position change (the panel reloading for a new primary) and for a station merely being
-    // added/removed while working the *same* position (e.g. adding another AFV line mid-session),
-    // and only the former should re-baseline.
+    // Network.Me.Callsign when Init() last granted a position. VSCSFrequenciesChanged fires both
+    // for a position change and for a line added or removed while working the same position, and
+    // only the former re-baselines - see the handler.
     string? _lastPrimaryCallsign;
 
-    // Network.Connected fires the moment the session comes up, which is NOT the same moment the
-    // data Init() depends on is usable: Network.Me can still be null, and DefaultSectorsFor matches
-    // Network.Me.Callsign against the profile's own SectorsVolumes.Sectors. A single attempt at
-    // that instant silently granted nothing whenever either side wasn't ready - Init() returned on
-    // the empty result, MMI.SectorsControlled was never written, and since nothing else touches it
-    // on connect there was no second chance. The symptom was logging in on a position and being
-    // handed none of its airspace, having to claim your own sector group by hand.
+    // Network.Connected fires before the data Init() depends on is usable: Network.Me can still be
+    // null, and DefaultSectorsFor matches its callsign against the profile's SectorsVolumes.Sectors.
+    // Nothing else writes MMI.SectorsControlled on connect, so Init() is retried until it has
+    // granted the position's sectors.
     static readonly TimeSpan InitRetryInterval = TimeSpan.FromSeconds(1);
     const int InitMaxAttempts = 20;
     readonly System.Threading.Timer _initRetryTimer;
     int _initAttemptsLeft;
 
-    // Putting the controller back on the frequencies they were working before a disconnect. The
-    // sectors come back on their own (POST /sectors/resume), the VSCS panel does not - vatSys
-    // rebuilds it Idle every session - so without this a resumed position is held on OzServer, drawn
-    // on the scope, and silently off the air.
+    // Puts the controller back on the frequencies they were working before a disconnect. The
+    // sectors come back by themselves (POST /sectors/resume); the VSCS panel does not - vatSys
+    // rebuilds it Idle every session.
     //
-    // Retried rather than done once, and for longer than Init's own retries: every input arrives at
-    // its own pace after a connect. The panel's lines are rebuilt by vatSys, the network has to
-    // confirm the session as a real controller before vatSys will transmit at all (Network.ValidATC,
-    // the same gate its own Transmit button uses), and the sectors themselves only become this
-    // controller's again when the resume lands a round trip later. A single pass at connect would
-    // run before all three on most sessions.
+    // Retried, and for longer than Init: vatSys rebuilds the panel's lines, the network has to
+    // confirm the session as a controller before vatSys will transmit (Network.ValidATC, the gate
+    // its own Transmit button uses), and the sectors only become this controller's again when the
+    // resume lands a round trip later. Each arrives at its own pace after a connect.
     static readonly TimeSpan TransmitRestoreInterval = TimeSpan.FromSeconds(1);
     const int TransmitRestoreMaxAttempts = 45;
     readonly System.Threading.Timer _transmitRestoreTimer;
-    // Lines still to put back, by VSCS line name. Each one is dropped the moment it is dealt with -
-    // restored, or found already transmitting - so no line is ever written twice. That is what keeps
-    // this from fighting the controller: switching a line off during the restore window is their
-    // decision, and a loop that kept re-reading the remembered list would turn it straight back on.
+    // Lines still to put back, by VSCS line name. Each is removed once dealt with - restored, or
+    // found already transmitting - so no line is written twice, and a line the controller switches
+    // off during the restore window stays off.
     readonly HashSet<string> _transmitToRestore = new(StringComparer.OrdinalIgnoreCase);
     int _transmitRestoreAttemptsLeft;
 
@@ -83,41 +62,23 @@ public class AfvSectorClaimer
     {
         _tracker = tracker;
 
-        // Network.Connected, Audio.VSCSFrequenciesChanged and the retry timer below all end up in
-        // MMI.SetControlledSectors, which touches vatSys's own map/UI state - and none of the three
-        // are guaranteed to fire on the UI thread (vatSys never installs a SynchronizationContext on
-        // its FSDSession, and a System.Threading.Timer callback is never the UI thread either).
-        // RunOnUiThread is what the sibling trackers (PrimaryPositionWatcher, ObserverPositionMirror)
-        // already do for the same reason.
+        // Network.Connected, Audio.VSCSFrequenciesChanged and the retry timers all end in
+        // MMI.SetControlledSectors, which touches vatSys's map and UI state, and none of them is
+        // guaranteed to fire on the UI thread (vatSys installs no SynchronizationContext on its
+        // FSDSession).
         Network.Connected += (_, _) => RunOnUiThread(() =>
         {
             BeginInit();
             BeginTransmitRestore();
         });
-        // Nothing to put back once the session is over, and a list left over from it must not be
-        // applied to whatever position this client connects as next - the same rule
-        // TagResumeRecovery applies to its own outstanding tags.
+        // A list left over from an ended session must not be applied to whatever position this
+        // client connects as next.
         Network.Disconnected += (_, _) => RunOnUiThread(StopTransmitRestore);
-        // VSCSFrequenciesChanged re-baselines via Init() (not CheckActive() - see Init()'s own
-        // comment for why) only when the primary callsign has actually changed since Init() last
-        // ran, i.e. only for a genuine position change. Init() unconditionally resets
-        // MMI.SectorsControlled to primary + its own direct subsectors - running that on *every*
-        // list change, including a mid-session station add that has nothing to do with a position
-        // change, wiped out whatever had already been extended into (the map's infill for those
-        // sectors disappearing, until a later TransmitChanged happened to sweep them back in via
-        // CheckActive()'s own full read of current Transmit state - which is why pressing transmit
-        // on the new station appeared to "bring everything back").
-        //
-        // "Changed" means changed to another position, never merely unreadable. Network.Me is null
-        // for stretches of a perfectly ordinary session (it lags Connected, and it is momentarily
-        // null again around a reconnect), and a bare inequality counted that as a position change:
-        // BeginInit then started its one-second retry loop, which sat there until Me came back and
-        // promptly reset MMI.SectorsControlled to the position's bare defaults - silently taking
-        // every extension off the scope, while OzServer went on recording them as this controller's
-        // because nothing here releases anything. The sector then could not be dropped from its own
-        // VSCS line either, since by the time the line was pressed the sector was no longer in MMI
-        // for CheckActive to find (it releases that case now too - see
-        // ReleaseQuietLineMissingFromMmi - but the reset itself should not be happening).
+        // Re-baselines through Init() only when the primary callsign has changed since Init() last
+        // ran, i.e. for a position change. Init() resets MMI.SectorsControlled to the position's
+        // defaults, which for a line added mid-session would take every extension off the scope
+        // while OzServer went on recording them as this controller's. A null Network.Me is not a
+        // change: it lags Connected and is briefly null again around a reconnect.
         Audio.VSCSFrequenciesChanged += (_, _) => RunOnUiThread(() =>
         {
             ResubscribeTransmitChanged();
@@ -136,9 +97,9 @@ public class AfvSectorClaimer
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 
     // Always queued, even from the UI thread - runs after whatever event is being handled right now
@@ -146,9 +107,9 @@ public class AfvSectorClaimer
     static void DeferOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control { IsHandleCreated: true } mainForm)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 
     void BeginInit()
@@ -168,17 +129,16 @@ public class AfvSectorClaimer
         if (OzServerMode.Disabled)
             return;
 
-        // Session went away while still waiting for it to become ready - nothing left to grant.
+        // The session went away while this was waiting for it to become ready.
         if (!Network.IsConnected)
         {
             StopInitRetries();
             return;
         }
 
-        // An observer is never granted a position of their own - their airspace is mirrored from
-        // whoever actually holds it (ObserverPositionMirror). Read from the connection's own
-        // Position/Rating, which are correct immediately; the previous test on Network.Me.IsRealATC
-        // abandoned a real controller's grant outright, taking their whole position off them.
+        // An observer is never granted a position; their airspace is mirrored from whoever holds
+        // it (ObserverPositionMirror). NetworkIdentity.IsObserver is correct immediately, unlike
+        // Network.Me.IsRealATC, which reads false for a real controller just after Connected.
         if (NetworkIdentity.IsObserver)
         {
             StopInitRetries();
@@ -191,16 +151,13 @@ public class AfvSectorClaimer
             return;
         }
 
-        // One-shot reschedule rather than a repeating period, so a slow Init() can never overlap
-        // itself.
+        // One-shot reschedule, not a repeating period, so a slow Init() cannot overlap itself.
         _initRetryTimer.Change(InitRetryInterval, System.Threading.Timeout.InfiniteTimeSpan);
     }
 
-    // Audio.VSCSFrequencies is a fresh array snapshot on every call, and the VSCSFrequency
-    // instances it hands back aren't guaranteed to be the same ones across a
-    // VSCSFrequenciesChanged event (a position change tears down and rebuilds the whole list) - so
-    // this diffs by reference against what's already subscribed rather than assuming it's safe to
-    // subscribe once and forget.
+    // Audio.VSCSFrequencies is a fresh array on every call, and a position change rebuilds the
+    // VSCSFrequency instances, so subscriptions are diffed by reference against what is already
+    // subscribed.
     void ResubscribeTransmitChanged()
     {
         var current = Audio.VSCSFrequencies;
@@ -221,26 +178,26 @@ public class AfvSectorClaimer
     }
 
     // ReceiveChanged matters only for the line going idle - see OnLineStateChanged. A Transmit press
-    // raises it too, straight after TransmitChanged has already handled the press, and running the
-    // claim a second time for the same press would repeat anything it shows (a transmit prompt is
-    // de-duplicated, the FMP "cannot assume" notice is not).
+    // raises it too, after TransmitChanged has handled the press, and running the claim again would
+    // repeat anything it shows (a transmit prompt is de-duplicated, the FMP "cannot assume" notice
+    // is not).
     void OnReceiveChanged(object? sender, EventArgs e)
     {
         if (sender is VSCSFrequency { Transmit: false, Receive: false })
             OnLineStateChanged(sender, e);
     }
 
-    // Both events, because Idle and Receive cannot be told apart from TransmitChanged alone. vatSys's
-    // VSCS buttons (VSCSControlDX, VSCS_Button_Freq_*) set the two flags in a fixed order:
+    // Both events, because Idle and Receive cannot be told apart from TransmitChanged alone.
+    // vatSys's VSCS buttons (VSCSControlDX, VSCS_Button_Freq_*) set the two flags in a fixed order:
     //
     //   Transmit  Transmit = true,  then Receive = true
     //   Receive   Transmit = false, then Receive = true
     //   Idle      Transmit = false, then Receive = false
     //
-    // so when TransmitChanged fires for Receive *or* Idle, Receive still reads true from the
-    // transmitting state it is leaving. Only ReceiveChanged, which comes second, shows which button it
-    // was. Both setters raise their event on every write, changed or not, so pressing Idle on a line
-    // already on Receive still arrives here as a ReceiveChanged with both flags off.
+    // so when TransmitChanged fires for Receive or Idle, Receive still reads true from the
+    // transmitting state it is leaving. Only ReceiveChanged, which comes second, shows which button
+    // it was. Both setters raise their event on every write, changed or not, so pressing Idle on a
+    // line already on Receive still arrives here as a ReceiveChanged with both flags off.
     void OnLineStateChanged(object? sender, EventArgs e)
     {
         if (OzServerMode.Disabled)
@@ -249,9 +206,8 @@ public class AfvSectorClaimer
         if (sender is VSCSFrequency frequency)
             CheckActive(frequency);
 
-        // After CheckActive, so what is written is the state the press has actually settled into.
-        // Saved on every change rather than on disconnect - see VscsTransmitMemory for why a
-        // disconnect is the wrong moment to be writing a file.
+        // After CheckActive, so what is written is the state the press has settled into. Saved on
+        // every change rather than on disconnect - see VscsTransmitMemory.
         VscsTransmitMemory.Remember();
     }
 
@@ -267,8 +223,8 @@ public class AfvSectorClaimer
             return;
 
         // Read once, at connect. Re-reading it on every attempt would pick up the memory this
-        // session is itself writing (OnTransmitChanged saves on every change), turning a restore
-        // the controller then undid into a restore that keeps coming back.
+        // session is itself writing (OnLineStateChanged saves on every change), so a restore the
+        // controller undid would keep coming back.
         foreach (var line in VscsTransmitMemory.Recall(Network.Me?.Callsign))
             _transmitToRestore.Add(line);
 
@@ -300,10 +256,9 @@ public class AfvSectorClaimer
 
         if (_transmitToRestore.Count == 0 || --_transmitRestoreAttemptsLeft <= 0)
         {
-            // Whatever is left was never this controller's to take back - a sector somebody else
-            // picked up while they were away, or a line the panel no longer has. Logged rather
-            // than dropped silently: "I came back and one of my frequencies is missing" is worth
-            // being able to answer.
+            // Whatever is left was not this controller's to take back - a sector somebody else
+            // picked up while they were away, or a line the panel no longer has. Logged, so a
+            // frequency missing after a reconnect can be explained.
             if (_transmitToRestore.Count > 0)
                 ActionLog.Log("Primary",
                     $"Did not put back transmit on {string.Join(", ", _transmitToRestore.OrderBy(n => n))} - not owned here after reconnecting",
@@ -318,8 +273,7 @@ public class AfvSectorClaimer
             return;
         }
 
-        // One-shot reschedule rather than a repeating period, the same shape as the init retry, so
-        // a slow pass can never overlap itself.
+        // One-shot reschedule, as for the init retry, so a slow pass cannot overlap itself.
         _transmitRestoreTimer.Change(TransmitRestoreInterval, System.Threading.Timeout.InfiniteTimeSpan);
     }
 
@@ -330,9 +284,9 @@ public class AfvSectorClaimer
         if (OzServerMode.Disabled)
             return;
 
-        // The same gate vatSys's own Transmit button uses (VSCSControlDX's Freq_Trans clickspot):
-        // until the network has confirmed this session as a controller, setting Transmit puts the
-        // panel in a state AFV will not actually carry.
+        // The gate vatSys's own Transmit button uses (VSCSControlDX's Freq_Trans clickspot): until
+        // the network has confirmed this session as a controller, setting Transmit puts the panel
+        // in a state AFV does not carry.
         if (!Network.ValidATC)
             return;
 
@@ -340,13 +294,13 @@ public class AfvSectorClaimer
         {
             var frequency = Audio.VSCSFrequencies.FirstOrDefault(f => f.Name == name);
 
-            // The panel is still being rebuilt - vatSys populates it over the first seconds of a
-            // session. Keep waiting rather than writing this line off.
+            // The panel may still be being rebuilt - vatSys populates it over the first seconds of
+            // a session - so the line is kept for a later pass.
             if (frequency == null)
                 continue;
 
-            // Done only when both are on - a line showing Transmit without Receive is exactly the
-            // broken state the write below exists to avoid (see there), not a restored one.
+            // Done only when both are on: Transmit without Receive is the broken state the write
+            // below avoids, not a restored line.
             if (frequency.Transmit && frequency.Receive)
             {
                 _transmitToRestore.Remove(name);
@@ -355,20 +309,17 @@ public class AfvSectorClaimer
 
             var sector = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == name);
 
-            // Only what OzServer agrees is this controller's. A frequency is a claim on airspace,
-            // and the resume has already decided which of it came back: a sector somebody else
-            // picked up in the meantime is theirs now, and putting the controller on its frequency
-            // would both talk over them and have CheckActive claim it back out from under them.
-            // Not yet owned is not the same as not theirs, though - the resume lands a round trip
-            // after connect - so this is left in the set and asked again next second.
+            // Only what OzServer agrees is this controller's: a sector somebody else picked up in
+            // the meantime is theirs, and transmitting on it would talk over them. A sector not
+            // owned yet may still arrive - the resume lands a round trip after connect - so it
+            // stays in the set for the next pass.
             if (sector == null || !_tracker.IsMine(sector))
                 continue;
 
             // Both flags, in the order vatSys's own Transmit button writes them (VSCSControlDX,
             // VSCS_Button_Freq_Trans). AFV only builds transceivers for lines with Receive on
-            // (AFV.UpdateTransceivers: transmit is decided inside the Receive branch), and a line
-            // comes back from a reconnect Idle - so Transmit alone lit the button on the panel while
-            // nothing was actually keyed on AFV.
+            // (AFV.UpdateTransceivers), and a line comes back from a reconnect Idle - Transmit
+            // alone would light the button with nothing keyed on AFV.
             frequency.Transmit = true;
             frequency.Receive = true;
             _transmitToRestore.Remove(name);
@@ -383,17 +334,15 @@ public class AfvSectorClaimer
         }
     }
 
-    // Sets the initial controlled-sector set on connect (or on a genuine position change - see the
-    // VSCSFrequenciesChanged handler): the primary sector matching this session's own login
-    // callsign, plus the rest of its current-session group after removing top-down cover already
-    // staffed by another real controller. Based on VatpacPlugin's Sectors.Init().
-    // True once the position's default sectors have actually been granted, which is what tells
-    // RetryInit to stop. False means "not ready yet", never "nothing to do" - see the retry fields.
+    // Sets the controlled sectors on connect or on a position change (see the
+    // VSCSFrequenciesChanged handler): the primary sector matching this session's login callsign,
+    // plus the rest of its group, less any top-down cover already staffed by another controller.
+    // Based on VatpacPlugin's Sectors.Init(). Returns true once the position's default sectors
+    // have been granted; false means "not ready yet", and RetryInit tries again.
     bool Init()
     {
-        // Network.Me (and everything else here - VSCS lines, sector callsigns) is only meaningful
-        // once actually connected to the network; running this beforehand (e.g. a stray
-        // VSCSFrequenciesChanged before login) would touch MMI.SectorsControlled with garbage.
+        // Network.Me, VSCS lines and sector callsigns mean nothing before the network connection
+        // is up, and a VSCSFrequenciesChanged can arrive before login.
         if (!Network.IsConnected)
             return false;
 
@@ -401,9 +350,9 @@ public class AfvSectorClaimer
         if (string.IsNullOrEmpty(callsign))
             return false;
 
-        // PrimaryPosition, not an open-coded copy of the same rule: PrimaryPositionWatcher applies
-        // it on the *other* controller's side to decide what to release to this session, and the
-        // two have to agree exactly or a sector is either released to nobody or never handed over.
+        // PrimaryPosition, not a local copy of the same rule: PrimaryPositionWatcher applies it on
+        // the other controller's side to decide what to release to this session, and the two have
+        // to agree or a sector is either released to nobody or never handed over.
         var unfiltered = PrimaryPosition.DefaultSectorsFor(callsign);
         var sectors = PrimaryPosition.WithoutStaffedTopDownCover(unfiltered, callsign);
         if (sectors.Count == 0)
@@ -411,78 +360,55 @@ public class AfvSectorClaimer
 
         LogWithheldTopDownCover("Withheld top-down cover on login", unfiltered, sectors);
 
-        // Anything a resume just handed back stays. Nothing orders this against the resume, and
-        // replacing MMI with the bare defaults after it had already restored the extras took them
-        // back out - see OzServerOwnershipTracker.RecentlyResumed.
+        // Anything a resume has just handed back stays. Nothing orders this against the resume,
+        // and the bare defaults would take the resumed extras back out of MMI - see
+        // OzServerOwnershipTracker.RecentlyResumed.
         foreach (var resumed in _tracker.RecentlyResumed)
         {
             if (!sectors.Any(s => s.Equals(resumed)))
                 sectors.Add(resumed);
         }
 
-        // Only recorded once the grant actually happened. Setting it on the way in marked the
-        // position as handled even when nothing was granted, so the VSCSFrequenciesChanged
-        // re-baseline below then saw no callsign change and never gave it a second attempt.
+        // Recorded only once the grant has happened. Set earlier, a failed attempt would look
+        // handled, and the VSCSFrequenciesChanged handler would see no callsign change to retry on.
         _lastPrimaryCallsign = callsign;
 
         MMI.SetControlledSectors(sectors);
         return true;
     }
 
-    // Recomputes MMI.SectorsControlled from ONE VSCS line's current Transmit state - the specific
-    // line that just raised TransmitChanged (see OnTransmitChanged, which passes it in via sender),
-    // never the whole panel. Two cases, exactly:
-    //   - A bare sub-sector's own line (no SubSectors of its own, e.g. SNO) activating adds only
-    //     that sector - never its primary, never siblings. There is no legitimate reading of
-    //     "extend into SNO" that should also hand over WOL and WOL's other sub-sectors.
-    //   - A primary's own line (e.g. WOL, or WON) activating adds it plus its *whole* group -
-    //     matching real "extend" semantics (you're covering the area on your own scope/tags).
-    //     OzServer ownership conflicts are still resolved downstream by
-    //     OzServerOwnershipTracker.HandleConflictAsync, but direct live-ATC presence is applied here
-    //     too for dataset top-down cover: if ML_APP is already online, pressing BLA Transmit must
-    //     not locally re-add MAE/MAV to vatSys's Sector Management Window before the backend gets a
-    //     chance to reject them.
+    // Recomputes MMI.SectorsControlled from one VSCS line's state - the line that raised the event
+    // (see OnLineStateChanged), never the whole panel:
     //
-    // A line going Idle (Transmit and Receive both off) removes that sector and its sub-sectors from
-    // MMI *and* releases it on OzServer. Receive does not: it is the controller listening on the
-    // frequency, still holding the airspace and its tags, and dropping both on a Receive press took
-    // the sector off the scope and every tag in it with it. Only Idle is the controller saying they
-    // are no longer working that airspace (see OnLineStateChanged for how the two are told apart),
-    // and then the two records have to say the same thing: before the
-    // release call at the end of this method the infill came off the map while OzServer went on
-    // listing the sector as owned, so nobody else could take it and it sat in the OzServer Sectors
-    // window as if it were still being worked. The one exception is this session's own primary
-    // sector, which is never dropped either locally or on OzServer - see the primarySector check
-    // below.
+    //   - Transmit on a bare sub-sector's line (no SubSectors of its own, e.g. SNO) adds only that
+    //     sector - never its primary or siblings.
+    //   - Transmit on a primary's line (e.g. WOL) adds it and its whole group, less top-down cover
+    //     another controller is already online for. OzServer ownership conflicts are resolved
+    //     downstream (OzServerOwnershipTracker.HandleConflictAsync), but live ATC presence is
+    //     applied here so that cover is not added to MMI before the backend can reject it.
+    //   - Idle (Transmit and Receive both off) removes the sector and its covered group from MMI
+    //     and releases it on OzServer. Receive does not: the controller is still listening on the
+    //     frequency and still holds the airspace and its tags. This session's own primary sector
+    //     is never dropped, locally or on OzServer.
     //
-    // Deliberately scoped to just this one frequency rather than resweeping every VSCS line's
-    // current state (an earlier version did that): every OTHER line's Transmit still reads exactly
-    // what it read before this event, including any sub-sector Init() had already granted into
-    // MMI.SectorsControlled but that's never individually been transmitted on - resweeping those
-    // treated "controlled but not currently transmitting" as "just turned off" on every unrelated
-    // transmit press, silently stripping them back out (and, worse, once a sector drops out of
-    // MMI.SectorsControlled entirely vatSys backfills it with a dummy placeholder infill that VSCS
-    // can no longer reclaim by transmitting again - the actual bug this was rewritten to fix:
-    // pressing Transmit on a primary like BLA was wiping BLA's own already-granted infill back to a
-    // dummy and leaving it unrecoverable). The primarySector self-protection below still matters for
-    // its own sake (turning the primary's own line off should never drop the primary itself), but
-    // scoping to one frequency is what actually stops every OTHER granted sector from being caught
-    // in the blast radius of a change that has nothing to do with them.
-    // Uses Sector.Equals throughout (Callsign-based), not == or ReferenceEquals - Sector overrides
-    // Equals/GetHashCode but not the == operator, so two Sector instances for the same real sector
-    // reached via different lookups compare unequal under == even though they're the same sector.
+    // Scoped to the one line rather than resweeping the panel: every other line's Transmit reads
+    // as it did before the event, including sub-sectors Init() granted that have never been
+    // transmitted on. A resweep would treat "controlled but not transmitting" as "just turned off"
+    // and strip them - and once a sector leaves MMI.SectorsControlled, vatSys backfills it with a
+    // dummy infill that transmitting again cannot reclaim.
+    //
+    // Sectors are compared with Sector.Equals (Callsign-based), not ==: Sector overrides Equals and
+    // GetHashCode but not the == operator, so two instances of the same sector are unequal under ==.
     void CheckActive(VSCSFrequency frequency)
     {
         if (OzServerMode.Disabled)
             return;
 
-        // Same reasoning as Init() above - nothing here means anything before the network
-        // connection is actually up.
+        // As in Init(): nothing here means anything before the network connection is up.
         if (!Network.IsConnected)
             return;
 
-        // Network.Me lags Connected (see Init), and a Transmit press in that window dereferenced it
-        // here unguarded - a NullReferenceException thrown into whatever vatSys code set Transmit.
+        // Network.Me lags Connected (see Init), and a Transmit press can arrive in that window.
         var myCallsign = Network.Me?.Callsign;
         if (string.IsNullOrEmpty(myCallsign))
             return;
@@ -498,7 +424,7 @@ public class AfvSectorClaimer
         // Transmitting on a sector another controller holds asks whether to request it - see
         // PromptToRequestHeldSector. Checked before anything touches MMI, and whether or not
         // something else (VatpacPlugin, on this same press) has already put it there. This
-        // session's own position is left to the logon path, which requests it on its own.
+        // session's own position is left to the logon path, which requests it itself.
         if (frequency.Transmit
             && !primarySector.Equals(frequencySector)
             && !_tracker.IsMine(frequencySector)
@@ -508,7 +434,7 @@ public class AfvSectorClaimer
             return;
         }
 
-        // Neither transmitting nor idle: the line is on Receive, or is part-way into a Receive/Idle
+        // Neither transmitting nor idle: the line is on Receive, or part-way into a Receive or Idle
         // press (see OnLineStateChanged - Transmit clears before Receive is set). Receive keeps the
         // sector, so there is nothing to do; an Idle press finishes with a ReceiveChanged that
         // arrives back here with both flags off.
@@ -516,11 +442,14 @@ public class AfvSectorClaimer
         if (!frequency.Transmit && !idle)
             return;
 
-        var currentSectors = MMI.SectorsControlled.ToList();
+        // Without vatSys's placeholder for a missing login sector (MMI.SetControlledSectors adds
+        // one, carrying the login callsign). Matched as the sector itself, it made a Transmit press
+        // on this session's own line a no-op, so a position taken out of MMI could not be brought
+        // back from the panel.
+        var currentSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
         var currentlyControlled = currentSectors.FirstOrDefault(s => s.Callsign == frequency.Name);
 
-        // Set only by the drop branch below, and given back to OzServer after the MMI write - see
-        // the end of this method.
+        // Set only by the drop branch below, and released on OzServer after the MMI write.
         SectorsVolumes.Sector? dropped = null;
 
         if (currentlyControlled == null)
@@ -533,8 +462,8 @@ public class AfvSectorClaimer
 
             // A flow position never takes enroute or TMA airspace nobody holds - see
             // PrimaryPosition.MayOwn. (Airspace someone does hold was handled above: it is asked
-            // for, as relief cover.) Already given to this session, by an accepted request, it goes
-            // back on the scope like any other sector of ours.
+            // for, as relief cover.) Airspace already given to this session by an accepted request
+            // goes back on the scope like any other sector of ours.
             if (!PrimaryPosition.MayOwn(frequencySector, myCallsign) && !_tracker.IsMine(frequencySector))
             {
                 PrimaryPosition.ReportFlowCannotAssume(new[] { frequencySector }, myCallsign);
@@ -589,26 +518,19 @@ public class AfvSectorClaimer
             currentSectors.Remove(currentlyControlled);
 
             // The whole covered group, not just the direct sub-sectors: the release below gives back
-            // everything the dropped sector is responsible for all the way down (the backend's
-            // releaseGroup walks the chain, and PrimaryPosition.CoveredBy mirrors it), and 19 sectors
-            // in the dataset bundle sub-sectors that bundle more of their own. One level left the
-            // deeper ones in MMI with nothing owning them on OzServer, which is exactly what the
-            // tracker's RetryUnclaimedMmiSectors exists to claim - so a tick landing before the
-            // release's refresh took them out could claim them straight back, on their own, after
-            // the controller had dropped the line that covered them.
+            // everything the dropped sector is responsible for, all the way down (the backend's
+            // releaseGroup walks the chain, and PrimaryPosition.CoveredBy mirrors it). Deeper
+            // sub-sectors left in MMI with no owner on OzServer are what the tracker's
+            // RetryUnclaimedMmiSectors claims, so they could be claimed straight back after the
+            // controller had dropped the line that covered them.
             foreach (var subsector in PrimaryPosition.CoveredBy(currentlyControlled).Where(s => !s.Equals(currentlyControlled)))
             {
-                // Never the position this session is actually logged on as, even when the group
-                // being dropped is responsible for it. A controller logged on as a bare sub-sector
-                // (SNO) who extended into its parent group (WOL) and then drops WOL's line is
-                // dropping a group whose SubSectors include SNO itself - taking their own airspace
-                // off their own scope, and (because a sector that leaves MMI.SectorsControlled
-                // entirely gets backfilled with a dummy infill VSCS can no longer reclaim - see
-                // this method's own header) not giving it back on the next transmit either. The
-                // release below sweeps the same group up server-side, where it cannot be skipped
-                // sector by sector - see OzServerOwnershipTracker's
-                // ReclaimOwnPositionAfterReleaseAsync, which takes the position straight back
-                // instead.
+                // Never the position this session is logged on as, even when the dropped group is
+                // responsible for it: a controller logged on as a bare sub-sector (SNO) who
+                // extended into its parent group (WOL) and then drops WOL's line keeps SNO. The
+                // release below takes the same group server-side, where it cannot be skipped
+                // sector by sector; the tracker's ReclaimOwnPositionAfterReleaseAsync takes the
+                // position straight back.
                 if (primarySector.Equals(subsector))
                     continue;
 
@@ -620,42 +542,31 @@ public class AfvSectorClaimer
 
         MMI.SetControlledSectors(currentSectors);
 
-        // The sector has just come off the scope locally; this is what stops OzServer from going on
-        // saying it is still this controller's. It cannot be inferred downstream from the MMI write
-        // above the way a claim is: the tracker's MMI.SectorsControlledChanged handler is
-        // claim-only by design (see ClaimMmiControlledSectorsAsync - releasing on MMI absence is
-        // what used to fight a VSCS transmit claim in a claim/release loop), so a release has to be
-        // asked for explicitly. Without it, dropping a line took the infill off the map while the
-        // sector stayed listed as owned in the OzServer Sectors window and stayed unavailable to
-        // every other controller - which is the bug this exists to fix.
+        // The release has to be asked for explicitly: the tracker's MMI.SectorsControlledChanged
+        // handler is claim-only (see ClaimMmiControlledSectorsAsync and the class comment), so
+        // the MMI write above releases nothing on OzServer.
         //
-        // Deliberately after MMI.SetControlledSectors, not before: that call is what hands the
-        // airspace back locally, and it is synchronous, so by the time the release's own refresh
-        // comes back and ReconcileMmiWithOwned diffs the result, MMI already agrees with it and
-        // there is nothing left for it to push. Released first, the refresh could land while the
-        // sector was still in MMI - and a sector in MMI that OzServer no longer records as ours is
-        // exactly what the claim path exists to put back (RetryUnclaimedMmiSectors), so the release
-        // would be undone by the next poll tick.
+        // After MMI.SetControlledSectors, not before. That call is synchronous, so by the time the
+        // release's refresh returns and ReconcileMmiWithOwned diffs the result, MMI already
+        // agrees with it. Released first, the refresh could land while the sector was still in
+        // MMI, and a sector in MMI that OzServer does not record as ours is what
+        // RetryUnclaimedMmiSectors claims - undoing the release on the next poll tick.
         //
-        // Fire-and-forget: TransmitChanged is raised from inside vatSys's own VSCS click handling
-        // (VSCSControlDX.Execute), which cannot be made to wait on a round trip to OzServer.
-        // Nothing is lost by not awaiting - ReleaseIdleVscsLineAsync reports its own failures and
-        // re-derives Owned itself when it succeeds.
+        // Fire-and-forget: TransmitChanged is raised inside vatSys's own VSCS click handling
+        // (VSCSControlDX.Execute), which cannot wait on a round trip to OzServer.
+        // ReleaseIdleVscsLineAsync reports its own failures and re-derives Owned when it succeeds.
         if (dropped != null)
             _ = ReleaseThenRetakeIfTransmittingAsync(frequency, dropped);
     }
 
-    // Releases an idled line's sector, then takes it straight back if the line went back to Transmit
-    // while the release was still in flight.
+    // Releases an idled line's sector, then takes it straight back if the line returned to Transmit
+    // while the release was in flight.
     //
-    // Transmit > Idle > Transmit inside one round trip used to end with the controller on the
-    // frequency and owning nothing. The second Transmit put the sector back into MMI, but the claim
-    // pass skipped it - Owned still listed it, the release not having landed yet - and when the
-    // release's refresh did land, ReconcileMmiWithOwned saw the sector lost and took it back out of
-    // MMI. Nothing claimed it after that: the line was transmitting, so no further press was coming.
-    //
-    // Re-run once the release and its refresh are done, so it starts from what OzServer now says -
-    // not owned, not in MMI - which is exactly the state an ordinary Transmit press claims from.
+    // Without this, Transmit > Idle > Transmit inside one round trip ends with the controller on
+    // the frequency and owning nothing: the second Transmit puts the sector back into MMI but the
+    // claim pass skips it (Owned still lists it), and when the release's refresh lands
+    // ReconcileMmiWithOwned takes it back out of MMI. CheckActive is therefore run again once the
+    // release and its refresh are done, from the state an ordinary Transmit press claims from.
     async System.Threading.Tasks.Task ReleaseThenRetakeIfTransmittingAsync(VSCSFrequency frequency, SectorsVolumes.Sector sector)
     {
         await _tracker.ReleaseIdleVscsLineAsync(sector);
@@ -685,18 +596,17 @@ public class AfvSectorClaimer
         + "relieving ATC during bathroom breaks etc. FMP should not control ENR/TMA Airspace for "
         + "extended periods of time.";
 
-    // Transmit was pressed on a sector someone else holds. Pressing transmit is how a controller
-    // takes airspace, but this airspace is somebody's: so rather than claiming it (which the backend
-    // refuses) or silently asking for it, the controller is asked whether to request it, shown
-    // everything that would come with it.
+    // Transmit was pressed on a sector someone else holds. Rather than claiming it (which the
+    // backend refuses) or requesting it unasked, the controller is asked whether to request it and
+    // shown everything that would come with it.
     //
     //   Accept - the request goes to the holder, and the Sectors window opens on it.
     //   Reject - (also closing the prompt, or leaving it for a minute) the line goes back to
     //            Receive, since the controller has decided not to work this airspace.
     //
-    // Nothing is put on the scope either way until the holder accepts; then the sector and its tags
-    // arrive the ordinary way. A flow position sees an extra note - it may only ever take airspace
-    // this way, as temporary relief.
+    // Nothing is put on the scope until the holder accepts; then the sector and its tags arrive the
+    // ordinary way. A flow position sees an extra note - it may only take airspace this way, as
+    // temporary relief.
     void PromptToRequestHeldSector(VSCSFrequency frequency, SectorsVolumes.Sector sector, string myCallsign)
     {
         if (OzServerMode.Disabled)
@@ -724,8 +634,8 @@ public class AfvSectorClaimer
         if (!_promptOpen.Add(sector.Name))
             return;
 
-        // What the holder would actually hand over: the sector and everything under it that they
-        // hold themselves (the backend's transferRequest gives exactly that).
+        // What the holder would hand over: the sector and everything under it that they hold
+        // themselves, which is what the backend's transferRequest transfers.
         var group = PrimaryPosition.CoveredBy(sector)
             .Where(s => s.Equals(sector)
                         || (_tracker.ControlledByOthers.TryGetValue(s.Name, out var o) && o.Cid == owner.Cid))
@@ -800,8 +710,8 @@ public class AfvSectorClaimer
         frequency.Receive = true;
     }
 
-    // Takes the sector, and whatever under it is not ours, back out of MMI - never this session's own
-    // position or anything it owns.
+    // Takes the sector, and whatever under it is not ours, back out of MMI - never this session's
+    // own position or anything it owns.
     void RemoveHeldFromMmi(SectorsVolumes.Sector sector, int? ownerCid)
     {
         if (OzServerMode.Disabled)
@@ -822,36 +732,26 @@ public class AfvSectorClaimer
         MMI.SetControlledSectors(current.Where(c => !remove.Any(r => r.Equals(c))).ToList());
     }
 
-    // A line stopped transmitting for a sector vatSys is not listing as controlled. There is
-    // nothing to take off the scope - but OzServer can still be recording the sector as this
-    // controller's, and then dropping the line does nothing at all: the sector stays in the
-    // OzServer Sectors window and stays unavailable to everyone else, with the one control that
-    // ought to give it back now doing nothing, because the sector it would have dropped is already
-    // out of MMI.
+    // A line went idle for a sector vatSys does not list as controlled. Nothing comes off the
+    // scope, but OzServer can still record the sector as this controller's: MMI.SectorsControlled
+    // and OzServer ownership are separate records, and several paths move one without the other - a
+    // sector carried out of MMI by another line's drop (CheckActive's group sweep), cover removed
+    // locally when a position's own controller logs on (PrimaryPositionWatcher.RemoveLocalCover,
+    // which only touches MMI), or an Owned list the Sectors window committed. The controller has
+    // taken themselves off this frequency, so whatever OzServer still holds under that sector's
+    // name goes back.
     //
-    // That is not a hypothetical. MMI.SectorsControlled and OzServer ownership are separate records
-    // and several paths move one without the other: a sector carried out of MMI by a *different*
-    // line's drop (the group sweep below removes the dropped sector's own sub-sectors, and a
-    // release server-side reaches further still, down the whole responsible-sectors chain), cover
-    // removed locally when a position's own controller logs on (PrimaryPositionWatcher.
-    // RemoveLocalCover, which deliberately only touches MMI), or an Owned list the Sectors window
-    // committed. Keying the release off "it was in MMI a moment ago" made the fix for dropping a
-    // line work only while those two records happened to agree.
-    //
-    // So the gesture is what counts, not the bookkeeping: the controller has taken themselves off
-    // this frequency, and whatever OzServer still has under that sector's name goes back. Gated on
-    // Owned here (unlike the in-MMI path, which asks the server outright - see
-    // OzServerOwnershipTracker.ReleaseIdleVscsLineAsync for why it cannot afford to trust a reading
-    // that trails by a round trip): without that gate every press of Idle or Recv on any line that
-    // isn't controlled - monitoring a neighbour's frequency, most of all - would fire a release the
+    // Gated on Owned, unlike the in-MMI path (which asks the server outright - see
+    // OzServerOwnershipTracker.ReleaseIdleVscsLineAsync): otherwise every Idle press on a line
+    // that is not controlled - a monitored neighbour's frequency, say - would send a release the
     // backend can only refuse.
     void ReleaseQuietLineMissingFromMmi(VSCSFrequency frequency, SectorsVolumes.Sector frequencySector, SectorsVolumes.Sector primarySector)
     {
         if (OzServerMode.Disabled)
             return;
 
-        // The position this session is logged on as is never given away by going quiet on it, the
-        // same rule the in-MMI path applies.
+        // The position this session is logged on as is never given away by going quiet on it, as
+        // in the in-MMI path.
         if (frequencySector.Equals(primarySector))
             return;
 

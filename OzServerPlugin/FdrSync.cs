@@ -8,46 +8,27 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Pushes FDR/position updates vatSys hands the plugin (Plugin.OnFDRUpdate, Plugin.OnRadarTrackUpdate
-// - both fire per flight, for every flight vatSys is tracking, not just this controller's own
-// traffic) to OzServer's /fdr/batch endpoint - but only for a flight this controller currently holds
-// and has activated: fdr.IsTrackedByMe && fdr.ESTed, checked fresh on every update (see ShouldPush) -
-// or, for an activated/completed FDR nobody tracks, when this controller holds its data authority
-// (ShouldPush's second rule; those are reported with no tag owner, see FillAuthority).
-// No grace period, no "used to own it" carve-out: the moment either goes false, nothing more is
-// pushed for that flight until (if ever) this controller holds it again. IsTrackedByMe is now
-// whatever vatSys itself says it is - nothing in this plugin moves tags between controllers any
-// more - so the condition simply follows the controller's own working state.
+// Pushes the FDR and radar updates vatSys hands the plugin - for every flight, not only this
+// controller's - to OzServer's /fdr/batch endpoint. A flight is pushed only while ShouldPush
+// holds: this controller tracks it and it is activated, or no OzServer controller tracks it and
+// this session is the one responsible for reporting it. There is no grace period.
 //
-// Because a push only ever happens while this controller holds the flight, the datalink authority it
-// reports is always this session's own identity (see FillAuthority) - there is no "assumed by
-// someone else" or "free" case left to report. See OzServerFdrUpdateDto's own comment for why that's
-// safe to just trust and forward as-is, and FlightDataRecordController::upsert (backend) for what
-// actually happens with it. A row nothing has pushed to in 10 minutes - the natural backend
-// counterpart to a controller simply no longer pushing anything once they've let go of a flight - is
-// dropped server-side; that's a backend-only follow-up (same precedent as the existing 60-minute
-// ATIS TTL - see AtisSync/README), not implemented in this repo.
+// A tracked push names this session as the tag's owner; an untracked one names nobody (see
+// FillAuthority). current_sector (FillCurrentSector) answers a separate question: which sector
+// the aircraft is physically inside.
 //
-// Also reports current_sector (see FillCurrentSector) - the real geographic subsector the aircraft
-// is physically inside of right now, resolved via SectorLocator against every sector vatSys knows
-// about, not just ones OzServer has an active ownership record for. That's deliberately a different
-// question from the datalink authority above: who owns the tag vs. which airspace the aircraft is
-// actually in, regardless of whether anyone has claimed it there yet.
-//
-// Updates are batched rather than sent one request per flight: OnFDRUpdate/OnRadarTrackUpdate just
-// merge into _pending (keyed by callsign, newer non-null fields overwriting older ones - a
-// position-only radar update doesn't blank out flight-plan fields a previous FDR push already
-// filled in, and vice versa), and a timer flushes everything pending as one request periodically.
+// Updates merge into _pending by callsign, newer non-null fields overwriting older ones, and a
+// timer flushes everything pending as one request. The backend drops a record that has had no
+// update for FDR_RETAIN_MINUTES.
 public class FdrSync
 {
     static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(5);
 
-    // Everything except the two datalink-authority fields, which CopyNonNull handles separately -
-    // see its own comment for why they can't go through the same "skip nulls" merge as the rest.
+    // The properties CopyNonNull merges by skipping nulls. The authority fields and the label state
+    // are excluded: CopyNonNull copies each of those as a unit.
     static readonly PropertyInfo[] MergeProperties = typeof(OzServerFdrUpdateDto).GetProperties()
         .Where(p => p.Name != nameof(OzServerFdrUpdateDto.ControllingCid)
                     && p.Name != nameof(OzServerFdrUpdateDto.ControllingCallsign)
-                    // The cleared level is merged as a unit too - see CopyNonNull.
                     && p.Name != nameof(OzServerFdrUpdateDto.CflLower)
                     && p.Name != nameof(OzServerFdrUpdateDto.CflUpper)
                     && p.Name != nameof(OzServerFdrUpdateDto.LabelOpData)
@@ -60,12 +41,9 @@ public class FdrSync
     readonly object _lock = new();
     readonly Dictionary<string, OzServerFdrUpdateDto> _pending = new();
     readonly Timer _flushTimer;
-    // 0 = idle, 1 = a flush is in flight. The timer keeps ticking every FlushInterval regardless of
-    // whether the previous flush has come back, so without this a backend slower than the interval
-    // accumulates overlapping batches - and because each one takes its own snapshot of _pending and
-    // clears it, they carry *different* data and can land out of order, letting an older batch
-    // overwrite a newer one's positions server-side. A tick that finds a flush already running just
-    // skips; nothing is lost, since whatever accumulates meanwhile goes out on the next one.
+    // 0 = idle, 1 = a flush is in flight. The timer ticks whether or not the previous flush has
+    // returned, and overlapping batches can land out of order, an older one overwriting a newer
+    // one's positions. A tick that finds a flush running skips.
     int _flushing;
 
     readonly OzServerOwnershipTracker _tracker;
@@ -75,22 +53,21 @@ public class FdrSync
         _tracker = tracker;
         _flushTimer = new Timer(_ => _ = FlushAsync(), null, FlushInterval, FlushInterval);
 
-        // Whatever was still queued belongs to the session that just ended. FlushAsync holds it
-        // while disconnected, so it used to go out on the first tick after reconnecting - naming
-        // this controller as the authority for flights someone else may have picked up while they
-        // were away, and, after a switch between live and a SweatBox, into the wrong server's
-        // records entirely (the server is attached when the batch is sent, not when it is queued).
+        // Whatever is still queued belongs to the session that ended. FlushAsync holds it while
+        // disconnected, so unless cleared it would go out after reconnecting - naming this
+        // controller as the authority for flights someone else may since have picked up, or,
+        // after a switch between live and a SweatBox, into the wrong server's records (the server
+        // is attached when the batch is sent).
         Network.Disconnected += (_, _) =>
         {
             lock (_lock)
             {
                 _pending.Clear();
-                // A new session starts with nothing sent: every route goes out again.
+                // A new session resends every route and every tag's label state.
                 _sentRouteKeys.Clear();
-                // Likewise every tag's label state, the first time it is seen tracked again.
                 _labelStateKeys.Clear();
             }
-            // And every tag is taken over from the record again when next tracked.
+            // And adopts every tag's label from the record again when next tracked.
             LabelAdopted.Clear();
             Landed.Clear();
         };
@@ -110,19 +87,11 @@ public class FdrSync
         Merge(BuildFdrDto(fdr, forceRoute: false));
     }
 
-    // Sends without waiting for the flush timer.
-    //
-    // For a position update, riding the next 5s batch is fine - a slightly stale lat/lon costs
-    // nothing. A change of *authority* is different: until it reaches the backend there is no record
-    // that this controller holds the tag, so an ungraceful disconnect in that window loses it
-    // entirely. On reconnect the backend has nothing to hand back and the controller is offered
-    // their own aircraft as a fresh pickup, which is exactly what happened to the last two tags of a
-    // five-tag session.
-    //
-    // Goes through the same _pending merge and the same FlushAsync as everything else, so it cannot
-    // race the timer, send a partial DTO, or overlap an in-flight batch. If a flush happens to be
-    // running, FlushAsync declines and the update simply stays queued for the next tick - no worse
-    // than the old behaviour, and the common case sends at once.
+    // Sends without waiting for the flush timer. A change of authority cannot ride the next batch:
+    // until it reaches the backend there is no record that this controller holds the tag, and an
+    // ungraceful disconnect in that window leaves a resume nothing to hand back. Uses the same
+    // _pending merge and FlushAsync as everything else, so if a flush is already running the
+    // update goes out on the next tick.
     public void PushNow(FDP2.FDR fdr)
     {
         if (OzServerMode.Disabled)
@@ -156,8 +125,8 @@ public class FdrSync
         CheckLanded(track);
 
         // Coupled flight plans only. A floating FDR (no coupled track) is reported where its flight
-        // plan track is - see FloatingSweep - not where some uncoupled return with the same callsign
-        // happens to be; CoupleAssist couples the two when they really are the same aircraft.
+        // plan track is - see FloatingSweep - not where an uncoupled return with the same callsign
+        // happens to be; CoupleAssist couples the two when they are the same aircraft.
         var fdr = track.CoupledFDR;
         if (string.IsNullOrEmpty(fdr?.Callsign))
             return;
@@ -188,20 +157,14 @@ public class FdrSync
             dto.AuthoritySector = sector;
     }
 
-    // Gates every push on this session's own relationship to the flight, checked fresh every time.
-    // Two ways to qualify:
+    // Gates every push, checked every time. A flight qualifies when:
     //
-    //  - this controller tracks it and it is activated (the original rule - see the class comment);
-    //  - nobody tracks it, and this controller holds its data authority: the sector vatSys names as
-    //    the FDR's ControllingSector is one of this session's controlled sectors. That is vatSys's
-    //    own rule for who may edit an untracked FDR (FDR.HavePermission), so exactly one online
-    //    controller answers for each such FDR - an activated tag still on the ground at YBBN is kept
-    //    up to date by whoever holds the sector its data authority sits in, and a completed one by
-    //    whoever holds it at the destination. Only activated (ESTed) or completed (STATE_FINISHED)
-    //    FDRs: a pre-active plan is not traffic yet.
+    //  - this controller tracks it and it is activated; or
+    //  - no OzServer controller tracks it, it is activated (ESTed) or completed (STATE_FINISHED),
+    //    and this session is the one responsible for reporting it (ResponsibleSectorForUntracked).
     //
-    // Connected as well: vatSys keeps delivering updates for a while after a disconnect, and what is
-    // queued then would be sent first on the next session - see the Disconnected handler above.
+    // Connected as well: vatSys keeps delivering updates for a while after a disconnect, and what
+    // is queued then would be sent first in the next session.
     bool ShouldPush(FDP2.FDR fdr)
     {
         if (!Network.IsConnected)
@@ -212,20 +175,21 @@ public class FdrSync
         if (fdr.IsTrackedByMe)
             return fdr.ESTed;
 
-        // Tracked by another OzServer controller: theirs to report. Tracked by someone who is not on
-        // OzServer at all (WAAF_CTR, say) is nobody's - so it is treated exactly like untracked below.
+        // Tracked by another OzServer controller: theirs to report. One tracked by a controller who
+        // is not on OzServer is treated as untracked below - see TrackedOutsideOzServer.
         if (fdr.IsTracked && !TrackedOutsideOzServer(fdr))
             return false;
 
-        // vatSys finishes an untracked FDR the moment its pilot drops off this client's picture - it
-        // cannot tell "left my visibility range" from "disconnected" (Network.ProcessRemovedPilot ->
-        // FDP2.CancelFDR). JST946 was finished at FL360 when CS1 cut its range to 10 nm, and CS_APP
-        // then reported it finished to everyone. A finish is only passed on when the aircraft was
-        // last seen down at its destination; anything else is this client losing sight of it, and
-        // the record is left as it was for a client that can still see it.
+        // vatSys finishes an untracked FDR when its pilot drops off this client's picture
+        // (Network.ProcessRemovedPilot -> FDP2.CancelFDR), whether the pilot disconnected or only
+        // left visibility range. A finish is passed on only when the aircraft was last seen down
+        // at its destination; otherwise the record is left for a client that can still see it.
         if (fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED && !IsCredibleFinish(fdr))
         {
-            if (!string.IsNullOrEmpty(fdr.Callsign) && FinishedOutOfView.TryAdd(fdr.Callsign, DateTime.UtcNow))
+            // Only when the pilot has gone from this client's picture. A finish made while they
+            // are still on it is a controller's, and is not one to bring back.
+            if (!string.IsNullOrEmpty(fdr.Callsign) && !IsPilotOnline(fdr.Callsign)
+                && FinishedOutOfView.TryAdd(fdr.Callsign, DateTime.UtcNow))
             {
                 ActionLog.Log("FDR", $"{fdr.Callsign} finished by vatSys out of view - not reported, kept active on OzServer", new
                 {
@@ -236,47 +200,37 @@ public class FdrSync
             return false;
         }
 
-        // An untracked FDR is only ever reported from a radar return: coupled to its track. A floating
-        // one - no coupled track - is the tracking controller's to report or nobody's; its flight plan
-        // position is a prediction, and the server's record of an untracked aircraft has to be where
-        // it really is. (A finish passed above came from the radar return too: seen landing.)
+        // An untracked FDR is reported only from a radar return, so it has to be coupled: a
+        // floating one's position is a prediction. (A finish that passed the test above was seen
+        // on radar too - see IsCredibleFinish.)
         if (fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED && fdr.CoupledTrack == null)
             return false;
 
         return ResponsibleSectorForUntracked(fdr, out _);
     }
 
-    // Landing seen on radar, reported to OzServer as completed.
+    // Landings seen on radar, reported to OzServer as completed.
     //
     // vatSys finishes an FDR on landing only at the instant it uncouples the track, and only if the
-    // aircraft is below 50 kt, within 2 nm of an assigned arrival runway's threshold and on the ground
-    // (RDP.TryAutoDeCouple -> TryAutoFinishFDR). Miss any of that - uncoupled still rolling out at
-    // 55 kt, no arrival runway set, a long runway - and it never looks again: QFA597 landed at YSSY
-    // and sat UNCONTROLLED at the aerodrome, on the map as if still flying, until it aged out.
+    // aircraft is then below 50 kt, on the ground and within 2 nm of an assigned arrival runway's
+    // threshold (RDP.TryAutoDeCouple -> TryAutoFinishFDR). A landing that misses any of those stays
+    // UNCONTROLLED at the aerodrome until its record ages out. So CheckLanded watches the radar
+    // return itself, and the flight is reported FINISHED from then on (see Merge). vatSys's own
+    // FDR is left alone: the tower may still be working the taxi, and finishing it would take the
+    // tag off their scope.
     //
-    // So the plugin watches the radar return itself: an activated, departed FDR whose aircraft is on
-    // the ground (within 200 ft of aerodrome elevation, or flagged on ground with no Mode C) below
-    // 50 kt within 4 nm of its destination is reported FINISHED, and from then on reported that way
-    // (see Merge) for as long as it is still that landing. vatSys's own FDR is left alone - the tower
-    // may still be working the taxi, and finishing it here would take the tag off their scope.
-    // Reported by whoever sees it and holds a sector (or tracks it); a finish is the same from anyone,
-    // so two reporting is harmless.
-    //
-    // Kept by callsign, with the flight that landed (its departure time and destination), because a
-    // callsign outlives a landing: an aircraft flying circuits takes off again on the same flight
-    // plan, and a turnaround files a new one under the same callsign. Held for the whole session, the
-    // first landing had every later push for that callsign - tracked ones included - reported as
-    // completed. So the landing is forgotten when the aircraft is at speed again (CheckLanded) or the
-    // callsign's flight plan is no longer the one that landed (ForgetLandingOfEarlierFlight). Either
-    // one being wrong costs nothing: still down at its destination, it is seen landed again within
-    // the next look.
+    // Keyed by callsign, with the flight that landed (ATD and destination), because a callsign
+    // outlives a landing: circuits take off again on the same flight plan, and a turnaround files
+    // a new one. The landing is forgotten when the aircraft is at speed again (CheckLanded) or the
+    // callsign carries another flight plan (ForgetLandingOfEarlierFlight). Forgetting it wrongly
+    // costs nothing: an aircraft still down at its destination is seen landed again.
     public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime Atd, string Destination)> Landed =
         new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, DateTime> _landingChecked = new(StringComparer.OrdinalIgnoreCase);
 
-    // A different flight plan under a callsign with a landing on record - the next leg, not yet
-    // departed or departed at another time, or bound somewhere else. Run before every push decision
-    // (ShouldPush), so the new flight is never reported with the old one's "completed".
+    // Forgets a landing when the callsign now carries a different flight plan - another departure
+    // time or destination. Run before every push decision (ShouldPush), so the new flight is never
+    // reported as completed.
     static void ForgetLandingOfEarlierFlight(FDP2.FDR fdr)
     {
         if (string.IsNullOrEmpty(fdr.Callsign) || !Landed.TryGetValue(fdr.Callsign, out var landed))
@@ -308,8 +262,8 @@ public class FdrSync
 
         if (track.GroundSpeed >= 50)
         {
-            // At speed again after a landing: a take-off roll. ContainsKey first - this runs for
-            // every moving track on every radar update, and almost none of them has landed.
+            // At speed again after a landing: a take-off roll. ContainsKey first, since this runs
+            // for every moving track on every radar update.
             if (Landed.ContainsKey(callsign!))
                 ForgetLanding(callsign!, "at speed again");
             return;
@@ -318,7 +272,7 @@ public class FdrSync
         if (Landed.ContainsKey(callsign!))
             return;
 
-        // Slow tracks are mostly aircraft sitting at gates; one look per callsign every 15 s.
+        // Slow tracks are mostly aircraft parked at gates: one look per callsign every 15 s.
         lock (_landingChecked)
         {
             if (_landingChecked.TryGetValue(callsign!, out var last) && DateTime.UtcNow - last < TimeSpan.FromSeconds(15))
@@ -341,7 +295,7 @@ public class FdrSync
 
         if (fdr == null || !fdr.ESTed || fdr.ATD == DateTime.MaxValue || string.IsNullOrEmpty(fdr.DesAirport))
             return;
-        // Someone else is tracking it: their client reports it.
+        // Tracked by another OzServer controller: their client reports it.
         if (fdr.IsTracked && !fdr.IsTrackedByMe && !TrackedOutsideOzServer(fdr))
             return;
         if (!fdr.IsTrackedByMe && _tracker.Owned.Count == 0)
@@ -366,7 +320,7 @@ public class FdrSync
         };
         FillPosition(dto, track);
         FillAuthority(dto, fdr);
-        // An untracked report has to name a sector this session holds - the nearest of them.
+        // An untracked report has to name a sector this session holds - see Choose.
         if (!fdr.IsTrackedByMe)
         {
             var mine = _tracker.Owned.Where(s => !s.IsDummy).ToList();
@@ -386,12 +340,11 @@ public class FdrSync
         });
     }
 
-    // Tracked by a controller who is not on OzServer - a neighbouring FIR's (WAAF_CTR), or anyone
-    // without the plugin. They will never report it, so for reporting it is as good as untracked: the
-    // OzServer controller responsible for it by the untracked rules keeps the record current. "Not on
-    // OzServer" is: they hold no OzServer sector, and no OzServer client is reporting itself as the
-    // flight's controller - the second so that an OzServer user holding nothing yet is not mistaken
-    // for an outsider.
+    // Tracked by a controller who is not on OzServer - a neighbouring FIR's, or anyone without the
+    // plugin. They never report it, so for reporting it counts as untracked and the untracked rules
+    // decide who keeps the record current. "Not on OzServer" means they hold no OzServer sector and
+    // no OzServer client reports itself as the flight's controller; the second test keeps an
+    // OzServer user who holds nothing yet from being taken for an outsider.
     bool TrackedOutsideOzServer(FDP2.FDR fdr)
     {
         var tracker = fdr.ControllerTracking?.Callsign;
@@ -409,9 +362,23 @@ public class FdrSync
     public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> FinishedOutOfView =
         new(StringComparer.OrdinalIgnoreCase);
 
-    // Landed, or as good as: last seen within 15 nm of its destination and below 3,000 ft above it
-    // (or on the ground). Uses the radar return when there still is one, otherwise vatSys's last
-    // predicted position - which, for an aircraft lost in the cruise, is nowhere near the ground.
+    // Whether vatSys has this pilot on its network picture. It drops a pilot before it finishes
+    // their FDR (Network.ProcessRemovedPilot), while the radar track coasts on for some 20 seconds
+    // - so this, not the presence of a track, says whether an aircraft is really in view.
+    public static bool IsPilotOnline(string callsign)
+    {
+        try
+        {
+            return Network.GetOnlinePilots?.Any(p => string.Equals(p.Callsign, callsign, StringComparison.OrdinalIgnoreCase)) == true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    // Landed, or as good as: within 15 nm of its destination, with a radar altitude less than
+    // 3,000 ft above it. An aircraft with no Mode C return never qualifies.
     static bool IsCredibleFinish(FDP2.FDR fdr)
     {
         if (string.IsNullOrEmpty(fdr.DesAirport) || Airspace2.GetAirport(fdr.DesAirport) is not { LatLong: { } destination } airport)
@@ -426,27 +393,22 @@ public class FdrSync
         return altitude != null && altitude < elevation + 3000;
     }
 
-    // Exactly one connected controller keeps each untracked activated (or completed) FDR current on
-    // the server, at all times - so its position there follows the aircraft on VATSIM even when the
-    // controller who was working it has gone. Only a controller who can actually see the aircraft
-    // counts: a client receives an aircraft's position only while it is inside that controller's
-    // visibility range, and one picked without it - CS_APP for JST946 at FL360, 94 nm out - would be
-    // left reporting a tag it never receives. Among those who can see it:
+    // One connected controller keeps each untracked activated (or completed) FDR current on the
+    // server, so its record follows the aircraft after its controller has gone. Only controllers
+    // who can see the aircraft count, since a client receives positions only inside its
+    // visibility range. Among those:
     //
-    //  1. whoever holds the sector the aircraft is in right now;
-    //  2. otherwise whoever holds the held sector nearest to it, by straight-line distance to that
-    //     sector's boundary (ties broken by sector name, so every client picks the same one).
+    //  1. whoever holds the sector the aircraft is in;
+    //  2. otherwise whoever holds the held sector nearest to it (ties broken by sector name, so
+    //     every client picks the same one).
     //
-    // "Can see it": for this session, it has a live radar track for the aircraft. For another
-    // controller, the aircraft is within their visibility range of their vis centre - the Position
-    // and Range vatSys has for them off the network, which is what VATSIM itself sends positions by.
-    // That uses only their main vis centre; extra vis points they may have only widen what they see,
-    // so when this is wrong it leaves two clients reporting (harmless - the server merges them) rather
-    // than none. A controller vatSys no longer lists as online does not count at all.
+    // This session sees the aircraft when it has a live radar track for it. Another controller is
+    // taken to see it when vatSys lists them online and it is within the Range of their Position -
+    // their main vis centre only, so an error leaves two clients reporting (the server merges
+    // them) rather than none.
     //
-    // The sector that decided it is returned for the push to carry (authority_sector) - always one
-    // this session holds when the answer is "us" - which is what the backend checks an untracked
-    // report against.
+    // Returns the deciding sector for the push to carry as authority_sector: one this session
+    // holds, which is what the backend checks an untracked report against.
     bool ResponsibleSectorForUntracked(FDP2.FDR fdr, out string? sectorName)
     {
         sectorName = null;
@@ -455,8 +417,7 @@ public class FdrSync
         if (!fdr.ESTed && fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED)
             return false;
 
-        // Not visible here: never ours, whatever anyone else can see.
-        // Where the aircraft is, by this client's own radar. No return here, never ours.
+        // Where the aircraft is, by this client's own radar. With no return here it is never ours.
         var seen = SectorLocator.LivePosition(fdr);
         if (seen == null)
             return false;
@@ -496,8 +457,7 @@ public class FdrSync
             return true;
         }
 
-        // Somebody else's - as far as this client can tell. See TakeOverIfStale for when that is not
-        // the end of it.
+        // Somebody else's, as far as this client can tell - unless they are not reporting it.
         return TakeOverIfStale(fdr, mine, position, chosen.Sector.Name, out sectorName);
     }
 
@@ -516,21 +476,18 @@ public class FdrSync
         return (nearest.Sector, nearest.Mine);
     }
 
-    // The watchdog. Choosing who reports an untracked aircraft is done from what this client can
-    // estimate about everyone else, and some of it can only be known on the other client: whether
-    // their vatSys has the aircraft coupled (they will not report an uncoupled one), whether their
-    // real coverage reaches it, whether their plugin can reach OzServer at all, and their own view of
-    // who holds what in the seconds after a change. Any of those can leave every client that sees the
-    // aircraft deferring to one that is not reporting it.
+    // The watchdog. The choice above rests on this client's estimate of the others, and it cannot
+    // know whether the chosen client has the aircraft coupled, has it within its real coverage,
+    // can reach OzServer, or agrees on who holds what. Any of those can leave every client that
+    // sees the aircraft deferring to one that is not reporting it.
     //
-    // So what the server actually received decides it. A client that can report the aircraft itself
-    // (it sees it, has it coupled, holds a sector) but was not chosen takes over when OzServer's
-    // record has not been updated for StaleAfter - or has no record at all - and keeps going while
-    // the record's last update came from one of its own sectors (authority_sector). The moment the
-    // chosen controller does report, its sector is on the record and this one stops. At worst that is
-    // two clients reporting for one scan interval, which the server merges.
+    // So the server's record decides. A client that was not chosen takes over when the record has
+    // not been updated for StaleAfter, or does not exist, and continues while the record's last
+    // update came from one of its own sectors (authority_sector). Once the chosen controller
+    // reports, its sector is on the record and this client stops; at worst two clients report for
+    // one scan interval.
     static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(30);
-    // Older than this and the snapshot says nothing about now - no takeover on its strength.
+    // A snapshot older than this says nothing about now, and no takeover is based on it.
     static readonly TimeSpan SnapshotUsableFor = TimeSpan.FromSeconds(60);
     readonly HashSet<string> _standingIn = new(StringComparer.OrdinalIgnoreCase);
 
@@ -556,7 +513,7 @@ public class FdrSync
             return false;
         }
 
-        // Reported as from the nearest of this session's own sectors, which is what the backend checks.
+        // Reported as from one of this session's own sectors, which is what the backend checks.
         sectorName = Choose(fdr, mine.Select(s => (Sector: s, Mine: true)).ToList(), position).Sector.Name;
 
         bool started;
@@ -588,10 +545,9 @@ public class FdrSync
     }
 
     // Floating FDRs this controller tracks - activated, no coupled radar track - are reported where
-    // vatSys draws their flight plan track, which moves along the route by itself and raises no FDR
-    // event as it does. Every FloatingEvery-th flush they are queued again with that position, so
-    // the map's box moves with vatSys's. Only tracked ones: ShouldPush never reports a floating FDR
-    // nobody tracks.
+    // vatSys draws their flight plan track, which moves along the route without raising an FDR
+    // event. Every FloatingEvery-th flush they are queued again with that position, so the map
+    // follows. Only tracked ones: ShouldPush rejects an unfinished floating FDR nobody tracks.
     const int FloatingEvery = 3; // x FlushInterval = every 15 s
 
     void FloatingSweep()
@@ -630,11 +586,10 @@ public class FdrSync
         }
     }
 
-    // Every SweepEvery-th flush, every FDR this session answers for is queued again in full. An
-    // untracked FDR parked at the gate, or one already completed, raises no FDR or radar events of
-    // its own, so without this it would age out of the backend (FDR_RETAIN_MINUTES) while still
-    // very much there - and an FDR whose data authority only just became ours (a sector claimed or
-    // handed over) would not appear until something about it happened to change.
+    // Every SweepEvery-th flush, every FDR this session answers for is queued again in full. An FDR
+    // that raises no events - parked at the gate, or completed - would otherwise age out of the
+    // backend (FDR_RETAIN_MINUTES), and one this session has just become responsible for (a sector
+    // claimed or handed over) would not appear until something about it changed.
     const int SweepEvery = 12; // x FlushInterval = once a minute
     int _flushCount;
 
@@ -673,8 +628,8 @@ public class FdrSync
         if (OzServerMode.Disabled)
             return;
 
-        // A landing stands for the server's record, whatever this client's vatSys still has the FDR
-        // as - until the callsign flies again (see Landed).
+        // A landing stands on the server's record, whatever state this client's vatSys still has
+        // the FDR in, until the callsign flies again (see Landed).
         if (Landed.ContainsKey(dto.Callsign))
             dto.State = nameof(FDP2.FDR.FDRStates.STATE_FINISHED);
 
@@ -687,17 +642,16 @@ public class FdrSync
         }
     }
 
-    // The label state last queued per tracked flight: scratchpad, global ops, and the "C"
-    // (see OzServerFdrUpdateDto.CPrompt). The C lives on the Track and vatSys raises nothing when a
-    // middle click flips it, so no FDR update ever carries the change - it has to be looked for.
-    // Checked once per flush, for this controller's own tags only (the only ones it reports these
-    // for), and queued only when something actually moved.
+    // The label state last queued per tracked flight: scratchpad, global ops and the "C" (see
+    // OzServerFdrUpdateDto.CPrompt). The C lives on the Track and vatSys raises nothing when a
+    // middle click toggles it, so no FDR update carries the change. It is looked for once per flush,
+    // on this controller's own tags only, and queued only when something has changed.
     readonly Dictionary<string, string> _labelStateKeys = new(StringComparer.OrdinalIgnoreCase);
 
     // Tags whose label this client must not speak for yet: just accepted from another controller,
     // with the previous controller's label still being read back (SectorTagHandoff.AcceptTransfer).
     // Until released, a push for one leaves the whole label out, as a non-tracking client's would.
-    // Expires on its own so a read that never completes cannot silence a tag for good.
+    // The hold expires by itself so a read that never completes cannot silence a tag for good.
     static readonly TimeSpan LabelHoldLimit = TimeSpan.FromSeconds(15);
     static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> LabelStateHeld =
         new(StringComparer.OrdinalIgnoreCase);
@@ -709,18 +663,12 @@ public class FdrSync
     static bool IsLabelStateHeld(string? callsign) =>
         !string.IsNullOrEmpty(callsign) && LabelStateHeld.TryGetValue(callsign!, out var until) && DateTime.UtcNow < until;
 
-    // Whether this session has taken over a tag's label from OzServer's record yet. Every way a tag
-    // becomes this controller's goes through here, not only the two that used to read the record
-    // back (a reconnect - TagResumeRecovery - and an OzServer transfer - SectorTagHandoff). A tag
-    // simply assumed in vatSys, after the controller who had it logged off, arrives with a bare
-    // label: vatSys only shares the CFL, scratchpad and global ops live, from whoever is tracking it
-    // at the time, and there was nobody. Its first push then stated that bare label as fact and
-    // erased the record - EFA69 on 16 Nov: CFL 350, "MEOW" and "SSSS" set by ML-ASP_CTR, gone the
-    // moment ML-BLA_CTR picked the tag up after ASP had logged off.
-    //
-    // So the label is left out of every push (as a non-tracking client's is) until the record has
-    // been read and anything it holds put into whatever the label is missing; only then does this
-    // client speak for it. Anything the controller has already typed is kept.
+    // Whether this session has taken over a tag's label from OzServer's record. A tag assumed in
+    // vatSys after its controller logged off arrives with a bare label - vatSys shares the CFL,
+    // scratchpad and global ops only live, from whoever is tracking the tag - and pushing that as
+    // fact would erase the record. So the label is left out of every push until the record has
+    // been read and anything it holds put into whatever the label is missing; what the controller
+    // has already typed is kept. This applies however the tag became this controller's.
     //
     // false while the read is in flight, true once done. Forgotten when the tag stops being ours, so
     // picking it up again reads the record again.
@@ -747,8 +695,8 @@ public class FdrSync
         }
         catch (Exception ex)
         {
-            // Taken over anyway: a label this client never speaks for is worse than one that starts
-            // from what the controller has in front of them.
+            // Taken over anyway: better to start from the label in front of the controller than
+            // never to speak for it.
             ActionLog.Log("FDR", $"Couldn't read {callsign}'s label from OzServer on pickup: {ex.Message}");
         }
 
@@ -780,7 +728,7 @@ public class FdrSync
             }
             finally
             {
-                // The next flush pushes the whole label (QueueLabelStateChanges has no key for it yet).
+                // The next flush pushes the whole label: QueueLabelStateChanges has no key for it.
                 LabelAdopted.TryUpdate(callsign, true, false);
             }
         });
@@ -789,17 +737,16 @@ public class FdrSync
     static void RunOnUiThread(Action action)
     {
         if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 
     void QueueLabelStateChanges()
     {
         // Copied first and guarded throughout, like the two sweeps above: this runs on the flush
-        // timer's thread while vatSys adds and removes FDRs on its own, and an enumeration that
-        // collided with one threw straight out of FlushAsync - the whole batch (every position and
-        // authority update queued behind it) then waited another five seconds, each time it happened.
+        // timer's thread while vatSys adds and removes FDRs, and an exception here would escape
+        // FlushAsync and hold the whole batch back until the next tick.
         List<FDP2.FDR> fdrs;
         try
         {
@@ -841,8 +788,8 @@ public class FdrSync
 
                 Merge(BuildFdrDto(fdr, forceRoute: false));
 
-                // Recorded only once the update is queued, so a read that failed part-way is looked
-                // at again on the next flush rather than remembered as already sent.
+                // Recorded only once the update is queued, so a read that failed part-way is retried
+                // on the next flush.
                 lock (_lock)
                     _labelStateKeys[fdr.Callsign] = key;
             }
@@ -853,19 +800,20 @@ public class FdrSync
         }
     }
 
+    const int MaxBatchSize = 200;
+
     async Task FlushAsync()
     {
         if (OzServerMode.Disabled)
             return;
 
-        // Leaves whatever's pending queued rather than dropping it - not connected right now just
-        // means nothing gets pushed yet, not that this update never happened. An unsupported server
-        // (see NetworkServer.Current) is the same: every push would fail before it was sent, and
-        // report that as an error every five seconds.
+        // Pending updates stay queued rather than being dropped. An unsupported server (see
+        // NetworkServer.Current) is treated like no connection: every push would fail before it
+        // was sent, and report an error on every flush.
         if (!Network.IsConnected || NetworkServer.Current == null)
             return;
 
-        // See _flushing - one batch in flight at a time, no overlapping pushes.
+        // One batch in flight at a time - see _flushing.
         if (Interlocked.CompareExchange(ref _flushing, 1, 0) != 0)
             return;
 
@@ -891,11 +839,14 @@ public class FdrSync
 
             try
             {
-                await _api.UpdateFdrBatchAsync(batch);
+                // In parts: the server takes at most 500 flights and 2 MB in one request, and a
+                // sweep carrying full routes for a busy session can pass either.
+                for (var offset = 0; offset < batch.Count; offset += MaxBatchSize)
+                    await _api.UpdateFdrBatchAsync(batch.Skip(offset).Take(MaxBatchSize));
             }
             catch (Exception ex)
             {
-                // Once per outage, not once per five-second flush - see ErrorThrottle.
+                // Once per outage rather than once per flush - see ErrorThrottle.
                 ErrorThrottle.Report("fdr-flush", $"Couldn't push FDR batch to OzServer: {ex.Message}", ex);
             }
         }
@@ -924,24 +875,16 @@ public class FdrSync
             SidStarString = NullIfEmpty(fdr.SIDSTARString),
             RunwayString = NullIfEmpty(fdr.RunwayString),
             DepartureRunway = NullIfEmpty(fdr.DepartureRunway?.Name),
-            // 0 is vatSys's own "not set" for these three, same spirit as the AssignedSSRCode/-1
-            // and ATD-ETD/DateTime.MaxValue sentinels below - never a real cleared/requested level
-            // or true airspeed in this context.
+            // 0 (or below) is vatSys's "not set" for these levels and for TAS, as -1 is for
+            // AssignedSSRCode and DateTime.MaxValue for ATD and ETD below.
             Rfl = fdr.RFL > 0 ? fdr.RFL : null,
             CflLower = fdr.CFLLower > 0 ? fdr.CFLLower : null,
             CflUpper = fdr.CFLUpper > 0 ? fdr.CFLUpper : null,
-            // Read straight off the FDR, so "no cleared level" here is a fact to report, not a gap
-            // in what this push knows - see OzServerFdrUpdateDto.CflLower.
-            //
-            // But only from the controller tracking it. The cleared level is that controller's own
-            // entry; a client reporting an untracked aircraft on OzServer's behalf (the untracked
-            // rules, a stand-in for a dropped controller) holds whatever its own copy happens to
-            // say, which after a disconnect is usually nothing. Stated as "none", that erased the
-            // CFL a disconnected controller had set - JST516 came back to ML-BLA_CTR with no level
-            // because ML-SNO_CTR had reported it in the meantime. Left unstated, the backend keeps
-            // what the tracking controller last said.
-            // And only once this session has taken the label over from OzServer's record - see
-            // LabelAdopted.
+            // Whether this push states the label as fact, "no cleared level" included - see
+            // OzServerFdrUpdateDto.CflLower. Only the tracking controller's client does: any other
+            // client's copy is usually empty, and stating it would erase what the tracking
+            // controller set. Also withheld until this session has taken the label over from
+            // OzServer's record (LabelAdopted) and while it is held (LabelStateHeld).
             ClearanceKnown = fdr.IsTrackedByMe && IsLabelAdopted(fdr) && !IsLabelStateHeld(fdr.Callsign),
             AssignedSsrCode = fdr.AssignedSSRCode == -1 ? null : fdr.AssignedSSRCode,
             Atd = fdr.ATD == DateTime.MaxValue ? null : fdr.ATD,
@@ -950,8 +893,8 @@ public class FdrSync
             Tas = fdr.TAS > 0 ? fdr.TAS : null,
             TextOnly = fdr.TextOnly,
             ReceiveOnly = fdr.ReceiveOnly,
-            // "" rather than null - a cleared scratchpad is a fact the tracking controller states (see
-            // OzServerFdrUpdateDto.LabelOpData). Not sent at all from anyone else.
+            // "" rather than null: a cleared scratchpad is a fact the tracking controller states
+            // (see OzServerFdrUpdateDto.LabelOpData). Serialised only when ClearanceKnown.
             LabelOpData = fdr.LabelOpData ?? "",
             GlobalOpData = fdr.GlobalOpData ?? "",
             Remarks = NullIfEmpty(fdr.Remarks),
@@ -1017,11 +960,9 @@ public class FdrSync
             };
 
             // A sector crossing, not a waypoint: vatSys inserts a ZPOINT segment wherever the
-            // predicted trajectory enters a volume (FDP2.CalculateAffectedSectors), named "Z" + the
-            // volume's name - ZMUN, ZMLTWR, ZYTCUZONE - with the volume itself in Tag. Told apart by
-            // the segment type, never the name: a volume can be called anything. The sector is
-            // vatSys's own answer for that volume (SectorsVolumes.FindSector), the same lookup its
-            // handoff window uses to pick the next sector.
+            // predicted trajectory enters a volume (FDP2.CalculateAffectedSectors), with the volume
+            // in Tag. Identified by segment type, never by name. The sector is vatSys's own answer
+            // for that volume (SectorsVolumes.FindSector), the lookup its handoff window uses.
             if (segment.Type == FDP2.FDR.ExtractedRoute.Segment.SegmentTypes.ZPOINT)
             {
                 point.Crossing = true;
@@ -1070,25 +1011,19 @@ public class FdrSync
         }
     }
 
-    // The geographic subsector fdr is physically inside of right now - a different question from
-    // who owns the tag (FillAuthority, above): resolved against the full SectorsVolumes.Sectors
-    // list rather than only sectors somebody has claimed, so this reports
-    // real geography regardless of whether anyone has actually claimed that sector on OzServer.
-    // Left null (and, via CopyNonNull's ordinary skip-null merge, simply not overwritten) when the
-    // aircraft isn't inside any known sector volume at its current position/level.
+    // The sector the aircraft is physically inside - a different question from who owns the tag
+    // (FillAuthority) - resolved against the full SectorsVolumes.Sectors list, whether or not anyone
+    // has claimed that sector on OzServer. Null when the aircraft is inside no known sector volume
+    // at its position and level; CopyNonNull then leaves any pending value in place.
     static void FillCurrentSector(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
     {
         dto.CurrentSector = SectorLocator.Resolve(fdr, SectorsVolumes.Sectors)?.Name;
     }
 
-    // A flight never coupled to a radar track - still climbing out of coverage, procedural, a
-    // non-radar environment - would otherwise never get any position pushed at all: only
-    // OnRadarTrackUpdate's FillPosition sets Lat/Lon, and it only ever fires once there's a track to
-    // report. Falls back to fdr.GetLocation()'s own PredictedPosition.Location branch - the same
-    // position vatSys itself draws the tag at - so there's always something for OzServer to show
-    // even before (or without) a live track. Once a track exists, this backs off entirely and leaves
-    // Lat/Lon to FillPosition, which reports the coupled track's own live position - the more
-    // authoritative of the two.
+    // A flight with no coupled radar track - out of coverage, procedural - gets no position from
+    // FillPosition, which runs only for a radar track. This reports fdr.GetLocation() instead: the
+    // predicted position vatSys draws the tag at. Once a track is coupled this does nothing, and
+    // the track's live position from FillPosition stands.
     static void FillPredictedPosition(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
     {
         if (fdr.CoupledTrack != null)
@@ -1102,15 +1037,15 @@ public class FdrSync
         dto.Lon = location.Longitude;
     }
 
-    // Called only once ShouldPush(fdr) has passed. A tracked push names this session; an untracked
-    // one (pushed because this session holds the data authority) names nobody, since nobody tracks
-    // it - null is what the backend and the map read as "no tag owner". Either way the data
-    // authority sector goes with it, which is what lets the backend accept the untracked report.
+    // A tracked push names this session; an untracked one names nobody - null is what the backend
+    // and the map read as "no tag owner". AuthoritySector is vatSys's controlling sector here;
+    // callers replace it on an untracked push (FillResponsibleSector, CheckLanded) with a sector
+    // this session holds, which is what the backend accepts an untracked report against.
     static void FillAuthority(OzServerFdrUpdateDto dto, FDP2.FDR fdr)
     {
         dto.AuthoritySector = fdr.ControllingSector?.Name;
-        // Who really tracks it, whoever that is - for a controller not on OzServer this is the only
-        // place their name reaches the record (controlling_* is OzServer's own authority, null here).
+        // Who tracks it in vatSys, whoever that is - for a controller not on OzServer this is the
+        // only place their callsign reaches the record (controlling_* is null for them).
         dto.TrackedBy = fdr.ControllerTracking?.Callsign ?? "";
 
         if (!fdr.IsTrackedByMe)
@@ -1120,8 +1055,8 @@ public class FdrSync
             return;
         }
 
-        // Left null when there is no identity yet rather than defaulted, because null is meaningful
-        // on this field: it is what the backend reads as "no datalink authority".
+        // Left null rather than defaulted when there is no identity yet: null is what the backend
+        // reads as "no tag owner".
         var me = NetworkIdentity.Current;
         if (me != null)
             dto.ControllingCid = me.Value.Cid;
@@ -1129,9 +1064,9 @@ public class FdrSync
         dto.ControllingCallsign = Network.Callsign;
     }
 
-    // RDP.RadarTrack uses sentinel values rather than nulls for "not set" - -1/-1.0 for
-    // CorrectedAltitude/GroundSpeed/Heading, -9999.0 for VerticalSpeed - left off the DTO (staying
-    // null) rather than sent as literal -1/-9999 readings.
+    // RDP.RadarTrack uses sentinels rather than nulls for "not set": -1 for CorrectedAltitude,
+    // GroundSpeed and Heading, -9999 for VerticalSpeed. Those are left null on the DTO rather than
+    // sent as readings.
     static void FillPosition(OzServerFdrUpdateDto dto, RDP.RadarTrack track)
     {
         if (track.LatLong != null)
@@ -1155,30 +1090,22 @@ public class FdrSync
         dto.OnGround = track.OnGround;
     }
 
-    // Copies every non-null property from source onto target - used to merge a newer, partial
-    // update (e.g. a radar-only position ping) into whatever's already pending for that callsign
-    // without blanking out fields the newer update simply doesn't know about. Reflection-based
-    // rather than a hand-written field list so a new OzServerFdrUpdateDto property is merged
-    // correctly without this having to be updated to match.
+    // Merges a newer update into the one already pending for the callsign: every non-null property
+    // of source overwrites target's, so a partial update (a radar-only position) does not blank
+    // fields it does not carry. Reflection-based, so a new OzServerFdrUpdateDto property is merged
+    // without a change here.
     //
-    // The two datalink-authority fields are copied as a unit, outside the shared skip-nulls loop
-    // below, rather than folded into MergeProperties: both producers (BuildFdrDto and the radar
-    // path) always run FillAuthority, which always sets them together to this session's own
-    // identity - see its own comment - so source's answer is always current and always meant to
-    // overwrite whatever target already had, never something to skip past because source "doesn't
-    // know" this round. ControllingCid is the one field of the two that can still land as null (see
-    // FillAuthority's int.TryParse), which is exactly why they're marked
-    // NullValueHandling.Include on OzServerFdrUpdateDto rather than trusted to the default
-    // skip-nulls serialization every other field gets.
+    // The two authority fields are copied as a unit, nulls included: every producer runs
+    // FillAuthority, so source's answer is current, and null is itself an answer ("no tag owner").
+    // That is also why they are marked NullValueHandling.Include on OzServerFdrUpdateDto.
     static void CopyNonNull(OzServerFdrUpdateDto source, OzServerFdrUpdateDto target)
     {
         target.ControllingCid = source.ControllingCid;
         target.ControllingCallsign = source.ControllingCallsign;
 
-        // The cleared level, likewise as a unit and likewise outside the skip-nulls loop - but only
-        // from a source that actually read it. A full FDR push's null means "no cleared level" and
-        // has to replace whatever is pending; a radar-only update's null means it never looked, and
-        // must not undo a clearance a fuller push has already queued.
+        // The label state is also copied as a unit, but only from a source that read it. A full
+        // FDR push's null means "no cleared level" and has to replace whatever is pending; a
+        // radar-only update's null means it never looked, and must not undo a queued clearance.
         if (source.ClearanceKnown)
         {
             target.ClearanceKnown = true;
