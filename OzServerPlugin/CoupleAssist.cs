@@ -78,26 +78,128 @@ public class CoupleAssist
         if (track.CoupledFDR != null)
             return;
 
-        var fdr = FDP2.GetFDRs.FirstOrDefault(f => string.Equals(f.Callsign, callsign, StringComparison.OrdinalIgnoreCase));
-        if (fdr == null
-            || fdr.CoupledTrack != null
-            || !fdr.ESTed                                   // not activated: not traffic yet
-            || fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
-            return;
+        var matches = FDP2.GetFDRs.Where(f => string.Equals(f.Callsign, callsign, StringComparison.OrdinalIgnoreCase)).ToList();
+        var fdr = matches.FirstOrDefault();
 
-        // Auto-couple was turned off for this flight on purpose, so it is never overridden. Logged
-        // once, so the log explains why the flight stays uncoupled.
+        // Every path below that leaves the track uncoupled says why, once per flight (see
+        // ExplainUncoupled) - JST372 departed uncoupled on 16 Nov with nothing in the log to say
+        // whether vatSys or this class had turned it down, or on what grounds.
+        if (fdr == null)
+        {
+            ExplainUncoupled(track, callsign, null, matches.Count, "no flight plan with its callsign");
+            return;
+        }
+        if (fdr.CoupledTrack != null)
+        {
+            ExplainUncoupled(track, callsign, fdr, matches.Count, "its flight plan is coupled to a different track");
+            return;
+        }
+        if (!fdr.ESTed)
+        {
+            ExplainUncoupled(track, callsign, fdr, matches.Count, "its flight plan is not activated");
+            return;
+        }
+        if (fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
+        {
+            ExplainUncoupled(track, callsign, fdr, matches.Count, "its flight plan is finished");
+            return;
+        }
+
+        // Auto-couple was turned off for this flight on purpose, so it is never overridden.
         if (fdr.InhibitAutoCouple)
         {
-            if (_inhibitLogged.Add(callsign))
-                ActionLog.Log("Couple", $"Not coupling {callsign} - auto-couple is turned off for it", new { action = "couple_assist_inhibited", fdr_callsign = callsign });
+            ExplainUncoupled(track, callsign, fdr, matches.Count, "auto-couple is turned off for it");
+            return;
+        }
+
+        if (WouldBeUncoupled(fdr, track))
+        {
+            ExplainUncoupled(track, callsign, fdr, matches.Count,
+                "Mode C-only return squawking a code other than the flight plan's - vatSys would uncouple it again");
             return;
         }
 
         Couple(fdr, track, "vatSys's auto-couple had not");
     }
 
-    static readonly HashSet<string> _inhibitLogged = new(StringComparer.OrdinalIgnoreCase);
+    // One line per flight per ExplainEvery, giving everything vatSys's auto-couple
+    // (RDP.TryAutoCouple) and this class decide on: the flight plan's state, code and auto-couple
+    // flag, the return's squawk and radar types, how many flight plans carry the callsign, and
+    // whether vatSys's route check (RDP.CheckForRAM) would accept the return.
+    static readonly TimeSpan ExplainEvery = TimeSpan.FromMinutes(5);
+    static readonly Dictionary<string, DateTime> _explained = new(StringComparer.OrdinalIgnoreCase);
+
+    static void ExplainUncoupled(RDP.RadarTrack track, string callsign, FDP2.FDR? fdr, int fdrCount, string reason)
+    {
+        lock (_explained)
+        {
+            if (_explained.TryGetValue(callsign, out var last) && DateTime.UtcNow - last < ExplainEvery)
+                return;
+            _explained[callsign] = DateTime.UtcNow;
+        }
+
+        var squawk = Octal(track.ActualAircraft?.TransponderCode);
+        var assigned = Octal(fdr?.AssignedSSRCode);
+        var onRoute = fdr != null ? OnRoute(track, fdr) : null;
+
+        var detail = fdr == null
+            ? $"squawking {squawk}, radar {track.RadarTypes}"
+            : $"{fdr.State}, auto-couple {(fdr.InhibitAutoCouple ? "off" : "on")}, " +
+              $"assigned {assigned}, squawking {squawk}, radar {track.RadarTypes}, " +
+              $"on route {(onRoute == null ? "unknown" : onRoute.Value ? "yes" : "no")}" +
+              (fdrCount > 1 ? $", {fdrCount} flight plans with this callsign" : "");
+
+        ActionLog.Log("Couple", $"Not coupling {callsign} - {reason} ({detail})", new
+        {
+            action = "couple_assist_declined",
+            reason,
+            fdr_callsign = callsign,
+            fdr_count = fdrCount,
+            state = fdr?.State.ToString(),
+            inhibit_auto_couple = fdr?.InhibitAutoCouple,
+            assigned_ssr = assigned,
+            squawk,
+            radar_types = track.RadarTypes.ToString(),
+            on_route = onRoute,
+            atd = fdr == null || fdr.ATD == DateTime.MaxValue ? null : (DateTime?)fdr.ATD,
+            ground_speed = track.GroundSpeed,
+            altitude = track.CorrectedAltitude,
+            lat = track.LatLong?.Latitude,
+            lon = track.LatLong?.Longitude
+        });
+    }
+
+    // SSR codes are held as the integer value of their octal digits.
+    static string? Octal(int? code) =>
+        code is int c && c >= 0 ? Convert.ToString(c, 8).PadLeft(4, '0') : null;
+
+    // vatSys's own route check, asked the way TryAutoCouple asks it: true when the return agrees
+    // with the flight plan's route. Private to vatSys, so reached by reflection; null if this
+    // vatSys build does not have it in that shape.
+    static readonly System.Reflection.MethodInfo? CheckForRam = typeof(RDP).GetMethod(
+        "CheckForRAM",
+        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static,
+        null,
+        new[] { typeof(RDP.RadarTrack), typeof(bool), typeof(List<FDP2.FDR.ExtractedRoute.Segment>), typeof(int) },
+        null);
+
+    static bool? OnRoute(RDP.RadarTrack track, FDP2.FDR fdr)
+    {
+        if (CheckForRam == null)
+            return null;
+        try
+        {
+            var route = fdr.ParsedRoute.ToList();
+            var stale = route.FindLastIndex(s => s.ETO < DateTime.UtcNow - TimeSpan.FromMinutes(30));
+            var start = Math.Max(Math.Min(stale, fdr.ParsedRoute.OverflownIndex), 0);
+            // CheckForRAM answers whether the return is off the route.
+            return !(bool)CheckForRam.Invoke(null, new object[] { track, true, route, start });
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     // The activation path. Activating a flight plan is the controller identifying the aircraft, so
     // one radar cycle after activation (vatSys's own chance first) an FDR still uncoupled is coupled
@@ -175,10 +277,14 @@ public class CoupleAssist
 
     static void Couple(FDP2.FDR fdr, RDP.RadarTrack track, string why)
     {
-        if (WouldBeUncoupled(fdr, track))
-            return;
-
         var callsign = fdr.Callsign;
+        if (WouldBeUncoupled(fdr, track))
+        {
+            ExplainUncoupled(track, callsign, fdr, 1,
+                "Mode C-only return squawking a code other than the flight plan's - vatSys would uncouple it again");
+            return;
+        }
+
         try
         {
             RDP.Couple(fdr, track);
