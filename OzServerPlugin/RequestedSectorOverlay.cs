@@ -17,7 +17,7 @@ namespace OzServerPlugin;
 //                                    Apply will give back. Soft red.
 //
 // OzServerSectorsWindow draws a swatch of each colour from IncomingColour, OutgoingColour and
-// ReleasingColour (SectorsView_DrawNode, the Owned heading), so the legend cannot drift from the
+// ReleasingColour (SectorsView_DrawNode, beside the three Requested Changes headings), so the legend cannot drift from the
 // highlight.
 //
 // Shown only while the Sectors window is open (SetRevealed). The highlight answers "which airspace

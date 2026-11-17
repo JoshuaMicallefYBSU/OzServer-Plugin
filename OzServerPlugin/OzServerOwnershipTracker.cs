@@ -195,15 +195,23 @@ public class OzServerOwnershipTracker
             RunOnUiThread(OnMmiSectorsControlledChanged);
     }
 
+    // Bumped on every disconnect. A resume settles only the session it was started for: one still
+    // waiting when the connection dropped (it waits up to 5 s for Network.Me, then up to the request
+    // timeout) would otherwise finish inside the next session and clear its _awaitingResume before
+    // that session's own resume had answered - letting the logon claim pre-empt a handover.
+    int _sessionGeneration;
+
     async Task ResumeThenClaimAsync()
     {
+        var generation = Volatile.Read(ref _sessionGeneration);
         try
         {
             await ResumePreviousSessionAsync();
         }
         finally
         {
-            ResumeSettled();
+            if (Volatile.Read(ref _sessionGeneration) == generation)
+                ResumeSettled();
         }
     }
 
@@ -277,6 +285,7 @@ public class OzServerOwnershipTracker
             lock (_droppedSubSectors)
                 _droppedDisconnectedAt = DateTime.UtcNow;
 
+            Interlocked.Increment(ref _sessionGeneration);
             _awaitingLogonGrant = true;
             _awaitingResume = true;
 

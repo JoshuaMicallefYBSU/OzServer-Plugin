@@ -101,6 +101,27 @@ public class TagResumeRecovery
         }
     }
 
+    // A tag this resume already restored that vatSys let go again moments later without the
+    // controller dropping it (FdrSync.ResumedTagLost). Worked like any outstanding tag: the retry
+    // timer takes it back once its sector is in MMI again - usually the next pass, as the tracker
+    // puts a sector it still owns back (ReconcileMmiWithOwned). Not attempted here: this runs inside
+    // vatSys's FDR update, and the sector is usually still missing at that moment.
+    static readonly TimeSpan RetakeWindow = TimeSpan.FromSeconds(30);
+
+    public void Retake(string callsign)
+    {
+        if (OzServerMode.Disabled || string.IsNullOrEmpty(callsign))
+            return;
+
+        lock (_gate)
+        {
+            _pending[callsign] = "lost again after its restore";
+            var until = DateTime.UtcNow + RetakeWindow;
+            if (_deadline < until)
+                _deadline = until;
+        }
+    }
+
     // A restored tag comes back with a bare label: the CFL and the C are vatSys's local state, and
     // the scratchpad and global ops are only sent by whoever is tracking the tag - nobody, while
     // this controller was away. OzServer has all of it (FdrSync pushes it), so it is read back.

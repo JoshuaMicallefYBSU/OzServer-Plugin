@@ -563,14 +563,15 @@ public class OzServerApiClient
     public Task UpdateFdrBatchAsync(IEnumerable<OzServerFdrUpdateDto> flights) =>
         PostAsync("/fdr/batch", new { flights = flights.ToArray() });
 
-    // One flight's server-side record. Accepting jurisdiction moves who is tracking a tag, not
-    // vatSys's local FDR fields, so the clearance data (CFL in particular) a previous controller
-    // entered is fetched and applied by hand - see SectorTagHandoff.ApplyClearanceDataAsync. Null
-    // on a 404: no record yet is an ordinary case, not a failure.
     // Deletes a flight's record because its owning controller cancelled the FDR - see
     // FdrSync.ReportOwnerCancel. The backend refuses (403) anyone but the owner.
     public Task CancelFlightAsync(string callsign) =>
         PostAsync($"/fdr/{Uri.EscapeDataString(callsign)}/cancel");
+
+    // One flight's server-side record. Accepting jurisdiction moves who is tracking a tag, not
+    // vatSys's local FDR fields, so the clearance data (CFL in particular) a previous controller
+    // entered is fetched and applied by hand - see SectorTagHandoff.ApplyClearanceDataAsync. Null
+    // on a 404: no record yet is an ordinary case, not a failure.
 
     public async Task<OzServerFdrUpdateDto?> GetFlightAsync(string callsign)
     {

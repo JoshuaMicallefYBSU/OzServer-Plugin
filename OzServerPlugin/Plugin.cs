@@ -106,6 +106,8 @@ public class Plugin : IPlugin
         _fdrSync = new FdrSync(_ownershipTracker);
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
+        // A restored tag vatSys let go again moments later, not by the controller's hand.
+        _fdrSync.ResumedTagLost += callsign => _tagResumeRecovery.Retake(callsign);
         _fdrResumeActivation = new FdrResumeActivation();
         _labelStateMirror = new LabelStateMirror();
         // After the tracker, whose OwnershipChanged tells it a sector moved.

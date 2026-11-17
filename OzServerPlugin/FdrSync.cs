@@ -54,6 +54,7 @@ public class FdrSync
     {
         _tracker = tracker;
         _flushTimer = new Timer(_ => _ = FlushAsync(), null, FlushInterval, FlushInterval);
+        _tracker.TagsResumed += (_, callsigns) => NoteResume(callsigns);
 
         // Whatever is still queued belongs to the session that ended. FlushAsync holds it while
         // disconnected, so unless cleared it would go out after reconnecting - naming this
@@ -76,6 +77,12 @@ public class FdrSync
             LabelStateRestore.ForgetAllPending();
             lock (_trackedHere)
                 _trackedHere.Clear();
+            lock (_resumeGate)
+            {
+                _resumedAt = DateTime.MinValue;
+                _resumedTags.Clear();
+                _heldAfterResume.Clear();
+            }
             lock (_outsideLabel)
                 _outsideLabel.Clear();
             lock (_lastRadarPush)
@@ -96,6 +103,9 @@ public class FdrSync
         // as a drop first, the record would no longer name them as its owner by the time the
         // delete went out.
         if (ReportOwnerCancel(fdr))
+            return;
+
+        if (HoldLostResumedTag(fdr))
             return;
 
         if (ReportDrop(fdr))
@@ -201,7 +211,8 @@ public class FdrSync
         {
             if (fdr.IsTrackedByMe)
             {
-                _trackedHere.Add(fdr.Callsign);
+                if (_trackedHere.Add(fdr.Callsign))
+                    StampRestored(fdr.Callsign);
                 return false;
             }
             wasMine = _trackedHere.Remove(fdr.Callsign);
@@ -211,17 +222,201 @@ public class FdrSync
         if (!wasMine || fdr.IsTracked || !Network.IsConnected)
             return false;
 
-        var dto = BuildFdrDto(fdr, forceRoute: false);
-        dto.Dropped = true;
-        Merge(dto);
+        if (SuppressDropAfterResume(fdr))
+            return true;
 
+        SendDrop(fdr);
+
+        var where = DescribeSector(fdr);
         ActionLog.Log("FDR", $"Dropped {fdr.Callsign} - it will not be picked up automatically", new
         {
             action = "fdr_dropped",
             fdr_callsign = fdr.Callsign,
-            state = fdr.State.ToString()
+            state = fdr.State.ToString(),
+            // A drop whose sector is held on OzServer but missing from vatSys is probably not the
+            // controller's own (see ResumedTagGrace) - recorded so such drops can be found outside
+            // the grace window too.
+            seconds_since_resume = SecondsSinceResume(),
+            owned_sector = where.Sector,
+            sector_in_vatsys = where.InVatsys,
+            owned_missing_from_vatsys = where.MissingFromVatsys
         });
         return true;
+    }
+
+    void SendDrop(FDP2.FDR fdr)
+    {
+        var dto = BuildFdrDto(fdr, forceRoute: false);
+        dto.Dropped = true;
+        Merge(dto);
+    }
+
+    // A tag put back by a resume (TagResumeRecovery) can be lost again within seconds without the
+    // controller doing anything. BN-ISA_CTR, 17 Nov 2026: JST113 and QFA1894 were restored, then
+    // 0.3 s later VatpacPlugin's Sectors.CheckActive - run by AFV loading the frequencies - took TRS
+    // out of MMI.SectorsControlled, vatSys let both tags go, and ReportDrop sent them as dropped.
+    // OzServerOwnershipTracker put TRS back 70 ms later, but a dropped tag is never picked up again.
+    //
+    // So for ResumedTagGrace after a resumed tag is first tracked again, losing it is not treated as
+    // a drop. Nothing is pushed for it - an untracked push from the recorded controller clears the
+    // tag on the server just as a drop does - and TagResumeRecovery is asked to take it back. Should
+    // it not be back within ResumedTagHold, the drop is reported after all.
+    //
+    // Every case is logged under TagLossCategory, which is forwarded to OzServer like every line, so
+    // how often this happens can be measured. Each tag is protected once per resume: a tag lost
+    // again after being taken back is an ordinary drop.
+    static readonly TimeSpan ResumedTagGrace = TimeSpan.FromSeconds(30);
+    static readonly TimeSpan ResumedTagHold = TimeSpan.FromSeconds(30);
+    public const string TagLossCategory = "TagLoss";
+
+    // Raised, on the thread of the FDR update, for a resumed tag lost within ResumedTagGrace.
+    public event Action<string>? ResumedTagLost;
+
+    readonly object _resumeGate = new();
+    DateTime _resumedAt = DateTime.MinValue;
+    // Tags the latest resume handed back, each with when this session first tracked it again
+    // (MinValue until then).
+    readonly Dictionary<string, DateTime> _resumedTags = new(StringComparer.OrdinalIgnoreCase);
+    // Tags lost within the grace window and not yet back: when each was lost.
+    readonly Dictionary<string, DateTime> _heldAfterResume = new(StringComparer.OrdinalIgnoreCase);
+
+    void NoteResume(IReadOnlyList<string> callsigns)
+    {
+        lock (_resumeGate)
+        {
+            _resumedAt = DateTime.UtcNow;
+            _resumedTags.Clear();
+            _heldAfterResume.Clear();
+            foreach (var callsign in callsigns.Where(c => !string.IsNullOrEmpty(c)))
+                _resumedTags[callsign] = DateTime.MinValue;
+        }
+    }
+
+    void StampRestored(string callsign)
+    {
+        lock (_resumeGate)
+        {
+            if (_resumedTags.TryGetValue(callsign, out var restoredAt) && restoredAt == DateTime.MinValue)
+                _resumedTags[callsign] = DateTime.UtcNow;
+        }
+    }
+
+    double? SecondsSinceResume()
+    {
+        lock (_resumeGate)
+            return _resumedAt == DateTime.MinValue ? null : Math.Round((DateTime.UtcNow - _resumedAt).TotalSeconds, 1);
+    }
+
+    bool SuppressDropAfterResume(FDP2.FDR fdr)
+    {
+        var now = DateTime.UtcNow;
+        DateTime restoredAt;
+        lock (_resumeGate)
+        {
+            if (!_resumedTags.TryGetValue(fdr.Callsign, out restoredAt)
+                || restoredAt == DateTime.MinValue
+                || now - restoredAt > ResumedTagGrace)
+                return false;
+
+            // Once per resume - see ResumedTagGrace.
+            _resumedTags.Remove(fdr.Callsign);
+            _heldAfterResume[fdr.Callsign] = now;
+        }
+
+        var where = DescribeSector(fdr);
+        ActionLog.Log(TagLossCategory, $"{fdr.Callsign} lost {(now - restoredAt).TotalSeconds:0.0}s after being restored on reconnect - not reported as dropped, taking it back", new
+        {
+            action = "resumed_tag_lost",
+            fdr_callsign = fdr.Callsign,
+            state = fdr.State.ToString(),
+            seconds_since_restored = Math.Round((now - restoredAt).TotalSeconds, 1),
+            seconds_since_resume = SecondsSinceResume(),
+            owned_sector = where.Sector,
+            sector_in_vatsys = where.InVatsys,
+            owned_missing_from_vatsys = where.MissingFromVatsys
+        });
+
+        ResumedTagLost?.Invoke(fdr.Callsign);
+        return true;
+    }
+
+    // True while a resumed tag lost within the grace window is held back (see ResumedTagGrace):
+    // nothing is pushed for it. Ends when it is tracked again, by this controller or another, or
+    // when ResumedTagHold runs out - and then the drop is reported after all.
+    bool HoldLostResumedTag(FDP2.FDR fdr)
+    {
+        DateTime lostAt;
+        lock (_resumeGate)
+        {
+            if (!_heldAfterResume.TryGetValue(fdr.Callsign, out lostAt))
+                return false;
+        }
+
+        var held = DateTime.UtcNow - lostAt;
+        string outcome;
+        if (fdr.IsTrackedByMe)
+            outcome = "retaken";
+        else if (fdr.IsTracked)
+            outcome = "tracked_by_other";
+        else if (!Network.IsConnected)
+            outcome = "disconnected";
+        else if (held > ResumedTagHold)
+            outcome = "expired";
+        else
+            return true;
+
+        lock (_resumeGate)
+        {
+            // Settled by another thread meanwhile (FDR and radar updates arrive on different ones).
+            if (!_heldAfterResume.Remove(fdr.Callsign))
+                return outcome != "retaken" && outcome != "tracked_by_other";
+        }
+
+        var message = outcome switch
+        {
+            "retaken" => $"{fdr.Callsign} taken back {held.TotalSeconds:0.0}s after it was lost",
+            "tracked_by_other" => $"{fdr.Callsign} not taken back - now tracked by {fdr.ControllerTracking?.Callsign ?? "another controller"}",
+            "disconnected" => $"{fdr.Callsign} not taken back - disconnected first",
+            _ => $"{fdr.Callsign} not taken back within {ResumedTagHold.TotalSeconds:0}s - reported as dropped"
+        };
+        ActionLog.Log(TagLossCategory, message, new
+        {
+            action = "resumed_tag_lost_" + outcome,
+            fdr_callsign = fdr.Callsign,
+            state = fdr.State.ToString(),
+            seconds_held = Math.Round(held.TotalSeconds, 1)
+        });
+
+        if (outcome == "expired")
+        {
+            SendDrop(fdr);
+            return true;
+        }
+
+        // Tracked again by someone: the ordinary pushes carry on (ReportDrop records this session
+        // tracking it again). Disconnected: nothing more is sent.
+        return outcome == "disconnected";
+    }
+
+    // The OzServer sector of this controller's the aircraft is in, whether vatSys still has it in
+    // MMI.SectorsControlled, and every OzServer sector of theirs vatSys is missing. Compared by
+    // name: two instances of the same sector compare unequal.
+    (string? Sector, bool? InVatsys, string[] MissingFromVatsys) DescribeSector(FDP2.FDR fdr)
+    {
+        try
+        {
+            var owned = _tracker.Owned.ToList();
+            var inMmi = new HashSet<string>(MMI.SectorsControlled.Select(s => s.Name), StringComparer.OrdinalIgnoreCase);
+            var sector = SectorLocator.Resolve(fdr, owned);
+            return (sector?.Name,
+                    sector == null ? null : inMmi.Contains(sector.Name),
+                    owned.Where(s => !inMmi.Contains(s.Name)).Select(s => s.Name).ToArray());
+        }
+        catch (Exception ex)
+        {
+            ActionLog.Log(TagLossCategory, $"Couldn't work out {fdr.Callsign}'s sector: {ex.Message}");
+            return (null, null, Array.Empty<string>());
+        }
     }
 
     // Sends without waiting for the flush timer. A change of authority cannot ride the next batch:
@@ -279,6 +474,10 @@ public class FdrSync
                 return;
             _lastRadarPush[fdr.Callsign] = now;
         }
+
+        // An untracked report would clear the tag on the server just as a drop does.
+        if (HoldLostResumedTag(fdr!))
+            return;
 
         if (!ShouldPush(fdr!))
             return;
@@ -1055,10 +1254,12 @@ public class FdrSync
                     ActionLog.Log("FDR", $"Deleted {callsign} from OzServer - cancelled by its controller",
                         new { action = "fdr_owner_cancel_sent", fdr_callsign = callsign });
                 }
-                catch (OzServerApiException ex) when (ex.StatusCode is 403 or 404)
+                catch (OzServerApiException ex) when (ex.StatusCode is >= 400 and < 500)
                 {
-                    // Not ours by the server's record, or already gone: nothing to retry. The
-                    // record ages out as it would have.
+                    // Not ours by the server's record (403), already gone (404), or refused
+                    // outright: asking again gets the same answer, and while the callsign stays
+                    // pending nothing more is sent for it (see Merge). The record ages out as it
+                    // would have.
                     ActionLog.Log("FDR", $"OzServer didn't delete {callsign}: {ex.Message}",
                         new { action = "fdr_owner_cancel_refused", fdr_callsign = callsign, status = ex.StatusCode });
                 }
