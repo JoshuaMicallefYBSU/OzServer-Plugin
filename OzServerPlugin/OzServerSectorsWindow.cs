@@ -43,7 +43,7 @@ public class OzServerSectorsWindow : BaseForm
     // are shaded with on the scope (RequestedSectorOverlay): green, yellow, red. Matched by text
     // throughout, so the wording lives only here.
     const string RequestedByMeName = "Request Sector Jurisdiction";
-    const string RequestedFromMeName = "Transfer Sector Authority";
+    const string RequestedFromMeName = "Release Sector Jurisdiction";
     const string DropSectorsName = "Drop Sectors";
     const string NoSectorsToDrop = "No sectors to drop";
     // Plain ASCII rather than an arrow glyph: vatSys's UI font (Terminus, the GenericButton
@@ -229,7 +229,7 @@ public class OzServerSectorsWindow : BaseForm
             ShowNodeToolTips = true,
             ShowPlusMinus = false,
             ShowRootLines = false,
-            Size = new Size(265, 324),
+            Size = new Size(265, 330),
             TabIndex = 4,
             BackColor = Colours.GetColour(Colours.Identities.WindowBackground),
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText)
@@ -255,7 +255,7 @@ public class OzServerSectorsWindow : BaseForm
             ShowNodeToolTips = true,
             ShowPlusMinus = false,
             ShowRootLines = false,
-            Size = new Size(265, 324),
+            Size = new Size(265, 330),
             TabIndex = 5,
             BackColor = Colours.GetColour(Colours.Identities.WindowBackground),
             ForeColor = Colours.GetColour(Colours.Identities.InteractiveText)
@@ -304,7 +304,7 @@ public class OzServerSectorsWindow : BaseForm
             Location = new Point(3, 3),
             Margin = new Padding(3, 3, 1, 3),
             Name = "availInsetPanel",
-            Size = new Size(270, 331),
+            Size = new Size(270, 337),
             TabIndex = 0
         };
         _availInsetPanel.Controls.Add(_availSectorsView);
@@ -314,7 +314,7 @@ public class OzServerSectorsWindow : BaseForm
             Location = new Point(3, 3),
             Margin = new Padding(3, 3, 1, 3),
             Name = "currInsetPanel",
-            Size = new Size(270, 331),
+            Size = new Size(270, 337),
             TabIndex = 0
         };
         _currInsetPanel.Controls.Add(_currSectorsView);
@@ -339,7 +339,7 @@ public class OzServerSectorsWindow : BaseForm
             Name = "availScrollBar",
             Orientation = ScrollOrientation.VerticalScroll,
             PreferredHeight = 10,
-            Size = new Size(20, 331),
+            Size = new Size(20, 337),
             TabIndex = 1,
             Text = "availScrollBar",
             Value = 0,
@@ -360,7 +360,7 @@ public class OzServerSectorsWindow : BaseForm
             Name = "currScrollBar",
             Orientation = ScrollOrientation.VerticalScroll,
             PreferredHeight = 10,
-            Size = new Size(20, 331),
+            Size = new Size(20, 337),
             TabIndex = 1,
             Text = "currScrollBar",
             Value = 0,
@@ -396,7 +396,7 @@ public class OzServerSectorsWindow : BaseForm
         {
             Location = new Point(628, 20),
             Name = "addRemoveLayoutPanel",
-            Size = new Size(298, 337),
+            Size = new Size(298, 343),
             TabIndex = 15
         };
         _addRemoveLayoutPanel.Controls.Add(_availInsetPanel);
@@ -406,7 +406,7 @@ public class OzServerSectorsWindow : BaseForm
         {
             Location = new Point(3, 20),
             Name = "currSectorsFlowPanel",
-            Size = new Size(298, 337),
+            Size = new Size(298, 343),
             TabIndex = 12
         };
         _currSectorsFlowPanel.Controls.Add(_currInsetPanel);
@@ -500,7 +500,7 @@ public class OzServerSectorsWindow : BaseForm
             Name = "requestedChangesLabel",
             Size = new Size(184, 17),
             TabIndex = 19,
-            Text = "Requested Changes",
+            Text = "Planned Changes",
             TextAlign = ContentAlignment.MiddleCenter
         };
 
@@ -1498,14 +1498,17 @@ public class OzServerSectorsWindow : BaseForm
         // releasing a group releases the sub-sectors it covers.
         var blockedByRequest = ownedSelected && ownedNode != null && HasOutstandingRequest(ownedNode);
 
-        // Reads only the Owned and Available trees. A row in Requested is a request in flight,
-        // which Accept and Reject decide; the arrow only moves sectors between the lists.
-        _arrowButton.Text = ownedSelected ? ArrowRight : availSelected ? ArrowLeft : ArrowIdle;
+        // A planned drop selected under Drop Sectors: the arrow points back at Owned and cancels
+        // it. Any other row in Planned Changes is a request in flight, which Accept and Reject
+        // decide.
+        var dropSelected = SelectedDropRoot() != null;
+
+        _arrowButton.Text = ownedSelected ? ArrowRight : (availSelected || dropSelected) ? ArrowLeft : ArrowIdle;
 
         // Disabled rather than hidden when blocked by a request: it is the right control, and
         // works again as soon as the request is answered.
         _arrowButton.Enabled = !_applyRunning && !_requestActionRunning
-                               && (ownedSelected || availSelected) && !blockedByRequest;
+                               && (ownedSelected || availSelected || dropSelected) && !blockedByRequest;
 
         // Hidden while an incoming request is selected. That is an Accept-or-Reject decision, and a
         // greyed arrow would still read as the control for what is being looked at.
@@ -2515,9 +2518,28 @@ public class OzServerSectorsWindow : BaseForm
         UpdateArrowButton();
     }
 
+    // The staged release a selected Drop Sectors row belongs to: the row under the heading itself.
+    // A member nested under a released group means that group, since the release is the group's.
+    // Null when nothing under Drop Sectors is selected.
+    SectorsVolumes.Sector? SelectedDropRoot()
+    {
+        var node = _requestedChangesView.SelectedNode;
+        if (node?.Tag is not SectorsVolumes.Sector || CategoryNameOf(node) != DropSectorsName)
+            return null;
+
+        while (node.Parent?.Parent != null)
+            node = node.Parent;
+
+        return node.Tag as SectorsVolumes.Sector;
+    }
+
     void ArrowButton_Click(object? sender, EventArgs e)
     {
-        if (_currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector ownedSector)
+        // Cancels a planned drop: the sector goes back into Owned with the group it took with it,
+        // as moving it back from Available would.
+        if (SelectedDropRoot() is { } dropped)
+            RunSectorAction(dropped, add: true);
+        else if (_currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector ownedSector)
             RunSectorAction(ownedSector, add: false);
         else if (_availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector availSector)
             RunSectorAction(availSector, add: true);

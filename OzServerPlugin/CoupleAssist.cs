@@ -288,6 +288,9 @@ public class CoupleAssist
         try
         {
             RDP.Couple(fdr, track);
+            // Queued behind the position report RDP.Couple has just queued on the same FDR, so it
+            // sees what that report did - see DepartIfVatSysDidNot.
+            fdr.TaskQueue.QueueTask(() => DepartIfVatSysDidNot(fdr, track));
             ActionLog.Log("Couple", $"Coupled {callsign} to its radar track - {why}", new
             {
                 action = "couple_assist",
@@ -303,6 +306,57 @@ public class CoupleAssist
         catch (Exception ex)
         {
             ErrorThrottle.Report("couple-assist", $"Couldn't couple {callsign} to its radar track: {ex.Message}", ex);
+        }
+    }
+
+    // vatSys records a departure when a coupled return is on the flight plan's route: its
+    // automatic position report (RDP.AutomaticPositionReport) gives the route point the aircraft
+    // is at an actual time and works the ATD back from it. Off the route (RDP.CheckForRAM) no
+    // point gets a time, and the flight stays undeparted. vatSys's own auto-couple never couples
+    // an off-route return, so it never meets this; this class does, by callsign. NBL334 departed
+    // YMHB pre-active, was activated off its route, was coupled here, and stayed undeparted with
+    // the Depart menu item still offered.
+    //
+    // So, once vatSys's report has run: an airborne flight still without an ATD is departed the
+    // way the position report would have done it - FDP2.DepartFDR, messages and all, so other
+    // controllers see the departure. The ATD is worked back from the distance flown from the
+    // departure aerodrome at the current ground speed, or is now if that cannot be known.
+    static void DepartIfVatSysDidNot(FDP2.FDR fdr, RDP.RadarTrack track)
+    {
+        try
+        {
+            if (fdr.ATD != DateTime.MaxValue || fdr.CoupledTrack != track || !fdr.ESTed
+                || fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
+                return;
+            if (track.OnGround || track.GroundSpeed < MinGroundSpeed)
+                return;
+
+            var atd = DateTime.UtcNow;
+            if (Airspace2.GetAirport(fdr.DepAirport) is { LatLong: { } departure } && track.LatLong != null)
+            {
+                var flownNm = Conversions.CalculateDistance(departure, track.LatLong);
+                // A flight further out than an hour at this speed was not seen leaving: the
+                // estimate would be guesswork, so it is departed now.
+                var flown = TimeSpan.FromHours(flownNm / track.GroundSpeed);
+                if (flown < TimeSpan.FromHours(1))
+                    atd = track.Timestamp - flown;
+            }
+
+            FDP2.DepartFDR(fdr, atd);
+
+            ActionLog.Log("Couple", $"Departed {fdr.Callsign} at {atd:HHmm}Z - coupled off its route, so vatSys had not", new
+            {
+                action = "couple_assist_departed",
+                fdr_callsign = fdr.Callsign,
+                atd,
+                dep_airport = fdr.DepAirport,
+                ground_speed = track.GroundSpeed,
+                altitude = track.CorrectedAltitude
+            });
+        }
+        catch (Exception ex)
+        {
+            ErrorThrottle.Report("couple-assist-depart", $"Couldn't record {fdr.Callsign}'s departure: {ex.Message}", ex);
         }
     }
 

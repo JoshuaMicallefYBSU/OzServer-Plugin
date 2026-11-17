@@ -65,6 +65,8 @@ public class FdrSync
             lock (_lock)
             {
                 _pending.Clear();
+                // Sent under this session's identity or not at all; the record then ages out.
+                _pendingCancels.Clear();
                 // A new session resends every route and every tag's label state.
                 _sentRouteKeys.Clear();
                 _labelStateKeys.Clear();
@@ -90,6 +92,12 @@ public class FdrSync
         if (string.IsNullOrEmpty(fdr.Callsign))
             return;
 
+        // Ahead of ReportDrop: a cancel also stops this controller tracking the tag, and reported
+        // as a drop first, the record would no longer name them as its owner by the time the
+        // delete went out.
+        if (ReportOwnerCancel(fdr))
+            return;
+
         if (ReportDrop(fdr))
             return;
 
@@ -101,6 +109,82 @@ public class FdrSync
 
     static readonly TimeSpan RadarEvery = TimeSpan.FromSeconds(2);
     readonly Dictionary<string, DateTime> _lastRadarPush = new(StringComparer.OrdinalIgnoreCase);
+
+    // Callsigns whose record is to be deleted on the next flush, after the batch - see FlushAsync.
+    // Guarded by _lock with _pending.
+    readonly HashSet<string> _pendingCancels = new(StringComparer.OrdinalIgnoreCase);
+    // FDRs this session has cancelled on the server. Held by reference: vatSys keeps a finished FDR
+    // for ten minutes and builds a new one if the pilot files again, and that one is reported as
+    // usual. Nothing more is sent for a cancelled one unless it is activated again.
+    readonly HashSet<FDP2.FDR> _cancelled = new();
+    static readonly TimeSpan CancelRecent = TimeSpan.FromSeconds(30);
+
+    // The controller who owns a flight cancelled its FDR - Finish in the aircraft menu, or Cancel
+    // in the flight plan window, both FDP2.CancelFDR. Its record is deleted from OzServer rather
+    // than left as completed for FDR_RETAIN_MINUTES, so nobody's client picks it back up.
+    //
+    // Told apart from a pilot disconnecting, which must keep the record for those 15 minutes in
+    // case they reconnect: vatSys cancels for a disconnect only once the pilot has gone from its
+    // picture (Network.ProcessRemovedPilot - at once for an untracked flight, after ten minutes for
+    // a tracked one). A controller cancels with the pilot still online. Also not a landing: vatSys
+    // finishes a coupled flight by itself on touchdown (RDP.TryAutoFinishFDR), and that stays a
+    // completed record (see Landed).
+    //
+    // "Owns" is this session tracking the tag up to the cancel (CancelFDR stops the tracking), or
+    // OzServer naming this controller. The backend checks it again.
+    bool ReportOwnerCancel(FDP2.FDR fdr)
+    {
+        lock (_cancelled)
+        {
+            if (_cancelled.Contains(fdr))
+            {
+                // Activated again after the cancel: an ordinary flight from here on.
+                if (fdr.ESTed && fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED)
+                    _cancelled.Remove(fdr);
+                else
+                    return true;
+            }
+        }
+
+        if (fdr.State != FDP2.FDR.FDRStates.STATE_FINISHED && fdr.State != FDP2.FDR.FDRStates.STATE_INACTIVE)
+            return false;
+        if (fdr.CancellationTime == DateTime.MaxValue || DateTime.UtcNow - fdr.CancellationTime > CancelRecent)
+            return false;
+        if (!Network.IsConnected || !IsPilotOnline(fdr.Callsign))
+            return false;
+        if (Landed.ContainsKey(fdr.Callsign) || IsCredibleFinish(fdr))
+            return false;
+
+        bool trackedHere;
+        lock (_trackedHere)
+            trackedHere = _trackedHere.Contains(fdr.Callsign);
+        var namedOnServer = ServerFdrSnapshot.TryGet(fdr.Callsign, out var record)
+                            && record.ControllingCid != null
+                            && record.ControllingCid == NetworkIdentity.Current?.Cid;
+        if (!trackedHere && !namedOnServer)
+            return false;
+
+        lock (_cancelled)
+            _cancelled.Add(fdr);
+        lock (_trackedHere)
+            _trackedHere.Remove(fdr.Callsign);
+        lock (_lock)
+        {
+            // Whatever was queued for it would recreate the record after the delete.
+            _pending.Remove(fdr.Callsign);
+            _pendingCancels.Add(fdr.Callsign);
+        }
+
+        ActionLog.Log("FDR", $"{fdr.Callsign} cancelled by its controller - deleting it from OzServer", new
+        {
+            action = "fdr_owner_cancel",
+            fdr_callsign = fdr.Callsign,
+            state = fdr.State.ToString(),
+            tracked_here = trackedHere,
+            named_on_server = namedOnServer
+        });
+        return true;
+    }
 
     // Tags this session has tracked, to recognise the moment one is dropped.
     readonly HashSet<string> _trackedHere = new(StringComparer.OrdinalIgnoreCase);
@@ -731,6 +815,10 @@ public class FdrSync
 
         lock (_lock)
         {
+            // Cancelled and awaiting its delete: nothing may recreate it (see ReportOwnerCancel).
+            if (_pendingCancels.Contains(dto.Callsign))
+                return;
+
             if (_pending.TryGetValue(dto.Callsign, out var existing))
                 CopyNonNull(dto, existing);
             else
@@ -927,27 +1015,60 @@ public class FdrSync
             QueueLabelStateChanges();
 
             List<OzServerFdrUpdateDto> batch;
+            List<string> cancels;
 
             lock (_lock)
             {
-                if (_pending.Count == 0)
+                if (_pending.Count == 0 && _pendingCancels.Count == 0)
                     return;
 
                 batch = _pending.Values.ToList();
                 _pending.Clear();
+                cancels = _pendingCancels.ToList();
+                _pendingCancels.Clear();
             }
 
-            try
+            if (batch.Count > 0)
             {
-                // In parts: the server takes at most 500 flights and 2 MB in one request, and a
-                // sweep carrying full routes for a busy session can pass either.
-                for (var offset = 0; offset < batch.Count; offset += MaxBatchSize)
-                    await _api.UpdateFdrBatchAsync(batch.Skip(offset).Take(MaxBatchSize));
+                try
+                {
+                    // In parts: the server takes at most 500 flights and 2 MB in one request, and a
+                    // sweep carrying full routes for a busy session can pass either.
+                    for (var offset = 0; offset < batch.Count; offset += MaxBatchSize)
+                        await _api.UpdateFdrBatchAsync(batch.Skip(offset).Take(MaxBatchSize));
+                }
+                catch (Exception ex)
+                {
+                    // Once per outage rather than once per flush - see ErrorThrottle.
+                    ErrorThrottle.Report("fdr-flush", $"Couldn't push FDR batch to OzServer: {ex.Message}", ex);
+                }
             }
-            catch (Exception ex)
+
+            // After the batch, and inside the one-flush-at-a-time guard, so no update for the
+            // flight - this batch's or an earlier one still in flight - can land after the delete
+            // and recreate it.
+            foreach (var callsign in cancels)
             {
-                // Once per outage rather than once per flush - see ErrorThrottle.
-                ErrorThrottle.Report("fdr-flush", $"Couldn't push FDR batch to OzServer: {ex.Message}", ex);
+                try
+                {
+                    await _api.CancelFlightAsync(callsign);
+                    ActionLog.Log("FDR", $"Deleted {callsign} from OzServer - cancelled by its controller",
+                        new { action = "fdr_owner_cancel_sent", fdr_callsign = callsign });
+                }
+                catch (OzServerApiException ex) when (ex.StatusCode is 403 or 404)
+                {
+                    // Not ours by the server's record, or already gone: nothing to retry. The
+                    // record ages out as it would have.
+                    ActionLog.Log("FDR", $"OzServer didn't delete {callsign}: {ex.Message}",
+                        new { action = "fdr_owner_cancel_refused", fdr_callsign = callsign, status = ex.StatusCode });
+                }
+                catch (Exception ex)
+                {
+                    // Offline or the server erred: tried again on the next flush.
+                    lock (_lock)
+                        _pendingCancels.Add(callsign);
+                    ErrorThrottle.Report("fdr-cancel", $"Couldn't delete {callsign} from OzServer: {ex.Message}", ex);
+                }
             }
         }
         finally
