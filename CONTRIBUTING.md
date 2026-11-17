@@ -71,6 +71,9 @@ recommending they restart vatSys. It takes effect the next time that controller 
 
 Things to know:
 
+- **Publishing announces it.** `.github/workflows/discord-release-notify.yml` posts the release's
+  name and description to Discord through the `CHANGES_WEBHOOK` secret when a release or prerelease
+  is published. Drafts are not announced, and editing a published release does not post again.
 - **Prereleases are offered like any other release.** Only a draft is held back, so keep a release
   as a draft until it is ready.
 - **A tag ahead of the assembly reaches nobody.** If `v0.1.9` carries a DLL still stamped `0.1.8`,

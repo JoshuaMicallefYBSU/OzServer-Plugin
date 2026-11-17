@@ -148,12 +148,17 @@ public class AfvSectorClaimer
         if (NetworkIdentity.IsObserver)
         {
             StopInitRetries();
+            _tracker.LogonGrantSettled();
             return;
         }
 
+        // Settled on success (after MMI.SetControlledSectors, so the claim starts from the grant)
+        // and on giving up, so a session Init cannot grant anything to still syncs what the
+        // controller sets by hand - see OzServerOwnershipTracker._awaitingLogonGrant.
         if (Init() || --_initAttemptsLeft <= 0)
         {
             StopInitRetries();
+            _tracker.LogonGrantSettled();
             return;
         }
 

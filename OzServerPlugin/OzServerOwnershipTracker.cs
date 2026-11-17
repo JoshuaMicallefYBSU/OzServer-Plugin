@@ -156,6 +156,26 @@ public class OzServerOwnershipTracker
     List<SectorsVolumes.Sector> _resumed = new();
     DateTime _resumedUntil = DateTime.MinValue;
 
+    // True from disconnect until AfvSectorClaimer has applied the logon grant, and nothing in
+    // MMI.SectorsControlled is claimed meanwhile. Before connecting, MMI holds whatever display
+    // position is open (vatSys's MMI.SetPrimePosition sets the whole position while offline), and
+    // vatSys re-applies it on connect before Network.Connected fires. Claimed, that was the
+    // display position's group rather than the logon's: ML-BKE_CTR with Alice Springs open took
+    // all of ASP. The grant replaces MMI with the logon position's sectors, and claiming starts
+    // from there.
+    volatile bool _awaitingLogonGrant = !Network.IsConnected;
+
+    // Called by AfvSectorClaimer once the logon grant is in MMI, or once it has stopped trying
+    // (an observer, or a callsign that is no sector's). Claims whatever MMI then holds.
+    public void LogonGrantSettled()
+    {
+        if (!_awaitingLogonGrant)
+            return;
+
+        _awaitingLogonGrant = false;
+        RunOnUiThread(OnMmiSectorsControlledChanged);
+    }
+
     public IReadOnlyList<SectorsVolumes.Sector> Owned => _owned;
 
     // Sectors a resume put back moments ago. AfvSectorClaimer.Init() replaces MMI.SectorsControlled
@@ -225,6 +245,8 @@ public class OzServerOwnershipTracker
             // as the controller is concerned. Network.Connected decides.
             lock (_droppedSubSectors)
                 _droppedDisconnectedAt = DateTime.UtcNow;
+
+            _awaitingLogonGrant = true;
 
             lock (_withheldGate)
                 _withheldUntil.Clear();
@@ -538,6 +560,10 @@ public class OzServerOwnershipTracker
         // one) or on a server OzServer does not operate on, where every claim would fail before it
         // was sent - see CanSync.
         if (!CanSync)
+            return;
+
+        // MMI still holds the offline display position - see _awaitingLogonGrant.
+        if (_awaitingLogonGrant)
             return;
 
         lock (_claimGate)
