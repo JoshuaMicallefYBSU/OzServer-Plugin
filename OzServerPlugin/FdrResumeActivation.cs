@@ -19,9 +19,8 @@ namespace OzServerPlugin;
 //  - it is placed where the record last had it, as a floating flight plan track on its route - a
 //    position report at that point, so vatSys carries it on along the route from there;
 //  - auto-couple is left on, so the tag becomes available when the radar track turns up;
-//  - on connecting, if that position is inside a sector this controller holds and nobody has the
-//    tag, it is taken straight into their jurisdiction, as a reconnect takes back its own tags;
-//    otherwise (and for any flight that comes into view later) it is only activated.
+//  - it is not taken into anyone's jurisdiction, even inside this controller's airspace: a tag
+//    nobody holds is picked up by hand.
 //
 // A tag the server has as this controller's own is left to TagResumeRecovery. An FDR vatSys already
 // has tracked by someone is left alone, as is the position of one with a coupled track.
@@ -48,7 +47,7 @@ public class FdrResumeActivation
     readonly System.Threading.Timer _scanTimer;
     readonly object _gate = new();
     readonly Dictionary<string, OzServerFdrRecordDto> _pending = new(StringComparer.OrdinalIgnoreCase);
-    // Activated (or offered) here this session. Each flight is brought in once: if the controller
+    // Activated here this session. Each flight is brought in once: if the controller
     // then puts it back to pre-active, a scan must not re-activate it. Held by reference, not
     // callsign: vatSys deletes a finished FDR after ten minutes and builds a new one when the pilot
     // is seen again, and that new one is a flight to bring in like any other.
@@ -273,18 +272,16 @@ public class FdrResumeActivation
         lock (_gate)
             connectPass = DateTime.UtcNow - _connectedAt < RetryWindow;
 
-        // Nothing is picked up before vatSys has validated the controllers online: until then it
-        // may not know who is tracking a flight (VOZ233 was taken from ML_APP that way).
+        // Nothing is activated before vatSys has validated the controllers online: until then it
+        // may not know who is tracking a flight, and would float a tag another controller is working.
         if (connectPass && !expired && PrimaryPosition.AwaitingValidationForAny(
                 MMI.SectorsControlled.Where(s => !s.IsDummy), Network.Me?.Callsign))
             return;
-        var mine = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
         var fdrs = FDP2.GetFDRs.Where(f => !string.IsNullOrEmpty(f.Callsign))
                                .GroupBy(f => f.Callsign, StringComparer.OrdinalIgnoreCase)
                                .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
         var activated = new List<string>();
-        var offered = new List<string>();
         var skipped = new List<string>();
         var settled = new List<string>();
         var brought = new List<FDP2.FDR>();
@@ -319,15 +316,6 @@ public class FdrResumeActivation
                 if (fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED)
                     FdrSync.FinishedOutOfView.TryRemove(record.Callsign, out _);
 
-                // The sector the record last had it in, if it is one of ours. With no sectors in MMI
-                // yet, waits for the grant rather than deciding nothing is ours.
-                SectorsVolumes.Sector? inMine = null;
-                if (!string.IsNullOrEmpty(record.CurrentSector))
-                    inMine = mine.FirstOrDefault(s => string.Equals(s.Name, record.CurrentSector, StringComparison.OrdinalIgnoreCase));
-
-                if (inMine == null && mine.Count == 0 && !expired)
-                    continue; // nothing held yet: cannot tell whether to offer it
-
                 var wasActive = fdr.ESTed;
                 if (!wasActive)
                     Activate(fdr, record);
@@ -337,26 +325,12 @@ public class FdrResumeActivation
                 if (fdr.CoupledTrack == null && record.Lat is double lat && record.Lon is double lon)
                     FloatAt(fdr, new Coordinate(lat, lon), record);
 
-                // Resolved against the position just applied when the record named none of ours.
-                inMine ??= SectorLocator.Resolve(fdr, mine);
-
-                // Picked up only on connecting - an aircraft in this controller's airspace as they
-                // log on is theirs, taken straight into jurisdiction like a reconnect's own tags
-                // (no flashing offer). One that comes into view later in the session is crossing
-                // airspace, and is only activated: it reaches this controller by handoff.
-                //
-                // Nor one that has not departed. Activated flights still on the ground are on
-                // OzServer too (FdrSync.GroundReturn), and logging on must not take jurisdiction of
-                // every aircraft at the gate: vatSys gives a departure to its controller when it
-                // departs.
-                var departed = fdr.ATD != DateTime.MaxValue;
-                if (inMine != null && connectPass && departed && Network.ValidATC && !OwnedElsewhere(record)
-                    && TagResumeRecovery.TryTakeJurisdiction(fdr, inMine))
-                {
-                    offered.Add($"{record.Callsign} ({inMine.Name})");
-                    brought.Add(fdr);
-                }
-                else if (!wasActive)
+                // Activated only, never taken into jurisdiction, even inside this controller's
+                // airspace: a tag nobody holds is picked up by hand. The only tags taken
+                // automatically on connecting are the ones the resume hands back
+                // (TagResumeRecovery) - this controller's own after a crash, or a position handed
+                // over from the previous controller of this callsign.
+                if (!wasActive)
                 {
                     activated.Add(record.Callsign);
                     brought.Add(fdr);
@@ -381,11 +355,11 @@ public class FdrResumeActivation
                 _pending.Clear();
         }
 
-        if (activated.Count > 0 || offered.Count > 0 || skipped.Count > 0)
+        if (activated.Count > 0 || skipped.Count > 0)
         {
             ActionLog.Log("FdrResume",
-                $"Activated: {List(activated)}; picked up for you: {List(offered)}; left alone: {List(skipped)}",
-                new { action = "fdr_resume_pass", activated, offered, skipped });
+                $"Activated: {List(activated)}; left alone: {List(skipped)}",
+                new { action = "fdr_resume_pass", activated, skipped });
         }
     }
 
@@ -506,21 +480,6 @@ public class FdrResumeActivation
         for (var i = 0; i <= passedIndex && i < route.Count; i++)
             elapsed += route[i].EET;
         MarkDeparted(fdr, passedAt - elapsed);
-    }
-
-    // Not to be picked up: dropped by its controller, another OzServer controller's tag (the record
-    // names them), or one tracked by a controller without the plugin (tracked_by).
-    static bool OwnedElsewhere(OzServerFdrRecordDto record)
-    {
-        // Dropped by its controller: left for whoever chooses to pick it up.
-        if (record.Dropped == true)
-            return true;
-
-        var me = Network.Me?.Callsign;
-        if (record.ControllingCid != null && record.ControllingCid != NetworkIdentity.Current?.Cid)
-            return true;
-        return !string.IsNullOrEmpty(record.TrackedBy)
-               && !string.Equals(record.TrackedBy, me, StringComparison.OrdinalIgnoreCase);
     }
 
     static void RunOnUiThread(Action action)

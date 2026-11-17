@@ -550,9 +550,13 @@ public class OzServerApiClient
     public Task ReleaseAllSectorsAsync() => PostAsync("/sectors/release-all");
 
     // Asks the backend to put this session back on what it held when it last left this position,
-    // if that was recent enough.
-    public Task<OzServerResumeResponseDto> ResumeAsync() =>
-        PostAsync<OzServerResumeResponseDto>("/sectors/resume");
+    // if that was recent enough. positionSectors is the logon position's own sectors
+    // (PrimaryPosition.DefaultSectorsForCurrentSession): if a different controller left this
+    // callsign moments ago, the backend hands over those of them they still held, with their tags.
+    // The backend cannot work the position out itself - positions come from the profile's
+    // Positions.xml, which it does not have.
+    public Task<OzServerResumeResponseDto> ResumeAsync(IEnumerable<string> positionSectors) =>
+        PostAsync<OzServerResumeResponseDto>("/sectors/resume", new { position_sectors = positionSectors.ToArray() });
 
     // Every flight FdrSync has pending in one request. Each flight succeeds or is refused
     // independently server-side; the per-flight results in the response are not read.

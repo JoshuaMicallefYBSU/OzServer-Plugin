@@ -165,6 +165,14 @@ public class OzServerOwnershipTracker
     // from there.
     volatile bool _awaitingLogonGrant = !Network.IsConnected;
 
+    // True from disconnect until this session's resume has been answered (or skipped, or failed),
+    // and nothing is claimed meanwhile either. The resume is where the backend hands a position
+    // over from the previous controller of this callsign, if they left inside its handover window:
+    // the position's sectors with their tags, which TagResumeRecovery then takes. A logon claim
+    // landing first would take those sectors as an ordinary claim on an absent owner, and that
+    // leaves their tags with nobody.
+    volatile bool _awaitingResume = !Network.IsConnected;
+
     // Called by AfvSectorClaimer once the logon grant is in MMI, or once it has stopped trying
     // (an observer, or a callsign that is no sector's). Claims whatever MMI then holds.
     public void LogonGrantSettled()
@@ -173,7 +181,30 @@ public class OzServerOwnershipTracker
             return;
 
         _awaitingLogonGrant = false;
-        RunOnUiThread(OnMmiSectorsControlledChanged);
+        if (!_awaitingResume)
+            RunOnUiThread(OnMmiSectorsControlledChanged);
+    }
+
+    void ResumeSettled()
+    {
+        if (!_awaitingResume)
+            return;
+
+        _awaitingResume = false;
+        if (!_awaitingLogonGrant)
+            RunOnUiThread(OnMmiSectorsControlledChanged);
+    }
+
+    async Task ResumeThenClaimAsync()
+    {
+        try
+        {
+            await ResumePreviousSessionAsync();
+        }
+        finally
+        {
+            ResumeSettled();
+        }
     }
 
     public IReadOnlyList<SectorsVolumes.Sector> Owned => _owned;
@@ -235,7 +266,7 @@ public class OzServerOwnershipTracker
             }
 
             PrimaryPosition.MarkConnected();
-            _ = ResumePreviousSessionAsync();
+            _ = ResumeThenClaimAsync();
         };
         // Back-offs and resume state do not carry into the next session, which may be on a
         // different position.
@@ -247,6 +278,7 @@ public class OzServerOwnershipTracker
                 _droppedDisconnectedAt = DateTime.UtcNow;
 
             _awaitingLogonGrant = true;
+            _awaitingResume = true;
 
             lock (_withheldGate)
                 _withheldUntil.Clear();
@@ -562,8 +594,9 @@ public class OzServerOwnershipTracker
         if (!CanSync)
             return;
 
-        // MMI still holds the offline display position - see _awaitingLogonGrant.
-        if (_awaitingLogonGrant)
+        // MMI still holds the offline display position (see _awaitingLogonGrant), or a position
+        // handover may still be coming in the resume (see _awaitingResume).
+        if (_awaitingLogonGrant || _awaitingResume)
             return;
 
         lock (_claimGate)
@@ -876,7 +909,11 @@ public class OzServerOwnershipTracker
 
         try
         {
-            var response = await _api.ResumeAsync();
+            var positionSectors = PrimaryPosition.DefaultSectorsForCurrentSession(Network.Me?.Callsign)
+                .Where(s => !s.IsDummy)
+                .Select(s => s.Name)
+                .ToList();
+            var response = await _api.ResumeAsync(positionSectors);
 
             if (response.Sync != null)
                 await ApplySyncGatedAsync(response.Sync);

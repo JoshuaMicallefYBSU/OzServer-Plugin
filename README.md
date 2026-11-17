@@ -57,7 +57,8 @@ and shown publicly on the live map at [ozserver.org](https://ozserver.org).
 | | |
 | --- | --- |
 | **Deliberate disconnect** | Closing vatSys or pressing Disconnect releases your sectors immediately. |
-| **Dropped connection** | A crash or network drop holds your sectors for five minutes. Reconnect in that time and your sectors, transmit lines, tags and traffic picture are restored. |
+| **Dropped connection** | After a crash or network drop your sectors stay yours for five minutes unless someone claims them. Reconnect in that time and your sectors, transmit lines, tags and traffic picture are restored. |
+| **Controller changes** | A controller logging on as your position within two minutes of you leaving takes over its sectors and the tags inside them. |
 | **Network separation** | The live network and each SweatBox server are kept completely apart. |
 | **Disable switch** | **Tools → Disable OzServer** takes OzServer out of your session entirely and restores plain vatSys until the next restart. |
 | **Automatic updates** | New releases install themselves and take effect the next time vatSys starts. |
@@ -154,10 +155,17 @@ you are ready. Accepting hands over the sector and the aircraft you hold inside 
 
 | What happened | What OzServer does |
 | --- | --- |
-| You closed vatSys or pressed Disconnect | Your sectors are released immediately |
-| vatSys crashed or the connection dropped | Your sectors are held for five minutes |
-| You reconnected within five minutes | Sectors, transmit lines, tags and traffic are restored |
-| Five minutes passed | Your sectors go to whoever is covering the position above, or become available |
+| You closed vatSys or pressed Disconnect | Your sectors are released immediately, and your tags are left with nobody |
+| vatSys crashed or the connection dropped | Your sectors stay yours for five minutes, unless someone else claims them |
+| You reconnected within five minutes | Sectors, transmit lines, tags and traffic are restored — except anything someone has taken since |
+| Someone logged on as your position within two minutes | They take over your position's sectors and your tags inside them. Sectors you were extending into, and their tags, are not part of it |
+| Anyone else took one of your sectors | The sector is theirs; your tags in it are left with nobody |
+| Five minutes passed | Your sectors go to whoever is covering the position above, or become available. Your tags are left with nobody |
+
+A tag left with nobody is still shown on everyone's scope — OzServer activates every flight it has
+seen in the last 15 minutes — but it is never taken into anyone's jurisdiction automatically.
+Whoever now holds the airspace picks it up. Tags only move by themselves in a sector handover, your
+own reconnect, or a controller change on a position within two minutes.
 
 ### Turning it off
 
