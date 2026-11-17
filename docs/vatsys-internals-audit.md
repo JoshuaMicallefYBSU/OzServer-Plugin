@@ -240,7 +240,7 @@ independent of `WM_KEYDOWN`. A controller who has personally remapped "D" via Op
 would get a silent double-action (the plugin's draw toggle plus whatever they bound) — not a crash, no
 error, just an unexplained side effect. Only matters for controllers who've customized their input map.
 
-### UI / menu integration (`Plugin.cs`'s menu logic, `OzServerSectorsWindow`, `OzServerSettingsWindow`, `SectorMessageWindow`, `SectorNoticeWindow`, `SectorConflictPromptWindow`, `ToggleGenericButton`)
+### UI / menu integration (`Plugin.cs`'s menu logic, `OzServerSectorsWindow`, `SectorMessageWindow`, `SectorNoticeWindow`, `SectorConflictPromptWindow`, `ToggleGenericButton`)
 
 Every specific claim about `MainForm.LoadPluginMenuItem`'s placement rules, the built-in Sectors menu
 item's designer name (`sectorsToolStripMenuItem`), `MenuRenderer`'s Name/Tag/Checked-driven coloring and

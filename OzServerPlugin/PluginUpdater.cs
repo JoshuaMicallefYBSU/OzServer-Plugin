@@ -43,9 +43,8 @@ public class PluginUpdater
     // published as prereleases.
     const string GitHubReleasesApi = "https://api.github.com/repos/" + Repository + "/releases";
 
-    // The only location a download is accepted from, whichever source named it. A base URL changed
-    // in settings, or a compromised OzServer, can choose among published releases but cannot serve
-    // a file of its own.
+    // The only location a download is accepted from, whichever source named it. A compromised
+    // OzServer can choose among published releases but cannot serve a file of its own.
     const string DownloadPrefix = "https://github.com/" + Repository + "/releases/download/";
 
     const string AssetName = "OzServerPlugin.dll";

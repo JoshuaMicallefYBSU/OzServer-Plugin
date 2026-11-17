@@ -62,7 +62,7 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 | `Plugin.cs` | MEF entry point; menu entries and the incoming-request indicators |
 | `OzServerApiClient.cs` | HTTP client and DTOs for the OzServer API |
 | `OzServerEventStream.cs` | The Server-Sent Events stream: change signals, each answered with a sync |
-| `OzServerSettings.cs` | Base-URL persistence and validation |
+| `OzServerSettings.cs` | The OzServer API address (fixed - not user-configurable) |
 | `OzServerMode.cs` | The session-wide *Disable OzServer* switch |
 | `NetworkIdentity.cs` | The session's CID and callsign |
 | `NetworkServer.cs` | Which network the session is on: live, SweatBox 1 or SweatBox 2 |
@@ -91,8 +91,7 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 
 | File | Role |
 | --- | --- |
-| `OzServerSectorsWindow.cs` | The Owned / Requested Changes / Available–Controlled window |
-| `OzServerSettingsWindow.cs` | The base-URL settings window |
+| `OzServerSectorsWindow.cs` | The Owned / Planned Changes / Available–Controlled window |
 | `SectorConflictPromptWindow.cs` | vatSys-styled Accept/Reject prompt |
 | `SectorNoticeWindow.cs` | One-way notice with an OK button |
 | `SectorMessageWindow.cs` | Shared chrome for the two dialogs above |

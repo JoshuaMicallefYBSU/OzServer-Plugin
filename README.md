@@ -84,8 +84,7 @@ Once loaded, the plugin adds:
 
 | Menu | Entry |
 | --- | --- |
-| **Settings** | **OzServer Sectors** — replaces vatSys's own *Sectors...* entry while OzServer is running |
-| **Settings** | **OzServer Settings** |
+| **Settings** | **Sectors** — opens the OzServer Sectors window, in place of vatSys's own *Sectors...* entry while OzServer is running |
 | **Tools** | **Disable OzServer** |
 
 ## Updates
@@ -109,7 +108,7 @@ How the updater chooses and verifies a release is described under [Security](#se
 
 ### The Sectors window
 
-**Settings → OzServer Sectors** has three panes:
+**Settings → Sectors** opens it. It has three panes:
 
 | Pane | Shows |
 | --- | --- |
@@ -168,11 +167,7 @@ vatSys is restarted.
 
 ## Settings
 
-**Settings → OzServer Settings** sets the OzServer address. It defaults to
-`https://api.ozserver.org` and normally never needs changing.
-
-Only `https://` addresses are accepted, apart from `http://` on the local machine for development.
-The setting is stored in `%AppData%\OzServerPlugin\settings.json`.
+There is nothing to configure. The plugin always talks to `https://api.ozserver.org`.
 
 ## Troubleshooting
 

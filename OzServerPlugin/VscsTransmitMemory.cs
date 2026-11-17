@@ -14,9 +14,8 @@ namespace OzServerPlugin;
 // vatSys's own state and comes back Idle. Without this a resumed controller owns the airspace and
 // is off every frequency for it, with nothing on the panel to show that.
 //
-// Written to %AppData% because the vatSys Plugins folder is not guaranteed writable (see
-// OzServerSettings), and to its own file rather than settings.json because it is session state: it
-// expires and is rewritten on every transmit press.
+// Written to %AppData% because the vatSys Plugins folder is not guaranteed writable, and to a file
+// of its own because it is session state: it expires and is rewritten on every transmit press.
 //
 // Saved on every change rather than on disconnect: the plugin is not told about every disconnect in
 // time to write a file - vatSys being killed, the machine losing power, a crash in another

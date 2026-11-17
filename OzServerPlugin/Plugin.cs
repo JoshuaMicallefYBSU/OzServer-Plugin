@@ -21,7 +21,6 @@ public class Plugin : IPlugin
     string IPlugin.Name => Name;
 
     OzServerSectorsWindow? _sectorsWindow;
-    OzServerSettingsWindow? _settingsWindow;
     // Constructed at load, unlike the lazily created windows above: they must work whether or not
     // the Sectors window is ever opened. AfvSectorClaimer turns a VSCS transmit press into an
     // MMI.SectorsControlled change, and the tracker answers every change to that list by claiming
@@ -131,7 +130,11 @@ public class Plugin : IPlugin
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
             CustomToolStripMenuItemCategory.Settings,
-            new ToolStripMenuItem("OzServer Sectors"));
+            // Plain "Sectors": it takes the place of vatSys's own Sectors... entry, which is hidden
+            // while OzServer runs (see repositionUnderSectors), and opens the OzServer Sectors
+            // window. Not "Sectors..." - the built-in entry is found by that text when its
+            // designer name cannot be.
+            new ToolStripMenuItem("Sectors"));
         sectorsMenuItem.Item.Click += (_, _) => OpenSectorsWindow();
         MMI.AddCustomMenuItem(sectorsMenuItem);
 
@@ -218,13 +221,6 @@ public class Plugin : IPlugin
             CustomToolStripMenuItemCategory.Settings,
             debugMenu));
 
-        var settingsMenuItem = new CustomToolStripMenuItem(
-            CustomToolStripMenuItemWindowType.Main,
-            CustomToolStripMenuItemCategory.Settings,
-            new ToolStripMenuItem("OzServer Settings"));
-        settingsMenuItem.Item.Click += (_, _) => OpenSettingsWindow();
-        MMI.AddCustomMenuItem(settingsMenuItem);
-
         // Under Tools, not Settings: switching OzServer off acts on the running session, like
         // vatSys's own Disable Filters and Disable GRIB Winds. vatSys appends plugin Tools items
         // at the bottom of that menu.
@@ -236,12 +232,11 @@ public class Plugin : IPlugin
             _disableItem));
 
         _ozServerMenuItems.Add(sectorsMenuItem.Item);
-        _ozServerMenuItems.Add(settingsMenuItem.Item);
         _ozServerMenuItems.Add(debugMenu);
 
         // vatSys inserts Settings-category plugin items at the bottom of the Settings menu, not
         // beside a built-in entry, and the menu does not exist yet. The move is deferred to
-        // Application.Idle, which fires until vatSys has built the menu with both items in it.
+        // Application.Idle, which fires until vatSys has built the menu with the item in it.
         EventHandler? repositionUnderSectors = null;
         repositionUnderSectors = (_, _) =>
         {
@@ -262,9 +257,6 @@ public class Plugin : IPlugin
             var insertAt = settingsMenu.DropDownItems.IndexOf(sectorsItem) + 1;
             settingsMenu.DropDownItems.Remove(sectorsMenuItem.Item);
             settingsMenu.DropDownItems.Insert(insertAt, sectorsMenuItem.Item);
-
-            settingsMenu.DropDownItems.Remove(settingsMenuItem.Item);
-            settingsMenu.DropDownItems.Insert(insertAt + 1, settingsMenuItem.Item);
 
             _builtInSectorsItem = sectorsItem;
 
@@ -414,7 +406,6 @@ public class Plugin : IPlugin
 
         // The OzServer windows and indicators go away.
         _sectorsWindow?.Hide();
-        _settingsWindow?.Hide();
         _pendingRequests = 0;
         RefreshRequestFlash();
         if (_settingsMenuHeader != null)
@@ -508,15 +499,6 @@ public class Plugin : IPlugin
         }
 
         ShowWindow(_sectorsWindow);
-    }
-
-    void OpenSettingsWindow()
-    {
-        if (OzServerMode.Disabled)
-            return;
-
-        _settingsWindow ??= new OzServerSettingsWindow();
-        ShowWindow(_settingsWindow);
     }
 
     // ShowWithPlacement rather than Show: it is how vatSys opens its own windows, and it restores

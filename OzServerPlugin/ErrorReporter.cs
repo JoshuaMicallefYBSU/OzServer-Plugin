@@ -14,7 +14,7 @@ static class ErrorReporter
 {
     public const string Category = "Error";
 
-    // Every source this plugin reports under starts with this ("OzServer", "OzServer Settings"),
+    // Every source this plugin reports under starts with this ("OzServer"),
     // and so does the default Source of an exception thrown from this assembly.
     const string SourcePrefix = "OzServer";
 
