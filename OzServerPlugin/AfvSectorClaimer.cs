@@ -306,9 +306,16 @@ public class AfvSectorClaimer
             var frequency = Audio.VSCSFrequencies.FirstOrDefault(f => f.Name == name);
 
             // The panel may still be being rebuilt - vatSys populates it over the first seconds of
-            // a session - so the line is kept for a later pass.
+            // a session - so the line is kept for a later pass. A line vatSys never loads (an
+            // extension's, added during the last session) is asked for once the sector is ours
+            // again, and comes back on Transmit - see VscsLines.
             if (frequency == null)
+            {
+                var awaited = SectorsVolumes.Sectors.FirstOrDefault(s => s.Callsign == name);
+                if (awaited != null && _tracker.IsMine(awaited))
+                    VscsLines.TransmitOn(awaited, "transmitting before the reconnect");
                 continue;
+            }
 
             // Done only when both are on: Transmit without Receive is the broken state the write
             // below avoids, not a restored line.

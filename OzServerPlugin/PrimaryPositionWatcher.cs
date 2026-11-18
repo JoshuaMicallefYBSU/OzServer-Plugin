@@ -52,6 +52,10 @@ public class PrimaryPositionWatcher
     // short enough that a logon moments later is still caught.
     static readonly TimeSpan SettleWindow = TimeSpan.FromSeconds(20);
 
+    // The longest an already-online check waits for the resume: its 5 s wait for Network.Me plus
+    // the request timeout.
+    static readonly TimeSpan ResumeWait = TimeSpan.FromSeconds(30);
+
     public PrimaryPositionWatcher(OzServerOwnershipTracker tracker)
     {
         _tracker = tracker;
@@ -283,10 +287,45 @@ public class PrimaryPositionWatcher
             return;
         }
 
-        var locallyRemoved = RemoveLocalCover(theirs, mine, atc.Callsign);
+        // Only once the resume has answered, so the previous session's sectors can be told from what
+        // this session's own logon claim took (see OzServerOwnershipTracker._carriedOver). Bounded:
+        // a resume that never answers must not leave the position unenforced for good.
+        var settled = _tracker.WhenResumeSettled;
+        if (!settled.IsCompleted)
+            await Task.WhenAny(settled, Task.Delay(ResumeWait));
+        if (!Network.IsConnected)
+            return;
+
+        // Re-read after the wait: the resume may have changed both.
+        mine = PrimaryPosition.DefaultSectorsForCurrentSession(Network.Me?.Callsign);
+        owned = _tracker.Owned;
+
+        // A sector this controller already held before connecting stays theirs: the controller
+        // online on it did not take it while they were away (OzServer would no longer list it), so
+        // they had handed it over or left it. BN-TRT_CTR handed TRT to BN-TRS_CTR; when BN-TRS_CTR
+        // reconnected, the resume gave TRT back and this then released it to BN-TRT_CTR.
+        var carriedOver = theirs
+            .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name) && _tracker.IsCarriedOver(s))
+            .Where(s => !mine.Any(m => m.Name == s.Name))
+            .ToList();
+        if (carriedOver.Count > 0)
+        {
+            ActionLog.Log("Primary",
+                $"{atc.Callsign} already online - keeping {string.Join(", ", carriedOver.Select(s => s.Name))}, held before connecting",
+                new
+                {
+                    action = "already_online_keep_carried_over",
+                    controller_callsign = atc.Callsign,
+                    sectors = carriedOver.Select(s => s.Name).ToArray(),
+                    their_group = theirs.Select(s => s.Name).ToArray()
+                });
+        }
+
+        var keep = mine.Concat(carriedOver).ToList();
+        var locallyRemoved = RemoveLocalCover(theirs, keep, atc.Callsign);
         var relinquishing = theirs
             .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name))
-            .Where(s => !mine.Any(m => m.Name == s.Name))
+            .Where(s => !keep.Any(m => m.Name == s.Name))
             .ToList();
 
         // Both outcomes are logged: "decided to relinquish nothing" and "never ran" otherwise look

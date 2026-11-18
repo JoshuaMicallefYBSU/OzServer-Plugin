@@ -187,6 +187,9 @@ public class OzServerOwnershipTracker
 
     void ResumeSettled()
     {
+        lock (_carriedOverGate)
+            _resumeSettledSource.TrySetResult(true);
+
         if (!_awaitingResume)
             return;
 
@@ -216,6 +219,48 @@ public class OzServerOwnershipTracker
     }
 
     public IReadOnlyList<SectorsVolumes.Sector> Owned => _owned;
+
+    // What OzServer still recorded as this controller's when this session's resume was answered:
+    // the previous session's sectors, given back by the resume or never released (a drop), plus a
+    // position handed over under this callsign. Nothing of this session's own has been claimed by
+    // then - claims wait for the resume (see _awaitingResume) - so the set is exactly what was
+    // already this controller's before they connected.
+    //
+    // Another controller online at connect does not own any of it: had they claimed it while this
+    // controller was away, OzServer would no longer list it here. BN-TRT_CTR handed TRT to
+    // BN-TRS_CTR, who then reconnected; TRT was given back by the resume and then relinquished to
+    // BN-TRT_CTR as "already online" (PrimaryPositionWatcher), taking TRS's own sector with it.
+    // Kept for the whole session, cleared on disconnect.
+    readonly object _carriedOverGate = new();
+    HashSet<string> _carriedOver = new(StringComparer.OrdinalIgnoreCase);
+    // Completed once this session's resume has been answered (or skipped, or failed) - see
+    // WhenResumeSettled. Already completed when the tracker is built mid-session.
+    TaskCompletionSource<bool> _resumeSettledSource = NewResumeSettledSource(settled: Network.IsConnected);
+
+    static TaskCompletionSource<bool> NewResumeSettledSource(bool settled)
+    {
+        var source = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (settled)
+            source.SetResult(true);
+        return source;
+    }
+
+    public bool IsCarriedOver(SectorsVolumes.Sector sector)
+    {
+        lock (_carriedOverGate)
+            return _carriedOver.Contains(sector.Name);
+    }
+
+    // Completes when this session's resume has been answered. Anything that has to tell the
+    // previous session's sectors from this session's own claims (IsCarriedOver) waits on it.
+    public Task WhenResumeSettled
+    {
+        get
+        {
+            lock (_carriedOverGate)
+                return _resumeSettledSource.Task;
+        }
+    }
 
     // Sectors a resume put back moments ago. AfvSectorClaimer.Init() replaces MMI.SectorsControlled
     // with the position's defaults and is not ordered against the resume, so it can land afterwards
@@ -296,6 +341,13 @@ public class OzServerOwnershipTracker
             {
                 _resumed = new List<SectorsVolumes.Sector>();
                 _resumedUntil = DateTime.MinValue;
+            }
+
+            lock (_carriedOverGate)
+            {
+                _carriedOver = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (_resumeSettledSource.Task.IsCompleted)
+                    _resumeSettledSource = NewResumeSettledSource(settled: false);
             }
 
             ResetSession();
@@ -929,6 +981,16 @@ public class OzServerOwnershipTracker
             else
                 await RefreshFromServerAsync();
 
+            // Read before ResumeSettled lets anything claim - see _carriedOver.
+            var carriedOverSectors = _owned.Where(s => !s.IsDummy).ToList();
+            lock (_carriedOverGate)
+                _carriedOver = new HashSet<string>(carriedOverSectors.Select(s => s.Name), StringComparer.OrdinalIgnoreCase);
+
+            // An extension held before connecting gets its VSCS line back on Transmit: vatSys loads
+            // only the logon station's group. Whether the resume gave it back or it was never
+            // released (a drop, or a vatSys restart) - and it waits for the session to be validated.
+            RunOnUiThread(() => VscsLines.TransmitOn(carriedOverSectors, "held before reconnecting"));
+
             ActionLog.Log("Resume",
                 $"backend returned {response.Resumed.Count} sector(s), {response.Flights.Count} tag(s)"
                 + (response.Flights.Count > 0 ? ": " + string.Join(", ", response.Flights) : ""));
@@ -970,7 +1032,8 @@ public class OzServerOwnershipTracker
     // an ownership change, and a resume is usually not one: on the first connect its sync is the
     // baseline, and on a reconnect Owned still holds the previous session's list. Without this MMI
     // would hold only the position defaults AfvSectorClaimer.Init() grants, and TagResumeRecovery
-    // could not place the tags inside the resumed sectors. Adds only, and leaves VSCS alone.
+    // could not place the tags inside the resumed sectors. Adds only, and leaves VSCS to the resume
+    // (see the VscsLines call there).
     void RestoreResumedToMmi(List<SectorsVolumes.Sector> resumed)
     {
         if (!Network.IsConnected || !IsRealAtc)
@@ -1118,9 +1181,10 @@ public class OzServerOwnershipTracker
 
         var mmiSectors = MMI.SectorsControlled.Where(s => !s.IsDummy).ToList();
 
-        // A gained sector is added to MMI, so its airspace and tags appear, but its VSCS line is not
-        // switched to Transmit (issue #5): whether to talk on a sector is the controller's decision,
-        // not a side effect of a request being accepted.
+        // A gained sector is added to MMI, so its airspace and tags appear. Its position's VSCS line
+        // is added if missing and put on Transmit further down (VscsLines) - which replaces the
+        // earlier rule of leaving that to the controller (issue #5): with VatpacPlugin running, a
+        // held sector whose line is on the panel but idle is taken out of MMI with its tags.
         foreach (var sector in gained)
         {
             if (!mmiSectors.Any(s => s.Equals(sector)))
@@ -1171,9 +1235,14 @@ public class OzServerOwnershipTracker
 
         _losingUntil = DateTime.MinValue;
 
+        // Every other gained position goes on Transmit too, its line added first if vatSys had not
+        // loaded it - see VscsLines. After the MMI writes above, so the line comes on for a sector
+        // already in MMI (AfvSectorClaimer.CheckActive then has nothing to add or claim).
+        VscsLines.TransmitOn(gained, "sector gained");
+
         // Gaining this session's own login position - requested at logon from whoever was covering
         // it - puts its line on transmit: being on your own frequency is what logging on to the
-        // position means. Every other gained sector is left to the controller.
+        // position means.
         foreach (var sector in gained)
         {
             if (!string.Equals(sector.Callsign, Network.Callsign, StringComparison.OrdinalIgnoreCase))
@@ -1536,6 +1605,10 @@ public class OzServerOwnershipTracker
         {
             await _api.ReleaseSectorAsync(sector.Name);
             ActionLog.Log("Ownership", $"Released {sector.Name}");
+            // The backend releases the named sector's whole covered group, which can hold this
+            // session's own position: relinquishing TRT to BN-TRT_CTR released TRS with it, and
+            // left BN-TRS_CTR logged on to a position OzServer no longer recorded as theirs.
+            await ReclaimOwnPositionAfterReleaseAsync(sector);
         }
         catch (Exception ex)
         {
@@ -1638,7 +1711,7 @@ public class OzServerOwnershipTracker
             ActionLog.Log("Ownership",
                 $"Took {ownSector.Name} back - releasing {released.Name} covered this session's own position", new
                 {
-                    action = "vscs_idle_release_keep_own_position",
+                    action = "release_keep_own_position",
                     sector = ownSector.Name,
                     released = released.Name,
                     own_callsign = Network.Me?.Callsign

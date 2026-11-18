@@ -58,7 +58,10 @@ public class TagResumeRecovery
         Network.Disconnected += (_, _) =>
         {
             lock (_gate)
+            {
                 _pending.Clear();
+                _retakeSector.Clear();
+            }
         };
 
         _retryTimer = new System.Threading.Timer(_ =>
@@ -85,6 +88,7 @@ public class TagResumeRecovery
         lock (_gate)
         {
             _pending.Clear();
+            _retakeSector.Clear();
             _labelState.Clear();
             _labelStateRead = wanted.Count == 0;
             foreach (var callsign in wanted)
@@ -101,25 +105,39 @@ public class TagResumeRecovery
         }
     }
 
-    // A tag this resume already restored that vatSys let go again moments later without the
-    // controller dropping it (FdrSync.ResumedTagLost). Worked like any outstanding tag: the retry
-    // timer takes it back once its sector is in MMI again - usually the next pass, as the tracker
-    // puts a sector it still owns back (ReconcileMmiWithOwned). Not attempted here: this runs inside
-    // vatSys's FDR update, and the sector is usually still missing at that moment.
-    static readonly TimeSpan RetakeWindow = TimeSpan.FromSeconds(30);
+    // A tag of this controller's that vatSys let go without the controller dropping it
+    // (FdrSync.TagLost): a restored tag lost again moments later, or one whose pilot disconnected.
+    // Worked like any outstanding tag, by the retry timer, with three differences:
+    //
+    //  - It goes back on the sector that was controlling it when it was lost, if this controller
+    //    still holds that sector, rather than one the aircraft is inside: a tag accepted early, in
+    //    the sector before this controller's (JST506, taken by ML_APP in ELW), has no held sector
+    //    under it yet.
+    //  - Nobody else's position claims it: it was this controller's a moment ago. Someone who has
+    //    since picked it up is still left with it (IsTracked, in Attempt).
+    //  - It waits for the pilot. A disconnected pilot's FDR stays in vatSys (for ten minutes), and
+    //    taking it before they are back would track an aircraft that is not there.
+    //
+    // Not attempted here: this runs inside vatSys's FDR update, and what the tag needs - the sector
+    // back in MMI, the pilot back online - is usually not there yet.
+    readonly Dictionary<string, string?> _retakeSector = new(StringComparer.OrdinalIgnoreCase);
 
-    public void Retake(string callsign)
+    public void Retake(FdrSync.LostTag lost)
     {
-        if (OzServerMode.Disabled || string.IsNullOrEmpty(callsign))
+        if (OzServerMode.Disabled || string.IsNullOrEmpty(lost.Callsign))
             return;
 
         lock (_gate)
         {
-            _pending[callsign] = "lost again after its restore";
-            var until = DateTime.UtcNow + RetakeWindow;
+            _pending[lost.Callsign] = lost.Reason;
+            _retakeSector[lost.Callsign] = lost.SectorName;
+            var until = DateTime.UtcNow + lost.Window;
             if (_deadline < until)
                 _deadline = until;
         }
+
+        // Its label as OzServer last had it - nothing has been pushed for the tag since it was lost.
+        _ = ReadLabelStateAsync(lost.Callsign);
     }
 
     // A restored tag comes back with a bare label: the CFL and the C are vatSys's local state, and
@@ -214,7 +232,10 @@ public class TagResumeRecovery
         if (!Network.IsConnected)
         {
             lock (_gate)
+            {
                 _pending.Clear();
+                _retakeSector.Clear();
+            }
             return;
         }
 
@@ -282,10 +303,49 @@ public class TagResumeRecovery
                 continue;
             }
 
+            // A tag lost moments ago, not by the controller - see Retake.
+            bool isRetake;
+            string? retakeSector;
+            lock (_gate)
+                isRetake = _retakeSector.TryGetValue(fdr.Callsign, out retakeSector);
+            if (isRetake)
+            {
+                if (!FdrSync.IsPilotOnline(fdr.Callsign))
+                {
+                    waiting[fdr.Callsign] = "waiting for the pilot to reconnect";
+                    continue;
+                }
+
+                var target = mine.FirstOrDefault(s => string.Equals(s.Name, retakeSector, StringComparison.OrdinalIgnoreCase))
+                             ?? SectorLocator.Resolve(fdr, mine);
+                if (target == null)
+                {
+                    waiting[fdr.Callsign] = "no held sector to take it on";
+                    continue;
+                }
+
+                if (TryTakeJurisdiction(fdr, target))
+                {
+                    waiting.Remove(fdr.Callsign);
+                    restored.Add(fdr.Callsign);
+                    ApplyLabelState(fdr);
+                }
+                else
+                {
+                    waiting[fdr.Callsign] = $"could not be taken, state {fdr.State}";
+                }
+                continue;
+            }
+
             // Inside another online controller's position: theirs, even if a sector of it is still
             // listed here for a moment (it is being handed to them - PrimaryPositionWatcher).
+            // Not a sector this controller held before connecting: the controller online on it had
+            // handed it over (see OzServerOwnershipTracker._carriedOver), and it stays here.
+            // SIA296 and VHL2B were given up as "in ASH, BN-TRT_CTR's position" after BN-TRT_CTR had
+            // handed the TRT group to BN-TRS_CTR.
             var staffed = staffedByOthers.Value;
-            if (staffed.Count > 0 && SectorLocator.Resolve(fdr, staffed.Select(s => s.Sector)) is { } theirs)
+            if (staffed.Count > 0
+                && SectorLocator.Resolve(fdr, staffed.Select(s => s.Sector).Where(s => !_tracker.IsCarriedOver(s))) is { } theirs)
             {
                 waiting.Remove(fdr.Callsign);
                 abandoned.Add($"{fdr.Callsign} (in {theirs.Name}, {staffed.First(s => s.Sector.Equals(theirs)).Callsign}'s position)");
@@ -332,6 +392,10 @@ public class TagResumeRecovery
                 else
                     _pending[entry.Key] = entry.Value;
             }
+
+            // A retake settled (taken, abandoned or expired) is no longer one.
+            foreach (var callsign in _retakeSector.Keys.Where(c => !_pending.ContainsKey(c)).ToList())
+                _retakeSector.Remove(callsign);
 
             logWait = !expired && waiting.Count > 0 && !_waitLogged;
             if (logWait)

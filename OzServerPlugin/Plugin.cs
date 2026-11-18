@@ -93,6 +93,8 @@ public class Plugin : IPlugin
         // change this plugin makes to the list.
         MmiSectorWatch.Install();
         _ownershipTracker = new OzServerOwnershipTracker();
+        // As early as possible: its VSCSFrequenciesChanged handler has to run before VatpacPlugin's.
+        VscsLines.Initialise(_ownershipTracker);
         // After the tracker: its connect-time grant keeps the tracker's RecentlyResumed sectors.
         _afvSectorClaimer = new AfvSectorClaimer(_ownershipTracker);
         // A request sent from a VSCS transmit press opens the Sectors window on it.
@@ -106,8 +108,9 @@ public class Plugin : IPlugin
         _fdrSync = new FdrSync(_ownershipTracker);
         // After the tracker, whose TagsResumed it listens to.
         _tagResumeRecovery = new TagResumeRecovery(_ownershipTracker);
-        // A restored tag vatSys let go again moments later, not by the controller's hand.
-        _fdrSync.ResumedTagLost += callsign => _tagResumeRecovery.Retake(callsign);
+        // A tag vatSys let go without the controller dropping it - its pilot disconnected, or it was
+        // lost moments after a restore - is taken back.
+        _fdrSync.TagLost += lost => _tagResumeRecovery.Retake(lost);
         _fdrResumeActivation = new FdrResumeActivation();
         _labelStateMirror = new LabelStateMirror();
         // After the tracker, whose OwnershipChanged tells it a sector moved.
