@@ -218,7 +218,7 @@ public class OzServerSectorsWindow : BaseForm
         ClientSize = new Size(930, 480);
         BackColor = Colours.GetColour(Colours.Identities.WindowBackground);
 
-        _availSectorsView = new TreeViewEx
+        _availSectorsView = new SectorTreeView
         {
             BorderStyle = BorderStyle.None,
             DrawMode = TreeViewDrawMode.OwnerDrawText,
@@ -244,7 +244,7 @@ public class OzServerSectorsWindow : BaseForm
         _availSectorsView.AfterCollapse += AvailSectorsView_AfterExpandCollapse;
         _availSectorsView.AfterExpand += AvailSectorsView_AfterExpandCollapse;
 
-        _currSectorsView = new TreeViewEx
+        _currSectorsView = new SectorTreeView
         {
             BorderStyle = BorderStyle.None,
             DrawMode = TreeViewDrawMode.OwnerDrawText,
@@ -270,7 +270,7 @@ public class OzServerSectorsWindow : BaseForm
         _currSectorsView.AfterCollapse += CurrSectorsView_AfterExpandCollapse;
         _currSectorsView.AfterExpand += CurrSectorsView_AfterExpandCollapse;
 
-        _requestedChangesView = new TreeViewEx
+        _requestedChangesView = new SectorTreeView
         {
             BorderStyle = BorderStyle.None,
             // No CheckBoxes: accepting is driven by the selection (see GetRequestsToAccept), and
@@ -1037,6 +1037,10 @@ public class OzServerSectorsWindow : BaseForm
 
     // Same shape as vatsys.SectorsWindow.SectorsView_DrawNode - save the clip, clip, clear, draw
     // the text, restore - using the tree's own ForeColor/BackColor.
+    //
+    // Raised only while the tree is painting: SectorTreeView drops the DrawNode the native control
+    // would otherwise raise for every node each time it re-measures its layout, which drew here
+    // straight onto the screen.
     void SectorsView_DrawNode(object? sender, DrawTreeNodeEventArgs e)
     {
         var treeView = (TreeViewEx)sender!;
