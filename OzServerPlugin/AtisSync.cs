@@ -69,7 +69,7 @@ public class AtisSync
         catch (Exception ex)
         {
             if (!quiet)
-                Errors.Add(new Exception($"Couldn't push ATIS to OzServer: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't push ATIS to OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 }

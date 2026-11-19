@@ -14,11 +14,42 @@ namespace OzServerPlugin;
 // safety sounds, and a sector request must never sound like an STCA. It is also internal, and
 // loops until StopAlert is called.
 //
-// Played through System.Media rather than vatSys's audio engine, which mixes into the VSCS output
-// device - the controller's headset. A UI notification belongs on the default output device, not
-// in the radio path.
+// Played through vatSys's VSCS sound engine, the way vatSys plays Tone2 itself for an ATC message
+// (Audio.PlayVSCSSound): into the controller's headset, where they will hear it. On the default
+// output device instead, ML-HYD_CTR - on a headset - did not hear ML-ASP_CTR's request arrive. The
+// engine is private to vatSys, so it is reached by reflection; if this vatSys build does not have
+// it in that shape, the sound falls back to the default output device.
 public static class NotificationSound
 {
+    static readonly System.Reflection.FieldInfo? AudioInstance =
+        typeof(Audio).GetField("Instance", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    static readonly System.Reflection.FieldInfo? Tone2 =
+        typeof(Audio).GetField("tone2", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    static readonly System.Reflection.MethodInfo? PlayVscsSound =
+        typeof(Audio).GetMethod("PlayVSCSSound", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    // Through the VSCS engine, as vatSys plays its own ATC-message tone. False if that is not
+    // available, or failed.
+    static bool TryPlayThroughVscs()
+    {
+        try
+        {
+            var audio = AudioInstance?.GetValue(null);
+            var tone = audio == null ? null : Tone2?.GetValue(audio);
+            if (audio == null || tone == null || PlayVscsSound == null)
+                return false;
+
+            var parameters = PlayVscsSound.GetParameters();
+            PlayVscsSound.Invoke(audio, parameters.Length == 2 ? new[] { tone, false } : new[] { tone });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ActionLog.Log("Sound", $"could not play the request sound through VSCS, using the default device: {ex.Message}");
+            return false;
+        }
+    }
+
     // Relative to Helpers.GetProgramFolder(), where vatSys loads its own sounds from, so it
     // follows a non-default install.
     const string RequestSoundFile = @"\wav\Tone2.wav";
@@ -30,6 +61,9 @@ public static class NotificationSound
     // Called once per new request group, not per poll - see Plugin.AnnounceNewRequestGroups.
     public static void PlayRequestArrived()
     {
+        if (TryPlayThroughVscs())
+            return;
+
         try
         {
             var player = Player();

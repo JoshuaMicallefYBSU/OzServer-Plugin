@@ -44,6 +44,8 @@ public class Plugin : IPlugin
     readonly PendingSectorGhosts _pendingSectorGhosts;
     readonly AtisSync _atisSync;
     readonly BadVectorsAtisSync _badVectorsAtisSync;
+    // Messages sent from the website's /console - shown in a popup, answered when allowed.
+    readonly DeveloperMessages _developerMessages;
     // Driven by Network's events: a position is handed back whether or not the Sectors window was
     // ever opened.
     readonly PrimaryPositionWatcher _primaryPositionWatcher;
@@ -119,6 +121,7 @@ public class Plugin : IPlugin
         _pendingSectorGhosts = new PendingSectorGhosts(_ownershipTracker);
         _atisSync = new AtisSync();
         _badVectorsAtisSync = new BadVectorsAtisSync();
+        _developerMessages = new DeveloperMessages();
         // After the tracker, which it releases through.
         _primaryPositionWatcher = new PrimaryPositionWatcher(_ownershipTracker);
         _gracefulDisconnectReleaser = new GracefulDisconnectReleaser();
@@ -250,6 +253,19 @@ public class Plugin : IPlugin
 
             Application.Idle -= repositionUnderSectors;
 
+            // Captured before anything that can return early: the request flash and badge
+            // (RefreshRequestFlash) need only these two, not the built-in entry. Captured after it,
+            // as they were, a vatSys build whose Sectors entry was not found by name or text left
+            // the flash with nothing to paint on for the whole session.
+            _settingsMenuHeader = settingsMenu;
+            _ozServerSectorsItem = sectorsMenuItem.Item;
+            // Opening Settings stops the header's flash, as vatSys's Messages header stops on its
+            // click. The OzServer Sectors badge stays until the request is dealt with.
+            settingsMenu.DropDownOpened += (_, _) => settingsMenu.Checked = false;
+            // A request that arrived before the menu existed had nothing to paint on, and
+            // IncomingRequestsChanged fires again only when the set changes.
+            RefreshRequestFlash();
+
             // Name first, Text as a fallback: the designer name is less likely to change between
             // vatSys builds than the displayed label.
             var sectorsItem = settingsMenu.DropDownItems.OfType<ToolStripItem>()
@@ -257,26 +273,17 @@ public class Plugin : IPlugin
                 ?? settingsMenu.DropDownItems.OfType<ToolStripItem>()
                     .FirstOrDefault(i => i.Text == SectorsMenuItemText);
             if (sectorsItem == null)
+            {
+                ActionLog.Log("Ui", "vatSys's own Sectors... entry was not found in Settings - OzServer Sectors left where vatSys put it",
+                    new { action = "settings_sectors_entry_missing" });
                 return;
+            }
 
             var insertAt = settingsMenu.DropDownItems.IndexOf(sectorsItem) + 1;
             settingsMenu.DropDownItems.Remove(sectorsMenuItem.Item);
             settingsMenu.DropDownItems.Insert(insertAt, sectorsMenuItem.Item);
 
             _builtInSectorsItem = sectorsItem;
-
-            // Captured here: the first point at which both the Settings header and the OzServer
-            // entry inside it exist.
-            _settingsMenuHeader = settingsMenu;
-            _ozServerSectorsItem = sectorsMenuItem.Item;
-
-            // A request that arrived before the menu existed had nothing to paint on, and
-            // IncomingRequestsChanged fires again only when the set changes.
-            RefreshRequestFlash();
-
-            // Opening Settings stops the header's flash, as vatSys's Messages header stops on its
-            // click. The OzServer Sectors badge stays until the request is dealt with.
-            settingsMenu.DropDownOpened += (_, _) => settingsMenu.Checked = false;
 
             // OzServer Sectors replaces the built-in Sectors window rather than sitting beside it:
             // both write MMI.SectorsControlled, but only the plugin's window also tells OzServer.
@@ -290,9 +297,10 @@ public class Plugin : IPlugin
         Application.Idle += repositionUnderSectors;
     }
 
-    // Sounds the notification for request groups not announced before. There is no popup: a
-    // request is answered in the Sectors window, where the airspace involved is shaded on the scope
-    // (RequestedSectorOverlay), rather than in a window put over the scope unasked.
+    // Sounds the notification for request groups not announced before, and opens the Sectors window,
+    // where a request is answered and the airspace involved is shaded on the scope
+    // (RequestedSectorOverlay). Opened rather than left to be found: ML-HYD_CTR's flash went
+    // unnoticed when ML-ASP_CTR asked for ASP.
     //
     // Requests arrive by poll and by SSE, so the same pending request is seen many times; only a
     // group not announced before counts as an arrival. Everything another controller asked for in
@@ -317,7 +325,11 @@ public class Plugin : IPlugin
         // One sound however many groups arrived together.
         NotificationSound.PlayRequestArrived();
 
-        ActionLog.Log("Requests", $"{arrived} new request group(s) announced");
+        // Brought up whether it was closed, hidden or behind another window. Not focused when it
+        // is already open: ShowWindow only shows and raises it.
+        OpenSectorsWindow();
+
+        ActionLog.Log("Requests", $"{arrived} new request group(s) announced - Sectors window opened");
     }
 
     // A couple of sectors rather than a whole position, which would shade most of the scope and

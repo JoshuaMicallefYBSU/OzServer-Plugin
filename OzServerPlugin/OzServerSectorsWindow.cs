@@ -1551,7 +1551,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't refresh sector lists from OzServer: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't refresh sector lists from OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 
@@ -2381,7 +2381,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't apply those sector changes: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't apply those sector changes: {ex.Message}", ex), "OzServer");
         }
         finally
         {
@@ -2568,7 +2568,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't accept that sector request: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't accept that sector request: {ex.Message}", ex), "OzServer");
             UpdateRequestActionButtons();
         }
     }
@@ -2601,7 +2601,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't reject that sector request: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't reject that sector request: {ex.Message}", ex), "OzServer");
             UpdateRequestActionButtons();
         }
     }
@@ -2850,7 +2850,7 @@ public class OzServerSectorsWindow : BaseForm
             // Left in _reportedRejections either way: the controller has been told, and telling
             // them again on the next poll would be worse than the row lingering until the
             // backend's maintenance sweep removes it.
-            Errors.Add(new Exception($"Couldn't acknowledge that rejection: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't acknowledge that rejection: {ex.Message}", ex), "OzServer");
         }
     }
 
@@ -3183,14 +3183,14 @@ public class OzServerSectorsWindow : BaseForm
                     failed
                 });
                 if (failed.Count > 0)
-                    Errors.Add(new Exception($"Couldn't cancel: {string.Join(", ", failed)}"), "OzServer");
+                    OzErrors.Add(new Exception($"Couldn't cancel: {string.Join(", ", failed)}"), "OzServer");
             }
 
             RefreshControlledSnapshot();
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+            OzErrors.Add(new Exception(ex.Message, ex), "OzServer");
         }
         finally
         {
@@ -3274,7 +3274,7 @@ public class OzServerSectorsWindow : BaseForm
             if (failed.Count > 0)
             {
                 var summary = string.Join("; ", failed.Select(f => $"{f.Sector ?? $"#{f.RequestId}"}: {f.Message}"));
-                Errors.Add(new Exception($"Couldn't accept: {summary}"), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't accept: {summary}"), "OzServer");
             }
 
             // AcceptRequestsBatchAsync has applied the state its response carried, so the lists are
@@ -3283,7 +3283,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+            OzErrors.Add(new Exception(ex.Message, ex), "OzServer");
         }
         finally
         {
@@ -3309,7 +3309,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+            OzErrors.Add(new Exception(ex.Message, ex), "OzServer");
         }
         finally
         {
@@ -3335,7 +3335,7 @@ public class OzServerSectorsWindow : BaseForm
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+            OzErrors.Add(new Exception(ex.Message, ex), "OzServer");
         }
         finally
         {

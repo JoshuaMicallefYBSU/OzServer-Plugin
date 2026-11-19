@@ -331,13 +331,56 @@ public sealed class AsdMapLayer
 
             // Checked first: SetMapVisible ends in SetRenderParams, which forces a full redraw of
             // that scope, and this runs every ReassertInterval.
-            if (isVisible?.Invoke(asd, new object[] { map }) is true)
+            var visible = isVisible?.Invoke(asd, new object[] { map }) is true;
+
+            // The radar scopes only - vatSys's main display and popped-out ASD windows - not a
+            // ground (ASMGCS) window, which uses the same control: request shading for an enroute or
+            // TMA sector painted orange across YPPH's ground map. Taken off one that already has it.
+            if (IsGroundDisplay(asd))
+            {
+                if (visible)
+                {
+                    setVisible.Invoke(asd, new object[] { map, false });
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (visible)
                 continue;
 
             setVisible.Invoke(asd, new object[] { map, true });
             changed = true;
         }
         return changed;
+    }
+
+    // ASDControlDX.ASDType is Ground for the ASMGCS window's control (ASMGCSWindow builds it with
+    // ASDTypes.Ground); MainASD and ASD are radar scopes. Read by reflection, as the control type is
+    // internal to vatSys. Unreadable counts as a radar scope, which is how every scope was treated
+    // before.
+    static readonly Dictionary<Type, PropertyInfo?> AsdTypeProperties = new();
+
+    static bool IsGroundDisplay(Control asd)
+    {
+        PropertyInfo? property;
+        lock (AsdTypeProperties)
+        {
+            if (!AsdTypeProperties.TryGetValue(asd.GetType(), out property))
+            {
+                property = asd.GetType().GetProperty("ASDType", BindingFlags.Public | BindingFlags.Instance);
+                AsdTypeProperties[asd.GetType()] = property;
+            }
+        }
+
+        try
+        {
+            return string.Equals(property?.GetValue(asd)?.ToString(), "Ground", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     // Registers a colour in the Colours custom table so CustomColourName resolves. Done by

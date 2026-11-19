@@ -942,7 +942,7 @@ public class SectorTagHandoff
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't fetch clearance data for {fdr.Callsign}: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't fetch clearance data for {fdr.Callsign}: {ex.Message}", ex), "OzServer");
         }
 
         RunOnUiThread(() =>

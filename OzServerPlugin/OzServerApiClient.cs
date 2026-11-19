@@ -128,6 +128,18 @@ public class OzServerCommitResultDto
     [JsonProperty("failed")] public List<string> Failed { get; set; } = new();
 }
 
+// A message from the people running OzServer, sent from the website's /console (GET /messages).
+public class OzServerDeveloperMessageDto
+{
+    [JsonProperty("id")] public long Id { get; set; }
+    [JsonProperty("title")] public string Title { get; set; } = "";
+    [JsonProperty("body")] public string Body { get; set; } = "";
+    // Whether the sender asked for answers: the popup offers Reply only then.
+    [JsonProperty("allow_reply")] public bool AllowReply { get; set; }
+    [JsonProperty("sent_by")] public string SentBy { get; set; } = "";
+    [JsonProperty("created_at")] public DateTime CreatedAt { get; set; }
+}
+
 // What POST /sectors/resume answers with: the sectors recovered, plus the resulting state.
 // Anything not listed was taken by someone else while this controller was away.
 public class OzServerResumeResponseDto
@@ -591,6 +603,15 @@ public class OzServerApiClient
     public Task<List<OzServerFdrRecordDto>> GetAllFlightsAsync() =>
         GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
 
+    // Console messages waiting for this controller - see DeveloperMessages. The backend records them
+    // as delivered as it answers.
+    public Task<List<OzServerDeveloperMessageDto>> GetMessagesAsync() =>
+        GetAsync<List<OzServerDeveloperMessageDto>>("/messages", () => new List<OzServerDeveloperMessageDto>());
+
+    public Task MarkMessageReadAsync(long id) => PostAsync($"/messages/{id}/read");
+
+    public Task ReplyToMessageAsync(long id, string body) => PostAsync($"/messages/{id}/reply", new { body });
+
     // ClientLogForwarder swallows a failure here rather than reporting it - see its comments.
     public Task SendClientLogsAsync(IEnumerable<OzServerClientLogLineDto> lines) =>
         PostAsync("/client-logs", new { lines = lines.ToList() });
@@ -645,6 +666,8 @@ public class OzServerApiClient
             }
 
             ActionLog.LogAttempt("GET", path, true);
+            // An answer means the API is up: a restart announced earlier is over (ApiOutage).
+            ApiOutage.End("API answered");
             return JsonConvert.DeserializeObject<T>(body) ?? empty();
         }
     }
@@ -703,6 +726,8 @@ public class OzServerApiClient
             }
 
             ActionLog.LogAttempt("POST", path, true);
+            // An answer means the API is up: a restart announced earlier is over (ApiOutage).
+            ApiOutage.End("API answered");
             return responseBody;
         }
     }
@@ -740,6 +765,8 @@ public class OzServerApiClient
             }
 
             ActionLog.LogAttempt("PUT", path, true);
+            // An answer means the API is up: a restart announced earlier is over (ApiOutage).
+            ApiOutage.End("API answered");
         }
     }
 

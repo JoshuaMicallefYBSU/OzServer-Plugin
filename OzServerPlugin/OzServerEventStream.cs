@@ -41,7 +41,7 @@ public sealed class OzServerEventStream : IDisposable
 
     // What subscribers are told to re-read when a connection comes up: anything signalled while
     // there was no stream was missed.
-    static readonly string[] CatchUpEvents = { "sectors" };
+    static readonly string[] CatchUpEvents = { "sectors", "messages" };
 
     // One connection for the whole plugin; the server sends every subscriber the same events.
     public static OzServerEventStream Shared { get; } = new OzServerEventStream();
@@ -214,6 +214,9 @@ public sealed class OzServerEventStream : IDisposable
             {
                 Volatile.Write(ref _lastLineTicks, DateTime.UtcNow.Ticks);
 
+                // Connected again: an API restart announced on the last connection is over.
+                ApiOutage.End("event stream reconnected");
+
                 foreach (var name in CatchUpEvents)
                     Raise(name);
 
@@ -234,7 +237,16 @@ public sealed class OzServerEventStream : IDisposable
                     // Only event lines are acted on. Lines starting with ':' are SSE comments -
                     // the server's keepalives.
                     if (line.StartsWith("event:", StringComparison.Ordinal))
-                        Raise(line.Substring("event:".Length).Trim());
+                    {
+                        var name = line.Substring("event:".Length).Trim();
+
+                        // The API is shutting down to restart: it goes quiet for a moment, and its
+                        // connection errors are held back until it is back (ApiOutage).
+                        if (name == "restarting")
+                            ApiOutage.Begin();
+
+                        Raise(name);
+                    }
                 }
             }
         }

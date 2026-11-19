@@ -61,7 +61,7 @@ public class FmpLevelFilter
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't set the FMP level filter: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't set the FMP level filter: {ex.Message}", ex), "OzServer");
         }
     }
 

@@ -142,7 +142,7 @@ public class PluginUpdater
         catch (Exception ex)
         {
             // Anything else needs someone to look at it - a plugin folder that isn't writable, say.
-            Errors.Add(new Exception($"Couldn't check for a plugin update: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't check for a plugin update: {ex.Message}", ex), "OzServer");
         }
     }
 
@@ -198,7 +198,7 @@ public class PluginUpdater
 
         // vatSys prefixes the source, so the line reads "OzServer: A new version ...". An
         // OzServerNotice, so it is not reported as a failure.
-        Errors.Add(
+        OzErrors.Add(
             new OzServerNotice($"A new version ({Display(installed)}) was found and installed. It is recommended you restart vatSys to update."),
             "OzServer");
     }

@@ -92,7 +92,7 @@ public class GracefulDisconnectReleaser
         {
             // Never break shutdown over this. A failure falls back to the dropped-connection path:
             // the sectors are held for the resume window, not lost.
-            Errors.Add(new Exception($"Couldn't release sectors on exit: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't release sectors on exit: {ex.Message}", ex), "OzServer");
         }
     }
 
@@ -104,7 +104,7 @@ public class GracefulDisconnectReleaser
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't release sectors on disconnect: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't release sectors on disconnect: {ex.Message}", ex), "OzServer");
         }
     }
 

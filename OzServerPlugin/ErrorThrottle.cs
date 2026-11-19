@@ -33,6 +33,6 @@ static class ErrorThrottle
             QuietUntil[key] = now + Window;
         }
 
-        Errors.Add(new Exception(message, cause), "OzServer");
+        OzErrors.Add(new Exception(message, cause), "OzServer");
     }
 }

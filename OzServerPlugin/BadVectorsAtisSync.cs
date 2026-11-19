@@ -158,7 +158,7 @@ public class BadVectorsAtisSync
             catch (Exception ex)
             {
                 if (!quiet)
-                    Errors.Add(new Exception($"Couldn't push ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
+                    OzErrors.Add(new Exception($"Couldn't push ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
             }
         }
 
@@ -202,7 +202,7 @@ public class BadVectorsAtisSync
         catch (Exception ex)
         {
             if (!quiet)
-                Errors.Add(new Exception($"Couldn't publish ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't publish ATISPlugin ATIS to OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 

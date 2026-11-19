@@ -236,7 +236,7 @@ public class PrimaryPositionWatcher
         {
             // Fire-and-forget from the event handler, so nothing may escape as an unobserved task
             // exception or leave _handling stuck true and every later logon ignored.
-            Errors.Add(new Exception($"Couldn't relinquish sectors to a primary position: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't relinquish sectors to a primary position: {ex.Message}", ex), "OzServer");
 
             lock (_pendingGate)
                 _handling = false;

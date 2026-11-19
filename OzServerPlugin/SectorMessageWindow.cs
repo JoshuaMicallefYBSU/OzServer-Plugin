@@ -114,21 +114,35 @@ public abstract class SectorMessageWindow : BaseForm
 
     // Centred as one row along the bottom and laid out left to right, so
     // AddButtonRow(Accept, Reject) puts Accept on the left.
+    //
+    // Each button is ButtonWidth or as wide as its label on one line, whichever is more: at a fixed
+    // ButtonWidth, GenericButton wrapped "Close vatSys" onto two lines in the update notice, and the
+    // label could not be read.
     protected void AddButtonRow(params GenericButton[] buttons)
     {
-        var totalWidth = buttons.Length * ButtonWidth + (buttons.Length - 1) * ButtonGap;
-        var x = (DialogWidth - totalWidth) / 2;
+        var widths = new int[buttons.Length];
+        for (var i = 0; i < buttons.Length; i++)
+            widths[i] = Math.Max(ButtonWidth, TextRenderer.MeasureText(buttons[i].Text ?? "", buttons[i].Font).Width + ButtonTextPadding);
+
+        var totalWidth = 0;
+        foreach (var width in widths)
+            totalWidth += width;
+        totalWidth += (buttons.Length - 1) * ButtonGap;
+        var x = Math.Max(Edge, (DialogWidth - totalWidth) / 2);
 
         for (var i = 0; i < buttons.Length; i++)
         {
             var button = buttons[i];
             button.Location = new Point(x, _buttonRowY);
-            button.Size = new Size(ButtonWidth, ButtonHeight);
+            button.Size = new Size(widths[i], ButtonHeight);
             button.TabIndex = i + 1;
             Controls.Add(button);
-            x += ButtonWidth + ButtonGap;
+            x += widths[i] + ButtonGap;
         }
     }
+
+    // Room either side of a button's label, so it does not touch the border.
+    const int ButtonTextPadding = 24;
 
     protected static GenericButton CreateButton(string text, Action onClick)
     {

@@ -350,6 +350,10 @@ public class OzServerOwnershipTracker
                     _resumeSettledSource = NewResumeSettledSource(settled: false);
             }
 
+            // A No to requesting the position is for this session only.
+            lock (_ownPositionDeclined)
+                _ownPositionDeclined.Clear();
+
             ResetSession();
         };
         _pollTimer = new System.Threading.Timer(_ =>
@@ -552,10 +556,12 @@ public class OzServerOwnershipTracker
             // A release this client has just sent: Owned still lists the sector until the release's
             // refresh lands, and putting it back meanwhile would undo the removal on screen.
             .Where(owned => !WasJustReleased(owned.Name))
-            // Nor one vatSys took off because its own controller is online: vatSys does that as it
-            // validates them (Network.VATSIM_ClientQueryResponseReceived), and putting it back
-            // fights vatSys while PrimaryPositionWatcher is handing it to them.
-            .Where(owned => !IsStaffedByOtherController(owned))
+            // Including one vatSys took off because its own controller has come online: vatSys does
+            // that once, as it validates them (Network.VATSIM_ClientQueryResponseReceived), but the
+            // sector stays this controller's until they request it and it is accepted. Left out, its
+            // infill vanished from ML-HYD_CTR's scope the moment ML-ASP_CTR connected, while HYD
+            // still held ASP. A sector being relinquished to a controller already online is excused
+            // above instead (PrimaryPositionWatcher marks it with ExpectReleaseOf).
             .ToList();
 
         if (missing.Count == 0)
@@ -574,18 +580,6 @@ public class OzServerOwnershipTracker
                 sectors = missing.Select(s => s.Name).ToArray(),
                 own_callsign = Network.Me?.Callsign
             });
-    }
-
-    // Whether another controller is online whose position includes this sector - logged on as it,
-    // or as the primary of a group it belongs to (ML_APP for MAE, MDN, MDS, MAV and MAW). Their
-    // position as it stands this session - see PrimaryPosition.StaffedByOthers.
-    static bool IsStaffedByOtherController(SectorsVolumes.Sector sector)
-    {
-        var me = Network.Me?.Callsign;
-        return PrimaryPosition.OnlineRealAtcs()
-            .Where(atc => !string.Equals(atc.Callsign, me, StringComparison.OrdinalIgnoreCase))
-            .Any(atc => string.Equals(atc.Callsign, sector.Callsign, StringComparison.OrdinalIgnoreCase)
-                        || PrimaryPosition.DefaultSectorsForCurrentSession(atc.Callsign).Any(s => s.Equals(sector)));
     }
 
     // Names this client has just asked the backend to release, excused from RestoreOwnedToMmi
@@ -705,7 +699,7 @@ public class OzServerOwnershipTracker
                 _claimQueued = false;
             }
 
-            Errors.Add(new Exception($"Couldn't sync controlled sectors to OzServer: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't sync controlled sectors to OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 
@@ -881,7 +875,7 @@ public class OzServerOwnershipTracker
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't take back cover under {sector.Name}: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't take back cover under {sector.Name}: {ex.Message}", ex), "OzServer");
             }
 
             if (conflicts == null)
@@ -897,7 +891,7 @@ public class OzServerOwnershipTracker
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't take back the rest of {sector.Name}: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't take back the rest of {sector.Name}: {ex.Message}", ex), "OzServer");
             }
         }
 
@@ -1023,7 +1017,7 @@ public class OzServerOwnershipTracker
         {
             // A backend without /sectors/resume, or a transient failure: fall back to the plain
             // connect refresh so the session still starts, without recovering anything.
-            Errors.Add(new Exception($"Couldn't resume the previous session: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't resume the previous session: {ex.Message}", ex), "OzServer");
             await RefreshFromServerIfIdleAsync();
         }
     }
@@ -1298,7 +1292,7 @@ public class OzServerOwnershipTracker
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+            OzErrors.Add(new Exception(ex.Message, ex), "OzServer");
         }
 
         if (conflicts != null)
@@ -1309,7 +1303,7 @@ public class OzServerOwnershipTracker
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't resolve the ownership conflict on {sector.Name}: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't resolve the ownership conflict on {sector.Name}: {ex.Message}", ex), "OzServer");
             }
         }
 
@@ -1414,7 +1408,7 @@ public class OzServerOwnershipTracker
         // giving something back or asking for something is not what that rule guards against.
         if (!IsRealAtc && toClaim.Count > 0)
         {
-            Errors.Add(new Exception(
+            OzErrors.Add(new Exception(
                 "Not connected as a real ATC position - sectors can't be claimed while observing."),
                 "OzServer");
             result.Failed.AddRange(toClaim.Select(s => s.Name));
@@ -1536,7 +1530,7 @@ public class OzServerOwnershipTracker
             catch (Exception ex)
             {
                 result.Failed.Add(sector.Name);
-                Errors.Add(new Exception($"Couldn't release {sector.Name}: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't release {sector.Name}: {ex.Message}", ex), "OzServer");
             }
         }
 
@@ -1558,7 +1552,7 @@ public class OzServerOwnershipTracker
             catch (Exception ex)
             {
                 result.Failed.Add(sector.Name);
-                Errors.Add(new Exception($"Couldn't claim {sector.Name}: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't claim {sector.Name}: {ex.Message}", ex), "OzServer");
             }
 
             if (conflicts == null)
@@ -1584,7 +1578,7 @@ public class OzServerOwnershipTracker
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't claim the rest of {sector.Name}: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't claim the rest of {sector.Name}: {ex.Message}", ex), "OzServer");
             }
         }
 
@@ -1612,7 +1606,7 @@ public class OzServerOwnershipTracker
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception(ex.Message, ex), "OzServer");
+            OzErrors.Add(new Exception(ex.Message, ex), "OzServer");
         }
 
         await RefreshFromServerAsync();
@@ -1721,7 +1715,7 @@ public class OzServerOwnershipTracker
         {
             // Reported unthrottled: the controller is left on a position OzServer does not record as
             // theirs.
-            Errors.Add(new Exception(
+            OzErrors.Add(new Exception(
                 $"Released {released.Name}, but couldn't take {ownSector.Name} back: {ex.Message}", ex), "OzServer");
         }
     }
@@ -1851,7 +1845,7 @@ public class OzServerOwnershipTracker
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't resolve the ownership conflict on {sector.Name}: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't resolve the ownership conflict on {sector.Name}: {ex.Message}", ex), "OzServer");
             }
         }
 
@@ -1869,13 +1863,13 @@ public class OzServerOwnershipTracker
         if (OzServerMode.Disabled)
             return;
 
-        // Requested without asking:
+        // Requested once the controller agrees (ConfirmOwnPositionRequestAsync):
         //
         //   - This session's own position. It is requested, never taken: the controller working the
         //     airspace decides when it, and the aircraft in it, move.
         //   - Anything else the same holder has that a requested sector covers. Accepting BLA hands
-        //     over its whole covered group (the backend's transferRequest), so there is no choice
-        //     to offer about them.
+        //     over its whole covered group (the backend's transferRequest), so it is asked about as
+        //     part of the position, not separately.
         //
         // Never requested here:
         //
@@ -1907,8 +1901,12 @@ public class OzServerOwnershipTracker
             .Where(c => !mineByRight.Contains(c) && !reliefCover.Contains(c))
             .Where(c => mineByRight.Any(own => own.Owner?.Cid == c.Owner?.Cid && Covers(own.Sector, c.Sector)))
             .ToList();
-        var asked = mineByRight.Concat(carriedWith).ToList();
-        var contestedByOthers = conflicts.Where(c => !asked.Contains(c) && !reliefCover.Contains(c)).ToList();
+        var ownPosition = mineByRight.Concat(carriedWith).ToList();
+        var contestedByOthers = conflicts.Where(c => !ownPosition.Contains(c) && !reliefCover.Contains(c)).ToList();
+
+        var asked = new List<OzServerSectorConflictDto>();
+        if (ownPosition.Count > 0 && await ConfirmOwnPositionRequestAsync(ownPosition))
+            asked.AddRange(ownPosition);
 
         // Laid out lead / list / question like every other popup in the plugin, with each sector
         // written out in full (SectorDescription). The message covers the whole of the sector's
@@ -1960,7 +1958,7 @@ public class OzServerOwnershipTracker
             }
             catch (Exception ex)
             {
-                Errors.Add(new Exception($"Couldn't claim {sector.Name} on OzServer: {ex.Message}", ex), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't claim {sector.Name} on OzServer: {ex.Message}", ex), "OzServer");
             }
         }
 
@@ -1983,6 +1981,100 @@ public class OzServerOwnershipTracker
                     freq.Transmit = false;
             }
         });
+    }
+
+    // Own-position prompts, by the sorted sector list they ask about: open right now, and answered
+    // No this session. The claim pass reaches HandleConflictAsync again on every retry while the
+    // position stays contested (RetryUnclaimedMmiSectors), and must not stack prompts or ask again
+    // after a No. Cleared on disconnect. Guarded by themselves: the claim pass and an interactive
+    // ClaimAsync can both get here.
+    readonly HashSet<string> _ownPositionAsking = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _ownPositionDeclined = new(StringComparer.OrdinalIgnoreCase);
+
+    // Asks before requesting this session's own position from whoever holds it. It used to be
+    // requested on logon without a word: ML-ASP_CTR connected and ML-HYD_CTR was asked for ASP and
+    // its six sub-sectors before ASP had chosen to take them. The holder still decides; this lets the
+    // controller logging on decide whether to ask.
+    async Task<bool> ConfirmOwnPositionRequestAsync(List<OzServerSectorConflictDto> ownPosition)
+    {
+        var names = ownPosition.Select(c => c.Sector).Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList();
+        var key = string.Join(",", names);
+
+        // Already asked for and still pending: RequestAsOneGroupAsync skips those anyway.
+        var pending = new HashSet<string>(
+            MyRequests.ByMe.Where(r => r.RejectedAt == null && r.Sector != null).Select(r => r.Sector!.Name),
+            StringComparer.OrdinalIgnoreCase);
+        if (names.All(pending.Contains))
+            return true;
+
+        lock (_ownPositionDeclined)
+        {
+            if (_ownPositionDeclined.Contains(key))
+                return false;
+        }
+        lock (_ownPositionAsking)
+        {
+            if (!_ownPositionAsking.Add(key))
+                return false;
+        }
+
+        try
+        {
+            var sectors = names
+                .Select(name => SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == name))
+                .Where(s => s != null)
+                .Select(s => s!)
+                .ToList();
+            // The logon sector if it is among them, otherwise the one covering the rest.
+            var primary = sectors.FirstOrDefault(s => string.Equals(s.Callsign, Network.Me?.Callsign, StringComparison.OrdinalIgnoreCase))
+                          ?? sectors.FirstOrDefault(s => sectors.All(other => other.Equals(s) || PrimaryPosition.CoveredBy(s).Any(c => c.Equals(other))))
+                          ?? sectors.FirstOrDefault();
+            var primaryName = primary?.Name ?? names.First();
+            var owners = string.Join(", ", ownPosition.Select(c => c.Owner?.Callsign)
+                .Where(callsign => !string.IsNullOrEmpty(callsign))
+                .Distinct(StringComparer.OrdinalIgnoreCase));
+            if (owners.Length == 0)
+                owners = "another controller";
+
+            var subSectors = ownPosition.Where(c => !string.Equals(c.Sector, primaryName, StringComparison.OrdinalIgnoreCase)).ToList();
+            var nl = Environment.NewLine;
+            var message = (subSectors.Count > 0
+                              ? $"{primaryName} and its sub-sectors are owned by {owners}."
+                              : $"{primaryName} is owned by {owners}.")
+                          + nl + nl
+                          + "Owned:" + nl
+                          + string.Join(nl, ownPosition.Select(c => SectorDescription.DescribeWithOwner(c.Sector, c.Owner?.Callsign)))
+                          + nl + nl
+                          + $"Request {primaryName} Sector from {owners}?";
+
+            var answer = await AskYesNoAsync(message, "Your position is owned", "Request Sectors", "No");
+
+            ActionLog.Log("Ownership",
+                answer
+                    ? $"Requesting {primaryName} from {owners} - confirmed"
+                    : $"Not requesting {primaryName} from {owners} - declined",
+                new
+                {
+                    action = answer ? "own_position_request_confirmed" : "own_position_request_declined",
+                    sector = primaryName,
+                    sectors = names.ToArray(),
+                    owners,
+                    own_callsign = Network.Me?.Callsign
+                });
+
+            if (!answer)
+            {
+                lock (_ownPositionDeclined)
+                    _ownPositionDeclined.Add(key);
+            }
+            return answer;
+        }
+        finally
+        {
+            lock (_ownPositionAsking)
+                _ownPositionAsking.Remove(key);
+        }
     }
 
     static bool HeldByItsOwnController(OzServerSectorConflictDto conflict)
@@ -2049,7 +2141,7 @@ public class OzServerOwnershipTracker
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't request {string.Join(", ", names)} on OzServer: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't request {string.Join(", ", names)} on OzServer: {ex.Message}", ex), "OzServer");
         }
     }
 
@@ -2092,12 +2184,12 @@ public class OzServerOwnershipTracker
                 await RefreshFromServerAsync();
 
             if (!raised)
-                Errors.Add(new Exception($"Couldn't request {sector.Name} from {owner.Callsign}."), "OzServer");
+                OzErrors.Add(new Exception($"Couldn't request {sector.Name} from {owner.Callsign}."), "OzServer");
             return raised;
         }
         catch (Exception ex)
         {
-            Errors.Add(new Exception($"Couldn't request {sector.Name} from {owner.Callsign}: {ex.Message}", ex), "OzServer");
+            OzErrors.Add(new Exception($"Couldn't request {sector.Name} from {owner.Callsign}: {ex.Message}", ex), "OzServer");
             return false;
         }
     }
@@ -2142,7 +2234,7 @@ public class OzServerOwnershipTracker
     // and this prompt is raised by a claim - a VSCS transmit press or a logon - so it can appear
     // while the controller is working traffic. Like every other popup here (see
     // SectorMessageWindow) it is non-modal, and the caller awaits the answer.
-    static Task<bool> AskYesNoAsync(string message, string caption)
+    static Task<bool> AskYesNoAsync(string message, string caption, string yesText = "Accept", string noText = "Reject")
     {
         var answer = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -2150,7 +2242,7 @@ public class OzServerOwnershipTracker
         {
             try
             {
-                var prompt = new SectorConflictPromptWindow(message, caption, "Accept", "Reject");
+                var prompt = new SectorConflictPromptWindow(message, caption, yesText, noText);
                 var timeout = new System.Windows.Forms.Timer { Interval = (int)ConflictPromptTimeout.TotalMilliseconds };
 
                 timeout.Tick += (_, _) =>
