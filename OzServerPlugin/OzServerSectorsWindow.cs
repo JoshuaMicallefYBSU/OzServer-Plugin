@@ -155,12 +155,11 @@ public class OzServerSectorsWindow : BaseForm
     readonly TableLayoutPanel _tableLayoutPanel1;
     readonly TextLabel _currentSectorsLabel;
     readonly TextLabel _requestedChangesLabel;
-    readonly GenericButton _applyButton;
-    readonly GenericButton _cancelButton;
     readonly GenericButton _arrowButton;
+    readonly TextLabel _testingNotice;
     readonly ToggleGenericButton _availableModeButton;
     readonly ToggleGenericButton _controlledModeButton;
-    // Act on the selection in _requestedChangesView - see UpdateRequestActionButtons.
+    // The window's two action buttons, under Planned Changes - see UpdateActionButtons.
     readonly GenericButton _acceptButton;
     readonly GenericButton _rejectButton;
     readonly FlowLayoutPanel _requestActionsPanel;
@@ -215,7 +214,8 @@ public class OzServerSectorsWindow : BaseForm
         Resizeable = false;
         FormBorderStyle = FormBorderStyle.FixedSingle;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(930, 466);
+        // The height is set again by LayoutTestingNotice, to end just under the testing notice.
+        ClientSize = new Size(930, 480);
         BackColor = Colours.GetColour(Colours.Identities.WindowBackground);
 
         _availSectorsView = new TreeViewEx
@@ -436,15 +436,17 @@ public class OzServerSectorsWindow : BaseForm
         };
         _arrowButton.Click += ArrowButton_Click;
 
-        _acceptButton = CreateRequestActionButton("Accept");
+        // The window's two action buttons - see UpdateActionButtons. Accept/Reject while a row under
+        // Release Sector Jurisdiction is selected; Apply/Cancel for everything else.
+        _acceptButton = CreateRequestActionButton("Apply");
         _acceptButton.Size = new Size(145, 30);
         _acceptButton.TabIndex = 23;
-        _acceptButton.Click += (_, _) => _ = AcceptSelectedRequestsAsync(_requestedChangesView.SelectedNode);
+        _acceptButton.Click += (_, _) => PrimaryActionClicked();
 
-        _rejectButton = CreateRequestActionButton("Reject");
+        _rejectButton = CreateRequestActionButton("Cancel");
         _rejectButton.Size = new Size(145, 30);
         _rejectButton.TabIndex = 24;
-        _rejectButton.Click += (_, _) => _ = RejectSelectedRequestAsync(_requestedChangesView.SelectedNode);
+        _rejectButton.Click += (_, _) => SecondaryActionClicked();
 
         _requestActionsPanel = new FlowLayoutPanel
         {
@@ -561,30 +563,25 @@ public class OzServerSectorsWindow : BaseForm
         _tableLayoutPanel1.Controls.Add(_sectorListModePanel, 2, 0);
         _tableLayoutPanel1.Controls.Add(_addRemoveLayoutPanel, 2, 1);
 
-        _applyButton = new GenericButton
+        // No separate Apply/Cancel along the bottom: the buttons under Planned Changes do both jobs
+        // (UpdateActionButtons). The strip they left holds the testing notice.
+        // Two lines in vatSys's 18px window font: on one line at that size it is wider than the
+        // window. UseMnemonic off, or the label takes "&" for a shortcut key and drops it. Placed
+        // by LayoutTestingNotice once the lists have their real size.
+        _testingNotice = new TextLabel
         {
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-            Location = new Point(754, 430),
-            Name = "applyButton",
-            Size = new Size(80, 30),
-            TabIndex = 2,
-            Text = "Apply",
+            AutoSize = false,
+            Font = MMI.eurofont_sml,
+            ForeColor = Colours.GetColour(Colours.Identities.GenericText),
+            HasBorder = false,
+            InteractiveText = false,
+            Name = "testingNotice",
+            Text = $"OzServer {PluginUpdater.RunningVersionDisplay} - Plugin in testing" + Environment.NewLine
+                   + "Please reach out to Levi & Joshua for any queries, bug or feature requests",
+            TextAlign = ContentAlignment.MiddleCenter,
+            UseMnemonic = false
         };
-        _applyButton.Click += ApplyButton_Click;
-
-        _cancelButton = new GenericButton
-        {
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-            Location = new Point(840, 430),
-            Name = "cancelButton",
-            Size = new Size(80, 30),
-            TabIndex = 3,
-            Text = "Cancel",
-        };
-        _cancelButton.Click += CancelButton_Click;
-
-        Controls.Add(_cancelButton);
-        Controls.Add(_applyButton);
+        Controls.Add(_testingNotice);
         Controls.Add(_tableLayoutPanel1);
 
         // Owned follows the tracker rather than MMI.SectorsControlledChanged - see the class
@@ -643,12 +640,40 @@ public class OzServerSectorsWindow : BaseForm
         FlashTitleBar = false;
     }
 
+    // Puts the testing notice just under the lowest of the three lists, with NoticePadding above
+    // and below, and ends the window there. Measured rather than fixed: the table holding the lists
+    // is taller than what is in it, and a notice placed under the table sat in dead space.
+    const int NoticePadding = 6;
+
+    void LayoutTestingNotice()
+    {
+        _tableLayoutPanel1.PerformLayout();
+        var contentBottom = _tableLayoutPanel1.Top
+                            + _tableLayoutPanel1.Controls.Cast<Control>()
+                                .Where(c => c.Visible)
+                                .Select(c => c.Bottom + c.Margin.Bottom)
+                                .DefaultIfEmpty(_tableLayoutPanel1.Height)
+                                .Max();
+
+        var textHeight = TextRenderer.MeasureText(_testingNotice.Text, _testingNotice.Font).Height;
+        _testingNotice.SetBounds(Edge, contentBottom + NoticePadding, ClientSize.Width - Edge * 2, textHeight);
+
+        var height = _testingNotice.Bottom + NoticePadding;
+        if (ClientSize.Height != height)
+            ClientSize = new Size(ClientSize.Width, height);
+    }
+
+    const int Edge = 6;
+
     protected override void OnVisibleChanged(EventArgs e)
     {
         base.OnVisibleChanged(e);
 
         if (Visible)
         {
+            // After vatSys's placement restore (ShowWithPlacement), which can bring back the height
+            // of an earlier build's window.
+            LayoutTestingNotice();
             FlashTitleBar = false;
             _pollTimer.Start();
             // On every open, in case a while has passed since the tracker last refreshed.
@@ -1503,17 +1528,26 @@ public class OzServerSectorsWindow : BaseForm
         // decide.
         var dropSelected = SelectedDropRoot() != null;
 
-        _arrowButton.Text = ownedSelected ? ArrowRight : (availSelected || dropSelected) ? ArrowLeft : ArrowIdle;
+        // A staged request selected under Request Sector Jurisdiction: the arrow points back at
+        // Available and takes it out before Apply sends it.
+        var stagedRequestSelected = SelectedStagedRequest() != null;
+
+        // An incoming request selected: Accept and Reject decide it, and the arrow has nothing to move.
+        var incomingSelected = CategoryNameOf(_requestedChangesView.SelectedNode) == RequestedFromMeName;
+
+        _arrowButton.Text = incomingSelected ? ArrowIdle
+            : (ownedSelected || stagedRequestSelected) ? ArrowRight
+            : (availSelected || dropSelected) ? ArrowLeft : ArrowIdle;
 
         // Disabled rather than hidden when blocked by a request: it is the right control, and
         // works again as soon as the request is answered.
-        _arrowButton.Enabled = !_applyRunning && !_requestActionRunning
-                               && (ownedSelected || availSelected || dropSelected) && !blockedByRequest;
+        _arrowButton.Enabled = !_applyRunning && !_requestActionRunning && !incomingSelected
+                               && (ownedSelected || availSelected || dropSelected || stagedRequestSelected) && !blockedByRequest;
 
-        // Hidden while an incoming request is selected. That is an Accept-or-Reject decision, and a
-        // greyed arrow would still read as the control for what is being looked at.
-        _arrowButton.Visible = !IsObserver
-                               && CategoryNameOf(_requestedChangesView.SelectedNode) != RequestedFromMeName;
+        // Always on screen, greyed out when there is nothing for it to move - including while an
+        // incoming request is selected, which Accept and Reject decide. Hidden, it left a gap that
+        // came and went with the selection.
+        _arrowButton.Visible = !IsObserver;
     }
 
     // Whether anything is waiting to be committed. Reads the staged sets rather than comparing the
@@ -1522,16 +1556,8 @@ public class OzServerSectorsWindow : BaseForm
     // the controller did not stage, and which must not light up Apply or lock the list.
     bool HasStagedEdits => _stagedNames.Count > 0 || _stagedRequests.Count > 0;
 
-    void UpdateApplyCancelButtons()
-    {
-        // Nothing to commit or discard while another sector or request action is in flight.
-        var pending = HasStagedEdits && !_applyRunning && !_requestActionRunning;
-
-        _applyButton.Visible = !IsObserver;
-        _cancelButton.Visible = !IsObserver;
-        _applyButton.Enabled = pending;
-        _cancelButton.Enabled = pending;
-    }
+    // Kept as the name every staging path calls; the two buttons are one pair now.
+    void UpdateApplyCancelButtons() => UpdateActionButtons();
 
     // Refreshes every source the three lists read. Called straight after an action of this
     // controller's, so the result is on screen at once rather than on the next poll tick.
@@ -1800,15 +1826,16 @@ public class OzServerSectorsWindow : BaseForm
         return node;
     }
 
-    // Available lists every CSEC-eligible sector this controller does not already hold - the rule
-    // vatsys.SectorsWindow.PopulateLists uses for its own list - annotated with whoever is on it
-    // (see ResolveDisplayController). A sector is not hidden because someone else is on it or owns
-    // it: the controller has to be able to see it to request it. Staging one becomes a request
-    // rather than a claim (see StageSectorChange), and the server has the final say either way.
+    // Available lists every CSEC-eligible sector this controller does not already hold and nobody
+    // else owns on OzServer - the rule vatsys.SectorsWindow.PopulateLists uses for its own list,
+    // less what Controlled shows - annotated with whoever is logged on to it (see
+    // ResolveDisplayController). A sector whose own controller is online but holds nothing on
+    // OzServer (no plugin) stays here, as it is still free on OzServer.
     //
-    // Controlled is a different data source: the sectors OzServer records as owned by someone else
-    // (see RenderControlledList). A callsign merely logged in on VATSIM does not make a sector
-    // Controlled.
+    // Controlled is the other half: the sectors OzServer records as owned by someone else (see
+    // RenderControlledList). One is requested from there - staging it becomes a request rather than
+    // a claim (see StageSectorChange) - and the server has the final say either way. A callsign
+    // merely logged in on VATSIM does not make a sector Controlled.
     void PopulateAvailableList()
     {
         if (_sectorListMode == SectorListMode.Controlled)
@@ -2014,9 +2041,9 @@ public class OzServerSectorsWindow : BaseForm
     bool IsSelected(SectorsVolumes.Sector sector) =>
         _sectorsSelected.Any(s => !s.IsDummy && s.Name == sector.Name);
 
-    // Whether a sector belongs in the Available list at all. Only the two "already effectively
-    // mine" cases exclude it - in Owned by name, or covered by something in Owned - and not
-    // "someone else has it" (see PopulateAvailableList). The candidate filter and
+    // Whether a sector belongs in the Available list at all: not when it is already effectively
+    // mine - in Owned by name, or covered by something in Owned - nor when another controller owns
+    // it on OzServer, which the Controlled list shows (see PopulateAvailableList). The candidate filter and
     // BuildAvailableSectorNode both use this one test, so they cannot disagree and drop a sector
     // from the list altogether.
     //
@@ -2031,8 +2058,12 @@ public class OzServerSectorsWindow : BaseForm
         if (_availabilityCache.TryGetValue(sector.Name, out var cached))
             return cached;
 
+        // Nor one another controller owns on OzServer: it is listed under Controlled, and requested
+        // from there. Listed in both, TRT - held by BN-TRT_CTR - sat in ML-HYD_CTR's Available list
+        // as if it were free.
         var result = !_sectorsSelected.Any(owned => !owned.IsDummy && owned.Name == sector.Name)
-                     && !IsCoveredByOwned(sector);
+                     && !IsCoveredByOwned(sector)
+                     && !IsOwnedByAnotherController(sector);
         _availabilityCache[sector.Name] = result;
         return result;
     }
@@ -2533,12 +2564,27 @@ public class OzServerSectorsWindow : BaseForm
         return node.Tag as SectorsVolumes.Sector;
     }
 
+    // A request staged but not yet sent, selected under Request Sector Jurisdiction: its row is
+    // tagged with the sector itself (AddRequestNodes), where a sent request carries the request.
+    // Null when nothing of the kind is selected.
+    SectorsVolumes.Sector? SelectedStagedRequest()
+    {
+        var node = _requestedChangesView.SelectedNode;
+        if (node?.Tag is not SectorsVolumes.Sector sector || CategoryNameOf(node) != RequestedByMeName)
+            return null;
+        return _stagedRequests.Any(r => r.Name == sector.Name) ? sector : null;
+    }
+
     void ArrowButton_Click(object? sender, EventArgs e)
     {
         // Cancels a planned drop: the sector goes back into Owned with the group it took with it,
         // as moving it back from Available would.
         if (SelectedDropRoot() is { } dropped)
             RunSectorAction(dropped, add: true);
+        // Takes a staged request back out before Apply sends it: the sector goes back to the list it came from
+        // and nothing is asked of its owner (StageSectorChange).
+        else if (SelectedStagedRequest() is { } stagedRequest)
+            RunSectorAction(stagedRequest, add: false);
         else if (_currSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector ownedSector)
             RunSectorAction(ownedSector, add: false);
         else if (_availSectorsView.SelectedNode?.Tag is SectorsVolumes.Sector availSector)
@@ -3102,20 +3148,92 @@ public class OzServerSectorsWindow : BaseForm
     // Accept takes one incoming request or the incoming heading's whole batch. Reject covers both
     // directions (see RejectSelectedRequestAsync), provided a real request is selected - not a
     // placeholder row or a staged one not yet applied.
-    void UpdateRequestActionButtons()
+    void UpdateRequestActionButtons() => UpdateActionButtons();
+
+    // The pair of buttons under Planned Changes does two jobs, decided by what is selected there:
+    //
+    //   - Under Release Sector Jurisdiction (its heading or a row): Accept / Reject the incoming
+    //     request, or the heading's whole batch.
+    //   - Anything else, or nothing: Apply Changes / Cancel the staged changes, as the separate
+    //     Apply and Cancel buttons along the bottom of the window used to.
+    //   - A request selected under Request Sector Jurisdiction: the second button is Cancel Request,
+    //     for that request alone - a staged one is taken back out (as the arrow does), a sent one
+    //     is withdrawn.
+    bool ReleaseModeSelected => CategoryNameOf(_requestedChangesView.SelectedNode) == RequestedFromMeName;
+
+    void UpdateActionButtons()
     {
         var selected = _requestedChangesView.SelectedNode;
-        var requestsActionable = !_requestActionRunning && !_applyRunning && Network.IsConnected;
-        var category = CategoryNameOf(selected);
+        var actionable = !_requestActionRunning && !_applyRunning;
 
         _acceptButton.Visible = !IsObserver;
         _rejectButton.Visible = !IsObserver;
-        _acceptButton.Enabled = requestsActionable && GetRequestsToAccept(selected).Count > 0;
-        _rejectButton.Enabled = requestsActionable
-                                 && (IsRequestHeading(selected)
-                                     ? RequestsUnderHeading(selected!).Count > 0
-                                     : FindOwningRequest(selected) != null
-                                       && (category == RequestedFromMeName || category == RequestedByMeName));
+
+        if (ReleaseModeSelected)
+        {
+            _acceptButton.Text = "Accept";
+            _rejectButton.Text = "Reject";
+            var connected = actionable && Network.IsConnected;
+            _acceptButton.Enabled = connected && GetRequestsToAccept(selected).Count > 0;
+            _rejectButton.Enabled = connected
+                                    && (IsRequestHeading(selected)
+                                        ? RequestsUnderHeading(selected!).Count > 0
+                                        : FindOwningRequest(selected) != null);
+            return;
+        }
+
+        _acceptButton.Text = "Apply Changes";
+        _acceptButton.Enabled = actionable && HasStagedEdits;
+
+        // A request selected - staged, or sent and waiting: Cancel acts on that request alone.
+        if (SelectedStagedRequest() != null)
+        {
+            _rejectButton.Text = "Cancel Request";
+            _rejectButton.Enabled = actionable;
+        }
+        else if (OwnRequestSelected(selected))
+        {
+            _rejectButton.Text = "Cancel Request";
+            _rejectButton.Enabled = actionable && Network.IsConnected;
+        }
+        else
+        {
+            _rejectButton.Text = "Cancel";
+            _rejectButton.Enabled = actionable && HasStagedEdits;
+        }
+    }
+
+    // A request this controller sent, or the Request Sector Jurisdiction heading with some under it.
+    bool OwnRequestSelected(TreeNode? selected)
+    {
+        if (CategoryNameOf(selected) != RequestedByMeName)
+            return false;
+        return IsRequestHeading(selected)
+            ? RequestsUnderHeading(selected!).Count > 0
+            : FindOwningRequest(selected) != null;
+    }
+
+    void PrimaryActionClicked()
+    {
+        if (ReleaseModeSelected)
+            _ = AcceptSelectedRequestsAsync(_requestedChangesView.SelectedNode);
+        else
+            ApplyButton_Click(this, EventArgs.Empty);
+    }
+
+    void SecondaryActionClicked()
+    {
+        var selected = _requestedChangesView.SelectedNode;
+        if (ReleaseModeSelected)
+            _ = RejectSelectedRequestAsync(selected);
+        // Cancel Request: a staged one is just taken back out; a sent one is withdrawn.
+        else if (SelectedStagedRequest() is { } staged)
+            RunSectorAction(staged, add: false);
+        else if (OwnRequestSelected(selected))
+            _ = RejectSelectedRequestAsync(selected);
+        // Cancel: everything planned is discarded.
+        else if (HasStagedEdits)
+            CancelButton_Click(this, EventArgs.Empty);
     }
 
     // The "Requested From Me" / "Requested By Me" headings themselves, as opposed to a row under

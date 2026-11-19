@@ -265,6 +265,19 @@ public class FdrSync
     {
         var dto = BuildFdrDto(fdr, forceRoute: false);
         dto.Dropped = true;
+
+        // A dropped tag has no cleared level: vatSys clears it on every client as the tag is dropped
+        // (FDP2.HandoffToNone here, the DropTrack message elsewhere). Stated so OzServer's record
+        // agrees. Left out, as it was - the tag is no longer tracked, so ClearanceKnown was false -
+        // the record kept the last level, and LabelStateMirror and a later pickup put it back: A77,
+        // dropped by PH_APP after its CFL was taken off, came back showing the old level.
+        //
+        // The rest of the label goes with it as this client has it: vatSys does not clear the
+        // scratchpad or global ops on a drop, and this client was the one tracking the tag.
+        dto.ClearanceKnown = true;
+        dto.CflLower = null;
+        dto.CflUpper = null;
+
         Merge(dto);
     }
 
@@ -955,10 +968,19 @@ public class FdrSync
             return false;
         }
 
+        bool alreadyStandingIn;
+        lock (_standingIn)
+            alreadyStandingIn = _standingIn.Contains(fdr.Callsign);
+
         string reason;
         if (!ServerFdrSnapshot.TryGet(fdr.Callsign, out var entry))
             reason = "no record on OzServer";
-        else if (!string.IsNullOrEmpty(entry.AuthoritySector) && mine.Any(s => string.Equals(s.Name, entry.AuthoritySector, StringComparison.OrdinalIgnoreCase)))
+        // Continues a stand-in this client is already doing; never starts one. The record names one
+        // of this session's sectors just as well after this controller tracked the tag themselves
+        // and let it go, and started on that, ML-HYD_CTR reported SIA298 alongside BN-TRT_CTR - who
+        // holds ASH, where it was, and was reporting it - each push flipping the record back.
+        else if (alreadyStandingIn && !string.IsNullOrEmpty(entry.AuthoritySector)
+                 && mine.Any(s => string.Equals(s.Name, entry.AuthoritySector, StringComparison.OrdinalIgnoreCase)))
             reason = "still reporting it";
         else if (entry.LastSeenAt == null || DateTimeOffset.UtcNow - entry.LastSeenAt.Value > StaleAfter)
             reason = $"not updated for {(entry.LastSeenAt == null ? "ever" : $"{(DateTimeOffset.UtcNow - entry.LastSeenAt.Value).TotalSeconds:0}s")}";

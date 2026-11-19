@@ -274,7 +274,16 @@ public sealed class LabelStateMirror
 
         // A record states its cleared level only alongside the rest of the label (see
         // OzServerFdrUpdateDto.ClearanceKnown), so null after a level has been seen means cleared.
-        if (record.CflUpper != last.CflUpper || record.CflLower != last.CflLower)
+        //
+        // Not onto a tag nobody is tracking: vatSys clears the cleared level of a dropped tag on
+        // every client (FDP2.HandoffToNone, and the DropTrack message), and nobody holds a clearance
+        // for it. Written back, A77 showed its old level again on every scope the moment PH_APP
+        // dropped it. Left unrecorded, so the level is taken up again once someone tracks the tag.
+        if (fdr.ControllerTracking == null)
+        {
+            // Nothing to do for the cleared level.
+        }
+        else if (record.CflUpper != last.CflUpper || record.CflLower != last.CflLower)
         {
             if (record.CflUpper is { } upper)
             {
