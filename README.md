@@ -95,9 +95,8 @@ vatSys opens and every six hours afterwards.
 
 An update never disturbs a running session. It is downloaded, verified, and put in place for the
 **next vatSys start**. When one has been installed an **OzServer update** window tells you a new
-version has been found. Its **Restart** button closes vatSys and opens it again for you; the window
-cannot be dismissed, but it can be moved aside and stays until vatSys is restarted or closed.
-Because the check runs as vatSys opens, that is usually before you have connected.
+version has been found. Its **Restart** button closes vatSys and opens it again for you. Because
+the check runs as vatSys opens, that is usually before you have connected.
 
 If a new version ever fails to load, the previous one is still beside it as
 `OzServerPlugin.dll.backup` — close vatSys, delete `OzServerPlugin.dll`, and rename the backup

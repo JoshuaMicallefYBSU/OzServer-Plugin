@@ -152,9 +152,10 @@ public class PluginUpdater
 
     // Tells the controller a new version has been found, in a window of its own, and recommends
     // they update - which is restarting vatSys, since the new DLL is already in place and the
-    // running session cannot swap itself. Its one button, "Restart", does that for them, and the
-    // window cannot be dismissed any other way: it stays up, non-modal, until vatSys restarts or is
-    // closed. A window rather than a line in the Errors window, which read as one more error and
+    // running session cannot swap itself. Its one button, "Restart", does that for them. Putting
+    // the update off is deliberately not offered - no second button, nothing in the text - though
+    // the title bar's close button still dismisses the window, leaving the update for the next
+    // start. A window rather than a line in the Errors window, which read as one more error and
     // was left unread for whole sessions.
     //
     // Called from the timer thread, possibly while vatSys is still starting, so it waits for the
