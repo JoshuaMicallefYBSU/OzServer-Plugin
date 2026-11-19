@@ -59,8 +59,11 @@ public class PluginUpdater
     // controlling - and stayed on the old build for the whole session (NW_APP and ML-SNO_CTR ran
     // 0.1.9 for hours on 16 Nov, after 0.2.1 had fixed the freezes they were reporting).
     static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(3);
-    // Catches a release published during a long session.
-    static readonly TimeSpan CheckInterval = TimeSpan.FromHours(6);
+    // Catches a release published during a session, within minutes rather than hours: every 6 hours,
+    // a controller on for an evening never heard about a release published after they opened
+    // vatSys. One small request to OzServer (GET /plugin/release, cached there) per controller;
+    // GitHub is asked only when OzServer cannot be reached.
+    static readonly TimeSpan CheckInterval = TimeSpan.FromMinutes(5);
     static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
     // A check that could not reach either source is tried again this soon, this many times, before
     // it is left to CheckInterval. Checking this early in startup can beat the PC's own network.
@@ -155,14 +158,7 @@ public class PluginUpdater
     // main window before posting to it. If that never appears the Errors window is used after all.
     static async Task AnnounceAsync(Version installed, Version? running)
     {
-        var message = $"A new version of OzServer has been found: {Display(installed)}."
-                      + (running != null ? $" You are running {Display(running)}." : "")
-                      + Environment.NewLine + Environment.NewLine
-                      + "Updating is highly recommended - the new version fixes issues in the one you are running. "
-                      + "It is already downloaded and loads the next time vatSys starts, so "
-                      + (Network.IsConnected
-                          ? "close vatSys and reopen it as soon as it is convenient."
-                          : "close vatSys and reopen it now, before you connect.");
+        var message = UpdateMessage(installed);
 
         var waitedUntil = DateTime.UtcNow + NoticeWait;
         while (DateTime.UtcNow < waitedUntil)
@@ -198,9 +194,18 @@ public class PluginUpdater
 
         // vatSys prefixes the source, so the line reads "OzServer: A new version ...". An
         // OzServerNotice, so it is not reported as a failure.
-        OzErrors.Add(
-            new OzServerNotice($"A new version ({Display(installed)}) was found and installed. It is recommended you restart vatSys to update."),
-            "OzServer");
+        OzErrors.Add(new OzServerNotice(UpdateMessage(installed).Replace(Environment.NewLine, " ")), "OzServer");
+    }
+
+    // What a controller is told once a new version is downloaded and waiting for the next start.
+    static string UpdateMessage(Version installed)
+    {
+        var nl = Environment.NewLine;
+        return $"OzServer {Display(installed)} has been downloaded!" + nl + nl
+               + "OzServer has had an update. When convenient, please close and re-open your vatSys Client to "
+               + "apply the updates. Your AFV Frequencies, Sectors and Aircraft Tags will all be saved for when "
+               + "you reconnect." + nl + nl
+               + "Thank you, OzServer Dev Team";
     }
 
     // The version of this running build, as Display writes it - e.g. "v0.2.3".
