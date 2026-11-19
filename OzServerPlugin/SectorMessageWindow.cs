@@ -13,7 +13,7 @@ namespace OzServerPlugin;
 // measured from the message and clamped between MinMessageHeight and MaxMessageHeight.
 //
 // Subclasses supply only the buttons: SectorConflictPromptWindow asks Yes/No and
-// SectorNoticeWindow reports with a single OK.
+// SectorNoticeWindow reports with a single OK (or, for the update notice, a single Restart).
 public abstract class SectorMessageWindow : BaseForm
 {
     // Wide enough for a sector list to wrap sensibly. The panel and text widths derive from it.
@@ -116,8 +116,8 @@ public abstract class SectorMessageWindow : BaseForm
     // AddButtonRow(Accept, Reject) puts Accept on the left.
     //
     // Each button is ButtonWidth or as wide as its label on one line, whichever is more: at a fixed
-    // ButtonWidth, GenericButton wrapped "Close vatSys" onto two lines in the update notice, and the
-    // label could not be read.
+    // ButtonWidth, GenericButton wraps a longer label onto two lines (the update notice's first
+    // button, "Close vatSys", did) and the label cannot be read.
     protected void AddButtonRow(params GenericButton[] buttons)
     {
         var widths = new int[buttons.Length];

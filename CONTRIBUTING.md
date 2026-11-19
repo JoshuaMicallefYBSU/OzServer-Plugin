@@ -67,7 +67,7 @@ Every installed copy updates itself from this repository's GitHub releases, and 
 
 The OzServer API picks a new release up within about five minutes, and each client installs it at
 its next check (as vatSys opens, then every six hours) and shows the controller a window
-recommending they restart vatSys. It takes effect the next time that controller starts vatSys.
+offering to restart vatSys for them. It takes effect the next time that controller starts vatSys.
 
 Things to know:
 

@@ -17,16 +17,16 @@ public class SectorNoticeWindow : SectorMessageWindow
         AddButtonRow(CreateButton("OK", Close));
     }
 
-    // A notice whose one button does something beyond dismissing it - the update notice's
-    // "Close vatSys". The notice closes first; the title bar's close button only dismisses.
-    public SectorNoticeWindow(string message, string caption, string buttonText, Action onClick) : base(message, caption)
+    // A notice that cannot be dismissed, only acted on - the update notice and its "Restart". Its
+    // one button runs the action and the window stays where it is: with HasCloseButton off,
+    // BaseForm draws no close button in the title bar and cancels every Close() until vatSys itself
+    // is exiting (BaseForm.AppClosing), which is also what finally closes it. Still non-modal, so
+    // it can be moved aside and vatSys used behind it.
+    public SectorNoticeWindow(string message, string caption, string actionText, Action onAction) : base(message, caption)
     {
         Name = nameof(SectorNoticeWindow);
+        HasCloseButton = false;
 
-        AddButtonRow(CreateButton(buttonText, () =>
-        {
-            Close();
-            onClick();
-        }));
+        AddButtonRow(CreateButton(actionText, onAction));
     }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -151,14 +152,16 @@ public class PluginUpdater
 
     // Tells the controller a new version has been found, in a window of its own, and recommends
     // they update - which is restarting vatSys, since the new DLL is already in place and the
-    // running session cannot swap itself. A window rather than a line in the Errors window, which
-    // read as one more error and was left unread for whole sessions.
+    // running session cannot swap itself. Its one button, "Restart", does that for them, and the
+    // window cannot be dismissed any other way: it stays up, non-modal, until vatSys restarts or is
+    // closed. A window rather than a line in the Errors window, which read as one more error and
+    // was left unread for whole sessions.
     //
     // Called from the timer thread, possibly while vatSys is still starting, so it waits for the
     // main window before posting to it. If that never appears the Errors window is used after all.
     static async Task AnnounceAsync(Version installed, Version? running)
     {
-        var message = UpdateMessage(installed);
+        var message = UpdateMessage(installed, canRestart: true);
 
         var waitedUntil = DateTime.UtcNow + NoticeWait;
         while (DateTime.UtcNow < waitedUntil)
@@ -169,14 +172,8 @@ public class PluginUpdater
                 {
                     mainForm.BeginInvoke(UiThread.Guard(() =>
                     {
-                        // The button closes vatSys through its main window, so vatSys's own exit
-                        // path runs - its disconnect prompt when connected, and the plugin's
-                        // graceful sector release with it. The title bar's X just dismisses.
-                        var notice = new SectorNoticeWindow(message, "OzServer update", "Close vatSys", () =>
-                        {
-                            if (!mainForm.IsDisposed)
-                                mainForm.Close();
-                        });
+                        var notice = new SectorNoticeWindow(
+                            message, "OzServer update", "Restart", () => RestartVatSys(mainForm));
                         notice.Show(mainForm);
                         notice.BringToFront();
                     }));
@@ -194,17 +191,59 @@ public class PluginUpdater
 
         // vatSys prefixes the source, so the line reads "OzServer: A new version ...". An
         // OzServerNotice, so it is not reported as a failure.
-        OzErrors.Add(new OzServerNotice(UpdateMessage(installed).Replace(Environment.NewLine, " ")), "OzServer");
+        OzErrors.Add(new OzServerNotice(UpdateMessage(installed, canRestart: false).Replace(Environment.NewLine, " ")), "OzServer");
+    }
+
+    // "Restart": closes vatSys and starts it again, so the controller does not have to reopen it by
+    // hand.
+    //
+    // vatSys is closed through its main window, so its own exit path runs - its disconnect prompt
+    // when connected, and the plugin's graceful sector release with it - and everything it saves on
+    // exit is saved. The new vatSys is started from FormClosed, which is raised only once that path
+    // has finished and the window has really gone. vatSys relaunches itself the same way after its
+    // own updates (Application.Restart), and does not mind the old process still exiting beside it.
+    static void RestartVatSys(System.Windows.Forms.Form mainForm)
+    {
+        if (mainForm.IsDisposed)
+            return;
+
+        System.Windows.Forms.FormClosedEventHandler relaunch = (_, _) =>
+        {
+            try
+            {
+                Process.Start(System.Windows.Forms.Application.ExecutablePath);
+            }
+            catch (Exception ex)
+            {
+                // vatSys is closing regardless; reopening it by hand still applies the update.
+                ActionLog.Log("Update", $"Couldn't start vatSys again after closing it: {ex.Message}");
+            }
+        };
+
+        mainForm.FormClosed += relaunch;
+        mainForm.Close();
+
+        // MainForm's FormClosing handler cancels this Close() and, once it has committed to
+        // exiting, sets AppClosing and closes the window itself a moment later. AppClosing still
+        // false here means the controller answered No to "You're still connected, confirm you wish
+        // to exit?": vatSys stays open, the notice with it, and closing vatSys later must not start
+        // it again.
+        if (!BaseForm.AppClosing)
+            mainForm.FormClosed -= relaunch;
     }
 
     // What a controller is told once a new version is downloaded and waiting for the next start.
-    static string UpdateMessage(Version installed)
+    // canRestart is false for the Errors window fallback, which has no buttons to refer to.
+    static string UpdateMessage(Version installed, bool canRestart)
     {
         var nl = Environment.NewLine;
+        var how = canRestart
+            ? "Press Restart to apply it - vatSys will close and re-open itself."
+            : "When convenient, please close and re-open your vatSys Client to apply the updates.";
+
         return $"OzServer {Display(installed)} has been downloaded!" + nl + nl
-               + "OzServer has had an update. When convenient, please close and re-open your vatSys Client to "
-               + "apply the updates. Your AFV Frequencies, Sectors and Aircraft Tags will all be saved for when "
-               + "you reconnect." + nl + nl
+               + "OzServer has had an update. " + how + " Your AFV Frequencies, Sectors and Aircraft Tags "
+               + "will all be saved for when you reconnect." + nl + nl
                + "Thank you, OzServer Dev Team";
     }
 
