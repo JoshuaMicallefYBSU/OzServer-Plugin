@@ -17,6 +17,8 @@ public class Plugin : IPlugin
     // entry is placed beneath.
     const string SectorsMenuItemText = "Sectors...";
     const string SectorsMenuItemName = "sectorsToolStripMenuItem";
+    // What the hidden built-in entry is renamed to once our own entry takes over SectorsMenuItemName.
+    const string HiddenSectorsMenuItemName = "sectorsToolStripMenuItem_hiddenByOzServer";
 
     string IPlugin.Name => Name;
 
@@ -293,6 +295,19 @@ public class Plugin : IPlugin
             // still open the window itself (MMI.SectorsWindow), and DisableNow shows the entry
             // again.
             sectorsItem.Visible = false;
+
+            // Other plugins reach the Sectors window by finding this item by its designer name and
+            // calling PerformClick - Eurocat UI's Airspace button does exactly that. PerformClick is
+            // a silent no-op on an item that isn't Available, so with the built-in entry hidden that
+            // click did nothing at all, and even if it had fired it would have opened the built-in
+            // window rather than this one. Handing the name over to our own entry routes every such
+            // lookup here instead.
+            //
+            // Safe for vatSys itself: its only use of the "sectorsToolStripMenuItem" string is the
+            // designer's own Name assignment (MainForm keeps the item in a field, and MenuRenderer
+            // keys only off the Windows/Messages names), unlike those items which it looks up by name.
+            sectorsItem.Name = HiddenSectorsMenuItemName;
+            sectorsMenuItem.Item.Name = SectorsMenuItemName;
         };
         Application.Idle += repositionUnderSectors;
     }
@@ -437,7 +452,15 @@ public class Plugin : IPlugin
         foreach (var item in _ozServerMenuItems)
             item.Visible = false;
         if (_builtInSectorsItem != null)
+        {
             _builtInSectorsItem.Visible = true;
+            // Hand the designer name back too, or other plugins that click the Sectors entry by
+            // name (Eurocat UI's Airspace button) would keep finding our now-hidden entry and get
+            // nothing.
+            if (_ozServerSectorsItem != null)
+                _ozServerSectorsItem.Name = string.Empty;
+            _builtInSectorsItem.Name = SectorsMenuItemName;
+        }
         if (_disableItem != null)
         {
             _disableItem.Text = "OzServer disabled (restart vatSys to re-enable)";
