@@ -116,10 +116,6 @@ unmentioned in `SectorLocator.cs`'s own comments.
 - `Plugin.cs`'s comment attributes the request-window title-bar flash to "the ATIS window" — the real
   vatSys precedent for `BaseForm.FlashTitleBar` is `ChatWindow`, not `ATISWindow` (which never calls
   it). No functional effect, just a misleading pointer for a future reader.
-- The debug menu's "Conflict (Yes/No)" preview (`Plugin.cs`) shows `SectorConflictPromptWindow`
-  non-modally via `Show()`, but the real code path always shows it modally via `ShowDialog`. The
-  preview doesn't reproduce the real window's modality, unlike the `SectorNoticeWindow` preview next to
-  it, which does.
 - `NotificationSound.cs`'s comment claims the sound is "loaded up front" — it's actually lazily loaded
   on the first real `PlayRequestArrived()` call, with no warm-up call anywhere in `Plugin.cs`. Trivial
   disk I/O, no real impact.

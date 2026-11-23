@@ -69,8 +69,6 @@ public class Plugin : IPlugin
     // Incoming requests waiting on this controller, driving the Settings header's flash.
     int _pendingRequests;
 
-    // Debug menu only: whether its highlight toggle is on.
-    bool _debugHighlightShown;
     // Request groups already announced, so a group sounds once rather than on every refresh while
     // it is unanswered. Pruned to what is still pending, so a request withdrawn and made again is
     // announced again.
@@ -180,60 +178,6 @@ public class Plugin : IPlugin
                 Apply();
         };
 
-        // Opens each popup on demand, so its layout can be checked in the real client. The windows
-        // derive from vatSys's BaseForm, which closes itself outside the vatSys process, so a
-        // standalone harness cannot render them.
-        var debugMenu = new ToolStripMenuItem("OzServer Popups (Debug)");
-
-        // Simulates a request arriving and being looked at: the notification sound, and the
-        // highlight the Sectors window would reveal. A toggle, because nothing else here clears
-        // the highlight.
-        debugMenu.DropDownItems.Add(new ToolStripMenuItem("Sector request (sound + highlight)", null,
-            (_, _) =>
-            {
-                _debugHighlightShown = !_debugHighlightShown;
-
-                if (!_debugHighlightShown)
-                {
-                    _requestedSectorOverlay.Clear();
-                    return;
-                }
-
-                NotificationSound.PlayRequestArrived();
-
-                // SetRevealed as well as SetIncoming: nothing is shown until the Sectors window
-                // opens, and this stands in for that.
-                var sectors = DebugHighlightSectors();
-                _requestedSectorOverlay.SetIncoming(sectors);
-                _requestedSectorOverlay.SetRevealed(true);
-
-                ActionLog.Log("Debug", $"highlighting {string.Join(", ", sectors.Select(s => s.Name))}");
-            }));
-        // Both previews below write their sectors with SectorDescription, as the live notices and
-        // prompts do, so the layout is judged against realistic text.
-        debugMenu.DropDownItems.Add(new ToolStripMenuItem("Notice (OK)", null,
-            (_, _) => ShowDebugPopup(new SectorNoticeWindow(
-                "BN-ISA_CTR has logged on." + Environment.NewLine + Environment.NewLine
-                + "These sectors belong to that position and are being relinquished to them:"
-                + Environment.NewLine + Environment.NewLine
-                + string.Join(Environment.NewLine,
-                    new[] { "ARA", "STR" }.Select(SectorDescription.Describe)),
-                "Position relinquished"))));
-        debugMenu.DropDownItems.Add(new ToolStripMenuItem("Conflict (Yes/No)", null,
-            (_, _) => ShowDebugPopup(new SectorConflictPromptWindow(
-                // One sector per line with the controller holding it, as
-                // OzServerOwnershipTracker.HandleConflictAsync lists them.
-                "This sector is already owned by another controller:"
-                + Environment.NewLine + Environment.NewLine
-                + SectorDescription.DescribeWithOwner("STR", "BN-TRT_CTR")
-                + Environment.NewLine + Environment.NewLine + "Request it from them?",
-                "Sector already owned"))));
-
-        MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
-            CustomToolStripMenuItemWindowType.Main,
-            CustomToolStripMenuItemCategory.Settings,
-            debugMenu));
-
         // Under Tools, not Settings: switching OzServer off acts on the running session, like
         // vatSys's own Disable Filters and Disable GRIB Winds. vatSys appends plugin Tools items
         // at the bottom of that menu.
@@ -245,7 +189,6 @@ public class Plugin : IPlugin
             _disableItem));
 
         _ozServerMenuItems.Add(sectorsMenuItem.Item);
-        _ozServerMenuItems.Add(debugMenu);
 
         // vatSys inserts Settings-category plugin items at the bottom of the Settings menu, not
         // beside a built-in entry, and the menu does not exist yet. The move is deferred to
@@ -350,30 +293,9 @@ public class Plugin : IPlugin
         ActionLog.Log("Requests", $"{arrived} new request group(s) announced - Sectors window opened");
     }
 
-    // A couple of sectors rather than a whole position, which would shade most of the scope and
-    // show neither what a highlight covers nor where the border between two sectors falls.
-    const int DebugHighlightCount = 2;
-
-    // What the debug entry highlights: this controller's own sectors if there are any, which
-    // adjoin each other and are where they are already looking; otherwise sectors from the
-    // dataset, so the highlight can be tested while disconnected, when MMI.SectorsControlled is
-    // empty.
-    static List<SectorsVolumes.Sector> DebugHighlightSectors()
-    {
-        var mine = MMI.SectorsControlled.Where(sector => !sector.IsDummy).ToList();
-        if (mine.Count > 0)
-            return mine.Take(DebugHighlightCount).ToList();
-
-        return SectorsVolumes.Sectors
-            .Where(sector => sector.Volumes != null
-                             && sector.Volumes.Any(volume => volume.Boundary != null && volume.Boundary.Count >= 3))
-            .Take(DebugHighlightCount)
-            .ToList();
-    }
-
     // Shows a popup the way the plugin's notices and prompts are shown: non-modal, owned by the
     // main form.
-    static void ShowDebugPopup(Form popup)
+    static void ShowPopup(Form popup)
     {
         if (Application.OpenForms["MainForm"] is Form mainForm)
             popup.Show(mainForm);
@@ -418,7 +340,7 @@ public class Plugin : IPlugin
             if (prompt.Answer)
                 DisableNow();
         };
-        ShowDebugPopup(prompt);
+        ShowPopup(prompt);
     }
 
     // Shuts OzServer out of the session. Runs on the UI thread, as the menu click and the prompt
@@ -518,9 +440,9 @@ public class Plugin : IPlugin
             + "Restart vatSys to use OzServer again.",
             "OzServer disabled");
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(UiThread.Guard(() => ShowDebugPopup(notice)));
+            mainForm.BeginInvoke(UiThread.Guard(() => ShowPopup(notice)));
         else
-            ShowDebugPopup(notice);
+            ShowPopup(notice);
     }
 
     void OpenSectorsWindow()
