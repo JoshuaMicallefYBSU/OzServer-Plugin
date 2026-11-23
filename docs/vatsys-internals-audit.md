@@ -360,6 +360,18 @@ vatSys refactor is most likely to change without notice.
   `UpdateATISNoTTS` — relied on for safely reading it from an event handler.
 - `Conversions.FSDFrequencyToString`/`VSCSFrequencyToFSDFrequency`'s exact numeric formulas.
 
+**SELCAL32 (`Selcal32.cs`), all reflection targets. Each one is checked before it is written, and
+if anything doesn't match the window just stays SELCAL16 (logged under `SELCAL`):**
+
+- `vatsys.SELCALWindow+<>c`'s compiler-generated lambda caches for `CheckValidSelcal`
+  (`<>9__7_0`/`<>9__7_1` in 0.4.9305.35667, located by the `<CheckValidSelcal>b__*` method names, not
+  by these ordinals). They are overwritten with a SELCAL32 predicate. This relies on
+  `CheckValidSelcal` still using the `cache ?? (cache = new Func<char,bool>(...))` pattern, and on the
+  check still being per-character via `Enumerable.Any`.
+- `GeoVR.Client.SelcalInput.codeLookup`, the private static `Dictionary<char, float>` that both
+  `Play` (validation) and `AddSignalsToMixer` (frequencies) read. The sixteen SELCAL32 tones are
+  added to it. AFV client 2.2.0.0 ships only the sixteen SELCAL16 entries.
+
 **Plugin loading:**
 
 - The exact scanned folders (`<dataset path>\Plugins`, `<program folder>\bin\Plugins`) — private to

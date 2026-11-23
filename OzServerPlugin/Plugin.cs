@@ -136,6 +136,9 @@ public class Plugin : IPlugin
         _updater = new PluginUpdater();
 
         _fmpLevelFilter = new FmpLevelFilter();
+        // Patches vatSys's own SELCAL window and AFV's tone table once, at load, so the window
+        // accepts SELCAL32 codes. Nothing to hold: there is no state beyond the patch itself.
+        Selcal32.Apply();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
