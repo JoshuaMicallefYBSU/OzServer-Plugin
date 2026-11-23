@@ -48,6 +48,9 @@ public class Plugin : IPlugin
     readonly BadVectorsAtisSync _badVectorsAtisSync;
     // Messages sent from the website's /console - shown in a popup, answered when allowed.
     readonly DeveloperMessages _developerMessages;
+    // vatSys's Arrival Lists, served from OzServer rather than vatSys's own sequence server.
+    readonly ArrivalListSync _arrivalListSync;
+    SelcalDebugWindow? _selcalDebugWindow;
     // Driven by Network's events: a position is handed back whether or not the Sectors window was
     // ever opened.
     readonly PrimaryPositionWatcher _primaryPositionWatcher;
@@ -137,6 +140,9 @@ public class Plugin : IPlugin
         // Patches vatSys's own SELCAL window and AFV's tone table once, at load, so the window
         // accepts SELCAL32 codes. Nothing to hold: there is no state beyond the patch itself.
         Selcal32.Apply();
+        // Swaps the HttpClient vatSys's Arrival Lists poll through, once, at load. Until a session
+        // on a supported server starts, every request still goes to vatSys's own server.
+        _arrivalListSync = new ArrivalListSync();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,
@@ -187,6 +193,20 @@ public class Plugin : IPlugin
             CustomToolStripMenuItemWindowType.Main,
             CustomToolStripMenuItemCategory.Tools,
             _disableItem));
+
+        // A debug window for SELCAL32 (Selcal32.cs). Not one of _ozServerMenuItems: it has nothing to
+        // do with OzServer, and stays when OzServer is turned off.
+        var selcalDebugItem = new ToolStripMenuItem("SELCAL Debug");
+        selcalDebugItem.Click += (_, _) =>
+        {
+            if (_selcalDebugWindow == null || _selcalDebugWindow.IsDisposed)
+                _selcalDebugWindow = new SelcalDebugWindow();
+            ShowWindow(_selcalDebugWindow);
+        };
+        MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
+            CustomToolStripMenuItemWindowType.Main,
+            CustomToolStripMenuItemCategory.Tools,
+            selcalDebugItem));
 
         _ozServerMenuItems.Add(sectorsMenuItem.Item);
 
@@ -504,6 +524,8 @@ public class Plugin : IPlugin
         Isolate("FdrSync", () => _fdrSync.OnFdrUpdate(updated));
         // A flight plan just activated by hand is coupled to its radar return if vatSys will not.
         Isolate("Couple", () => _coupleAssist.OnFdrUpdate(updated));
+        // A finished flight comes off the Arrival Lists straight away.
+        Isolate("Arrivals", () => _arrivalListSync.OnFdrUpdate(updated));
         // vatSys has just recomputed this track's state, so any ghost needs reasserting.
         Isolate("Ghost", () => _pendingSectorGhosts.Reassert());
     }

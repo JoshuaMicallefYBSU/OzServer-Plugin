@@ -119,6 +119,8 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 | `SectorLocator.cs` | Which sector an aircraft is physically inside |
 | `CoupleAssist.cs` | Couples an activated flight plan to its radar track by callsign |
 | `FmpLevelFilter.cs` | Applies the 998–999 level filter on flow positions |
+| `ArrivalListSync.cs` | Opens OzServer's Arrival List in place of vatSys's, keeps each one current, and reports which are open |
+| `ArrivalListWindow.cs` | The Arrival List window itself, drawn to match vatSys's |
 
 ### ATIS
 
@@ -152,6 +154,8 @@ All under `{BaseUrl}/api/v1`. Every call carries `controller_cid`, `controller_c
 | `GET /events?server=` | Server-Sent Events: a signal to re-sync, never data |
 | `POST /fdr/batch` | Flight-data upserts, keyed by callsign |
 | `GET /fdr/sync` · `GET /fdr/{callsign}` | Server-side flight records, for label state and resume |
+| `GET /arrivals/{ades}` · `POST /arrivals/{ades}/sequence` | An Arrival List, and a drag within it |
+| `POST /arrivals/viewing` | The Arrival Lists open here; answers how many controllers have each open |
 | `POST /atis` | The ATIS handover record, keyed by ICAO and server |
 | `PUT /vatsim/atis/{icao}` | Publishes the broadcast itself for the public map; live network only |
 | `POST /client-logs` | Forwarded log lines |
@@ -163,6 +167,8 @@ All under `{BaseUrl}/api/v1`. Every call carries `controller_cid`, `controller_c
 | --- | --- |
 | Ownership sync | every 3 s; 1 s while a claim or request is pending; 2 s while the Sectors window is open; immediately on an event |
 | Flight-data flush | every 5 s |
+| Arrival List refresh | every 3 s per open list; immediately on an event |
+| Open Arrival Lists report | every 10 s, and as a list opens or closes |
 | Log forwarding flush | every 5 s |
 | ATIS refresh while on air | every 20 min |
 | ATISPlugin rescan | every 5 s |

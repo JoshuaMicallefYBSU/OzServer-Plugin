@@ -1424,6 +1424,7 @@ public class FdrSync
             AssignedSsrCode = fdr.AssignedSSRCode == -1 ? null : fdr.AssignedSSRCode,
             Atd = fdr.ATD == DateTime.MaxValue ? null : fdr.ATD,
             Etd = fdr.ETD == DateTime.MaxValue ? null : fdr.ETD,
+            Eta = LandingTime(fdr),
             EetMinutes = fdr.EET == TimeSpan.Zero ? null : (int)fdr.EET.TotalMinutes,
             Tas = fdr.TAS > 0 ? fdr.TAS : null,
             TextOnly = fdr.TextOnly,
@@ -1593,6 +1594,24 @@ public class FdrSync
         }
 
         dto.RoutePoints = points;
+    }
+
+    // The estimate for the last point of the route - the landing time vatSys's own Arrival List
+    // shows. Null with no parsed route, or with an estimate vatSys has not worked out (MinValue or
+    // MaxValue).
+    internal static DateTime? LandingTime(FDP2.FDR fdr)
+    {
+        try
+        {
+            if (fdr.ParsedRoute is not { Count: > 0 } route)
+                return null;
+            var eto = route.Last().ETO;
+            return eto.Year > 2000 && eto.Year < 3000 ? eto : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     static void FillAerodromes(OzServerFdrUpdateDto dto, FDP2.FDR fdr)

@@ -60,6 +60,100 @@ static class Selcal32
 
     static bool _applied;
 
+    // For SelcalDebugWindow: what each layer makes of a code right now, read live from vatSys and AFV
+    // rather than from what Apply logged.
+    public static IReadOnlyList<string> Diagnose(string code)
+    {
+        var lines = new List<string>();
+        lines.Add(code.Length == 4 ? $"Code {code}: 4 tones" : $"Code {code}: {code.Length} tones - AFV plays only 4 (SelcalInput.Play)");
+
+        foreach (var c in code)
+        {
+            var kind = Selcal16Tones.IndexOf(c) >= 0 ? "SELCAL16" : AddedTones.Any(t => t.Tone == c) ? "SELCAL32" : "not a tone";
+            var afv = AfvFrequency(c) is { } hz ? $"{hz:0.0} Hz" : "MISSING from AFV's table";
+            lines.Add($"  {c}  {kind,-10}  AFV: {afv}");
+        }
+
+        lines.Add(WindowVerdict(code));
+        lines.Add(AfvAssemblies());
+        lines.Add(_applied ? "Patch: applied at load (see the SELCAL entries in the OzServer log)" : "Patch: not applied");
+        return lines;
+    }
+
+    // The frequency AFV would generate for a tone, from its own table (patched or not). Null when it
+    // has none, which is when SelcalInput.Play throws "Invalid SELCAL tone".
+    public static float? AfvFrequency(char tone)
+    {
+        try
+        {
+            var field = SelcalInputType()
+                ?.GetField("codeLookup", BindingFlags.NonPublic | BindingFlags.Static);
+            return field?.GetValue(null) is Dictionary<char, float> lookup && lookup.TryGetValue(tone, out var hz) ? hz : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    // AFV's SelcalInput, from the very GeoVR.Client vatSys transmits with: the assembly of the type
+    // of vatsys.AFV.Client (NAudioUserClient). Resolving it by name instead could find a different
+    // copy of GeoVR.Client loaded into another context, and patch a table AFV never reads.
+    static Type? SelcalInputType()
+    {
+        var client = typeof(AFV).GetField("Client", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static);
+        return client?.FieldType.Assembly.GetType("GeoVR.Client.SelcalInput", throwOnError: false)
+               ?? Type.GetType("GeoVR.Client.SelcalInput, GeoVR.Client", throwOnError: false);
+    }
+
+    // How many copies of GeoVR.Client are loaded: more than one means a patch by name could miss.
+    static string AfvAssemblies()
+    {
+        var copies = AppDomain.CurrentDomain.GetAssemblies().Where(a => a.GetName().Name == "GeoVR.Client").ToList();
+        var used = SelcalInputType()?.Assembly;
+        return $"AFV: {copies.Count} GeoVR.Client loaded ({string.Join(", ", copies.Select(a => $"{a.GetName().Version}{(a == used ? " - the one vatSys uses" : "")}"))})";
+    }
+
+    // The ICAO frequency for a tone, AFV's table aside - for playing a tone AFV is missing.
+    public static float? IcaoFrequency(char tone) =>
+        AddedTones.Where(t => t.Tone == tone).Select(t => (float?)t.Hz).FirstOrDefault()
+        ?? Selcal16Frequencies.Where(t => t.Tone == tone).Select(t => (float?)t.Hz).FirstOrDefault();
+
+    // ICAO Annex 10 SELCAL16 tones, for IcaoFrequency only: AFV's own values are what is transmitted.
+    static readonly (char Tone, float Hz)[] Selcal16Frequencies =
+    {
+        ('A', 312.6f), ('B', 346.7f), ('C', 384.6f), ('D', 426.6f), ('E', 473.2f), ('F', 524.8f),
+        ('G', 582.1f), ('H', 645.7f), ('J', 716.1f), ('K', 794.3f), ('L', 881.0f), ('M', 977.2f),
+        ('P', 1083.9f), ('Q', 1202.3f), ('R', 1333.5f), ('S', 1479.1f),
+    };
+
+    // Runs the code through the predicates vatSys's SELCAL window is using now - ours once patched.
+    static string WindowVerdict(string code)
+    {
+        try
+        {
+            var closure = typeof(Audio).Assembly.GetType("vatsys.SELCALWindow+<>c", throwOnError: false);
+            var caches = closure?.GetFields(BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static)
+                .Where(f => f.Name.StartsWith("<>9__", StringComparison.Ordinal) && f.FieldType == typeof(Func<char, bool>))
+                .Select(f => f.GetValue(null) as Func<char, bool>)
+                .ToList();
+            if (caches == null || caches.Count == 0)
+                return "vatSys SELCAL window: its character check was not found";
+            if (caches.Any(c => c == null))
+                return "vatSys SELCAL window: not patched (vatSys builds its own SELCAL16 check)";
+
+            var rejected = code.Where(ch => caches.Any(check => check!(ch))).Distinct().ToArray();
+            var patched = caches.All(c => c == IsInvalidTone) ? "patched" : "NOT patched";
+            return rejected.Length == 0
+                ? $"vatSys SELCAL window ({patched}): accepts every character"
+                : $"vatSys SELCAL window ({patched}): rejects {new string(rejected)}";
+        }
+        catch (Exception ex)
+        {
+            return $"vatSys SELCAL window: couldn't check - {ex.Message}";
+        }
+    }
+
     public static void Apply()
     {
         if (_applied)
@@ -91,9 +185,9 @@ static class Selcal32
 
     static bool ExtendAfvTones(out string reason)
     {
-        // Resolved by name from vatSys's own bin folder. The plugin does not reference GeoVR.Client,
+        // Found through vatSys's own AFV client (SelcalInputType). The plugin does not reference GeoVR.Client,
         // and has no need to.
-        var selcalInput = Type.GetType("GeoVR.Client.SelcalInput, GeoVR.Client", throwOnError: false);
+        var selcalInput = SelcalInputType();
         if (selcalInput == null)
         {
             reason = "GeoVR.Client.SelcalInput not found";

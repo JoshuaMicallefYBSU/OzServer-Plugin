@@ -368,6 +368,23 @@ if anything doesn't match the window just stays SELCAL16 (logged under `SELCAL`)
   `Play` (validation) and `AddSignalsToMixer` (frequencies) read. The sixteen SELCAL32 tones are
   added to it. AFV client 2.2.0.0 ships only the sixteen SELCAL16 entries.
 
+**Arrival Lists (`ArrivalListSync.cs`), all reflection targets. If the required ones are missing,
+vatSys's own list is left alone (logged under `Arrivals`):**
+
+- `MMI.ArrivalLists` (internal static `IList<SequenceWindow>`), `SequenceWindow.Airport`, and the
+  internal static event `MMI.ArrivalListWindowsChanged`. Each `SequenceWindow` vatSys opens is closed
+  as it appears and `ArrivalListWindow` opened in its place. This relies on vatSys still opening
+  every Arrival List through `MMI.OpenArrivalListWindow` (which raises the event), and on it being
+  safe to `Close()` one from a `BeginInvoke` after the event. `MMI.OpenArrivalListWindow` (public)
+  reopens vatSys's own when OzServer is turned off.
+- `SequenceLadder.UnsubscribeAirport(string)`, optional. It stops vatSys polling sawbe.com for a list
+  it no longer shows.
+- `ArrivalListWindow` repaints vatSys's `SequenceLadderDX` by hand: its colour identities
+  (`StripBackground`, `StripText`, `ListSeparator`, and the jurisdiction set chosen by `Track.State`
+  as `SelectBrush` does), its fonts (`eurofont_sml` for the callsign, `eurofont_winsml` for the rest),
+  its 26 px strips, and the landing time it shows (the `ETO` of `ParsedRoute.Last()`, which FdrSync
+  sends as `eta`). A vatSys restyle of its own list would not carry across.
+
 **Plugin loading:**
 
 - The exact scanned folders (`<dataset path>\Plugins`, `<program folder>\bin\Plugins`) — private to

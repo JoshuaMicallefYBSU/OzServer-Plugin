@@ -264,6 +264,9 @@ public class OzServerFdrUpdateDto
     [JsonProperty("assigned_ssr_code")] public int? AssignedSsrCode { get; set; }
     [JsonProperty("atd")] public DateTime? Atd { get; set; }
     [JsonProperty("etd")] public DateTime? Etd { get; set; }
+    // The landing time: the estimate for the last point of the parsed route, as vatSys's own Arrival
+    // List shows it. What the Arrival List window shows (ArrivalListWindow).
+    [JsonProperty("eta")] public DateTime? Eta { get; set; }
     [JsonProperty("eet_minutes")] public int? EetMinutes { get; set; }
     [JsonProperty("tas")] public int? Tas { get; set; }
     [JsonProperty("text_only")] public bool? TextOnly { get; set; }
@@ -346,6 +349,49 @@ public class OzServerRoutePointDto
     public bool ShouldSerializeVolume() => Volume != null;
     public bool ShouldSerializeSector() => Sector != null;
     public bool ShouldSerializeSectorCallsign() => SectorCallsign != null;
+}
+
+// One airport's Arrival List (GET /arrivals/:ades, and the answer to a reorder) - see
+// ArrivalListWindow. Flights are listed top of the window first: the unsequenced ones above the
+// bar, then the sequence from its top down.
+public class OzServerArrivalListDto
+{
+    [JsonProperty("ades")] public string Ades { get; set; } = "";
+    [JsonProperty("flights")] public List<OzServerArrivalFlightDto> Flights { get; set; } = new();
+    // How many controllers have this airport's list open, this one included.
+    [JsonProperty("viewers")] public int Viewers { get; set; }
+    // Their callsigns, for the hover on the window's Connected badge.
+    [JsonProperty("viewer_callsigns")] public List<string> ViewerCallsigns { get; set; } = new();
+    [JsonProperty("fmp")] public OzServerArrivalFmpDto Fmp { get; set; } = new();
+    // Whether this controller may reorder the list: anyone while the FMP is offline, only the FMP
+    // while it is online. The backend enforces it either way.
+    [JsonProperty("can_move")] public bool CanMove { get; set; }
+}
+
+public class OzServerArrivalFmpDto
+{
+    // The flow position the airport's list belongs to: CB_FMP for YSCB.
+    [JsonProperty("position")] public string Position { get; set; } = "";
+    [JsonProperty("online")] public bool Online { get; set; }
+    // The callsign it is online under (CB_FMP, or a relief CB_1_FMP); null while offline.
+    [JsonProperty("callsign")] public string? Callsign { get; set; }
+}
+
+public class OzServerArrivalFlightDto
+{
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    // -1: not sequenced (above the bar). Otherwise 0 is the bottom of the sequence.
+    [JsonProperty("seq_index")] public int SeqIndex { get; set; }
+    // As FdrSync sent them: the landing time, type, wake and global ops.
+    [JsonProperty("eta")] public DateTime? Eta { get; set; }
+    [JsonProperty("aircraft_type")] public string? AircraftType { get; set; }
+    [JsonProperty("aircraft_wake")] public string? AircraftWake { get; set; }
+    [JsonProperty("global_op_data")] public string? GlobalOpData { get; set; }
+}
+
+public class OzServerArrivalViewersDto
+{
+    [JsonProperty("viewers")] public Dictionary<string, int> Viewers { get; set; } = new();
 }
 
 // POST /atis: one airport's current ATIS on this server, kept for the next controller on the
@@ -602,6 +648,19 @@ public class OzServerApiClient
     // route_points, most of a record's size, out of this list; GetFlightAsync returns it.
     public Task<List<OzServerFdrRecordDto>> GetAllFlightsAsync() =>
         GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
+
+    // The Arrival List window's data - see ArrivalListWindow.
+    public Task<OzServerArrivalListDto> GetArrivalListAsync(string ades) =>
+        GetAsync<OzServerArrivalListDto>($"/arrivals/{Uri.EscapeDataString(ades)}", () => new OzServerArrivalListDto { Ades = ades });
+
+    // A flight dragged to a new place. The backend refuses (403) a flight another controller has,
+    // on the same terms as an FDR update.
+    public Task<OzServerArrivalListDto> SetArrivalSequenceAsync(string ades, string callsign, int seqIndex) =>
+        PostAsync<OzServerArrivalListDto>($"/arrivals/{Uri.EscapeDataString(ades)}/sequence", new { callsign, seq_index = seqIndex });
+
+    // Every Arrival List this controller has open. Answers how many controllers have each open.
+    public Task<OzServerArrivalViewersDto> ReportArrivalListsOpenAsync(IEnumerable<string> airports) =>
+        PostAsync<OzServerArrivalViewersDto>("/arrivals/viewing", new { airports = airports.ToArray() });
 
     // Console messages waiting for this controller - see DeveloperMessages. The backend records them
     // as delivered as it answers.
