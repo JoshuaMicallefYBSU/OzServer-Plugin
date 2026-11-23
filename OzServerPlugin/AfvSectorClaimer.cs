@@ -648,6 +648,15 @@ public class AfvSectorClaimer
         if (!_tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner))
             return;
 
+        // A controller without the plugin can't be asked (ExternalControl): nothing of theirs stays
+        // on the scope, and the controller is told to coordinate it by hand.
+        if (owner.External)
+        {
+            DeferOnUiThread(() => RemoveHeldFromMmi(sector, owner.Cid));
+            ExternalControl.Notify(new[] { sector.Name }, owner.Callsign);
+            return;
+        }
+
         // Kept out of the claim path while this is being decided, so the tracker does not also try
         // to claim it and ask its own "already owned" question about the same press.
         _tracker.HoldForTransmitPrompt(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));

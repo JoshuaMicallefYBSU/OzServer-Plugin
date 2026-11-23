@@ -90,6 +90,8 @@ public class OzServerSyncDto
     // Every controller whose plugin is calling OzServer now, sectors or not. Null from a backend
     // that predates the list - see OzServerOwnershipTracker.PluginClients.
     [JsonProperty("plugin_clients")] public List<OzServerControlledSectorOwnerDto>? PluginClients { get; set; }
+    // Controllers without the plugin whose airspace is among Controlled (Owner.External).
+    [JsonProperty("external_controllers")] public List<OzServerExternalControllerDto>? ExternalControllers { get; set; }
 }
 
 public class OzServerAcceptBatchResultDto
@@ -169,6 +171,30 @@ public class OzServerControlledSectorOwnerDto
 {
     [JsonProperty("cid")] public int Cid { get; set; }
     [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    // A controller connected without the plugin, whose airspace OzServer counts as held (the API's
+    // external-control.ts). Nothing can be requested from them: see ExternalControl. Their Cid is 0
+    // where OzServer does not know it.
+    [JsonProperty("external")] public bool External { get; set; }
+}
+
+// One controller connected without the plugin, as OzServer worked out their airspace.
+public class OzServerExternalControllerDto
+{
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    [JsonProperty("sectors")] public List<string> Sectors { get; set; } = new();
+}
+
+// What this client's vatSys sees of one other controller (POST /network/controllers).
+public class OzServerNetworkControllerDto
+{
+    [JsonProperty("callsign")] public string Callsign { get; set; } = "";
+    [JsonProperty("real_name")] public string? RealName { get; set; }
+    [JsonProperty("frequencies")] public List<string> Frequencies { get; set; } = new();
+    // Their position, by the profile's Positions.xml (PrimaryPosition.DefaultSectorsForCurrentSession).
+    [JsonProperty("sectors")] public List<string> Sectors { get; set; } = new();
+    // Their controller information lines, which often say what else they are covering
+    // ("Extending MUN, GUN"). Read by the API, not here.
+    [JsonProperty("atis")] public List<string> Atis { get; set; } = new();
 }
 
 // One sector another controller owns. The backend expands a claimed grouping sector (e.g. TBD)
@@ -659,6 +685,10 @@ public class OzServerApiClient
         PostAsync<OzServerArrivalListDto>($"/arrivals/{Uri.EscapeDataString(ades)}/sequence", new { callsign, seq_index = seqIndex });
 
     // Every Arrival List this controller has open. Answers how many controllers have each open.
+    // Every controller this client's vatSys can see - see ExternalControl.
+    public Task ReportNetworkControllersAsync(IEnumerable<OzServerNetworkControllerDto> controllers) =>
+        PostAsync("/network/controllers", new { controllers = controllers.ToArray() });
+
     public Task<OzServerArrivalViewersDto> ReportArrivalListsOpenAsync(IEnumerable<string> airports) =>
         PostAsync<OzServerArrivalViewersDto>("/arrivals/viewing", new { airports = airports.ToArray() });
 

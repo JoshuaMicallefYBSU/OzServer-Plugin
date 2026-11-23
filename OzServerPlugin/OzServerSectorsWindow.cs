@@ -1900,8 +1900,10 @@ public class OzServerSectorsWindow : BaseForm
                 continue;
 
             controlled.Add(sector);
+            // Marked on the row itself, and consistently, since SameOwner compares these: a
+            // controller without the plugin can't be asked for it (ExternalControl).
             if (!string.IsNullOrEmpty(dto.Owner?.Callsign))
-                owners[sector.Name] = dto.Owner!.Callsign;
+                owners[sector.Name] = dto.Owner!.External ? $"{dto.Owner.Callsign} - no plugin" : dto.Owner.Callsign;
         }
 
         var sectorNodes = new List<TreeNode>();
@@ -2447,9 +2449,16 @@ public class OzServerSectorsWindow : BaseForm
         // Sub-sectors of something that was claimed, left with their current owner. Reported so
         // the controller knows part of the group stayed behind; they are not requested
         // automatically - staging one is how it is asked for.
-        if (result.Skipped.Count > 0)
+        // Held by controllers without the plugin: explained separately, since asking is no use.
+        var external = result.Skipped.Distinct()
+            .Where(name => _tracker.ControlledByOthers.TryGetValue(name, out var o) && o.External)
+            .ToList();
+        foreach (var holder in external.GroupBy(name => _tracker.ControlledByOthers[name].Callsign, StringComparer.OrdinalIgnoreCase))
+            ExternalControl.Notify(holder, holder.Key);
+
+        if (result.Skipped.Distinct().Count() > external.Count)
         {
-            var described = result.Skipped.Distinct().Select(DescribeWithCurrentOwner).ToList();
+            var described = result.Skipped.Distinct().Except(external).Select(DescribeWithCurrentOwner).ToList();
             parts.Add((described.Count == 1
                           ? "This sector is already owned by another controller and was left with them. Move it across on its own to request it:"
                           : "These sectors are already owned by other controllers and were left with them. Move one across on its own to request it:")
@@ -2662,6 +2671,16 @@ public class OzServerSectorsWindow : BaseForm
     // diverges from _tracker.Owned, and SyncOwnedFromTracker leaves it alone until Apply or Cancel.
     void StageSectorChange(SectorsVolumes.Sector sector, bool owned)
     {
+        // Held by a controller without the plugin: there is nobody to send a request to, so it is
+        // not staged, and the controller is told to coordinate it by hand.
+        if (owned && _tracker.ControlledByOthers.TryGetValue(sector.Name, out var holder) && holder.External)
+        {
+            ExternalControl.Notify(new[] { sector.Name }, holder.Callsign);
+            _availSectorsView.SelectedNode = null;
+            UpdateArrowButton();
+            return;
+        }
+
         // Taking a sector somebody else holds is a request, not a claim, and is shown as one from
         // the moment it is staged: under Requested By Me, marked as staged because nothing has
         // been sent. The selection is dropped, since the row has moved to a different list.

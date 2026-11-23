@@ -50,6 +50,7 @@ public class Plugin : IPlugin
     readonly DeveloperMessages _developerMessages;
     // vatSys's Arrival Lists, served from OzServer rather than vatSys's own sequence server.
     readonly ArrivalListSync _arrivalListSync;
+    readonly ExternalControl _externalControl;
     SelcalDebugWindow? _selcalDebugWindow;
     // Driven by Network's events: a position is handed back whether or not the Sectors window was
     // ever opened.
@@ -143,6 +144,9 @@ public class Plugin : IPlugin
         // Swaps the HttpClient vatSys's Arrival Lists poll through, once, at load. Until a session
         // on a supported server starts, every request still goes to vatSys's own server.
         _arrivalListSync = new ArrivalListSync();
+        // Reports the controllers vatSys can see, so OzServer can hold the airspace of those without
+        // the plugin.
+        _externalControl = new ExternalControl();
 
         var sectorsMenuItem = new CustomToolStripMenuItem(
             CustomToolStripMenuItemWindowType.Main,

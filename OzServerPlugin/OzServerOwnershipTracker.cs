@@ -1882,7 +1882,14 @@ public class OzServerOwnershipTracker
         //     rule for giving a sector to its controller). It is theirs, not cover to take back:
         //     BLA logging on while ML_APP was online asked ML_APP for MAE, which BLA only works
         //     top-down when ML_APP is away.
-        var reliefCover = conflicts.Where(c => PrimaryPosition.IsFlowCallsign(c.Owner?.Callsign)
+        //   - Anything held by a controller without the plugin (Owner.External): nobody can answer.
+        //     The controller is told to coordinate it by hand instead (ExternalControl.Notify).
+        var external = conflicts.Where(c => c.Owner?.External == true).ToList();
+        foreach (var holder in external.GroupBy(c => c.Owner!.Callsign, StringComparer.OrdinalIgnoreCase))
+            ExternalControl.Notify(holder.Select(c => c.Sector), holder.Key);
+
+        var reliefCover = conflicts.Where(c => c.Owner?.External == true
+                                               || PrimaryPosition.IsFlowCallsign(c.Owner?.Callsign)
                                                || IsHeldForTransmitPrompt(c.Sector)
                                                || HeldByItsOwnController(c)).ToList();
         if (reliefCover.Count > 0)

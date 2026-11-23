@@ -120,6 +120,7 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 | `CoupleAssist.cs` | Couples an activated flight plan to its radar track by callsign |
 | `FmpLevelFilter.cs` | Applies the 998–999 level filter on flow positions |
 | `ArrivalListSync.cs` | Opens OzServer's Arrival List in place of vatSys's, keeps each one current, and reports which are open |
+| `ExternalControl.cs` | Reports the controllers vatSys can see, and explains (instead of requesting) when a sector is held by a controller without the plugin |
 | `ArrivalListWindow.cs` | The Arrival List window itself, drawn to match vatSys's |
 
 ### ATIS
@@ -156,6 +157,7 @@ All under `{BaseUrl}/api/v1`. Every call carries `controller_cid`, `controller_c
 | `GET /fdr/sync` · `GET /fdr/{callsign}` | Server-side flight records, for label state and resume |
 | `GET /arrivals/{ades}` · `POST /arrivals/{ades}/sequence` | An Arrival List, and a drag within it |
 | `POST /arrivals/viewing` | The Arrival Lists open here; answers how many controllers have each open |
+| `POST /network/controllers` | The controllers vatSys can see: callsign, frequencies, Positions.xml sectors and information lines |
 | `POST /atis` | The ATIS handover record, keyed by ICAO and server |
 | `PUT /vatsim/atis/{icao}` | Publishes the broadcast itself for the public map; live network only |
 | `POST /client-logs` | Forwarded log lines |

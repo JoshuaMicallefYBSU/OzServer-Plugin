@@ -812,7 +812,8 @@ public class FdrSync
         var tracker = fdr.ControllerTracking?.Callsign;
         if (!fdr.IsTracked || fdr.IsTrackedByMe || string.IsNullOrEmpty(tracker))
             return false;
-        if (_tracker.ControlledByOthers.Values.Any(o => string.Equals(o.Callsign, tracker, StringComparison.OrdinalIgnoreCase)))
+        // Not a holder without the plugin (External): their sectors are listed, but they report nothing.
+        if (_tracker.ControlledByOthers.Values.Any(o => !o.External && string.Equals(o.Callsign, tracker, StringComparison.OrdinalIgnoreCase)))
             return false;
 
         if (_tracker.PluginClients is { } pluginClients)
