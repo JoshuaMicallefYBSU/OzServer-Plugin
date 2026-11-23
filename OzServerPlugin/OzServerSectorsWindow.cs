@@ -2709,6 +2709,18 @@ public class OzServerSectorsWindow : BaseForm
             return;
         }
 
+        // One enroute position more than this controller may work (issue #11), counting what is on
+        // the Owned list and what is staged to be requested: not staged at all.
+        if (owned
+            && !_sectorsSelected.Any(s => !s.IsDummy && s.Name == sector.Name)
+            && !ExtensionLimit.Allows(sector, _sectorsSelected.Concat(_stagedRequests)))
+        {
+            ExtensionLimit.ReportFull(sector);
+            _availSectorsView.SelectedNode = null;
+            UpdateArrowButton();
+            return;
+        }
+
         // Held for a controller whose connection dropped: nobody can answer a request, so the
         // controller is asked whether to take it instead (ConfirmTakeDroppedAsync). Yes stages it as
         // an ordinary claim, which Apply sends with takeDropped; No leaves it where it is.

@@ -503,6 +503,16 @@ public class AfvSectorClaimer
                 return;
             }
 
+            // One enroute position more than this controller may work (issue #11): nothing is
+            // taken, and the line goes back to Receive.
+            if (!_tracker.IsMine(frequencySector) && !ExtensionLimit.Allows(frequencySector, _tracker.Owned))
+            {
+                ExtensionLimit.ReportFull(frequencySector);
+                frequency.Transmit = false;
+                frequency.Receive = true;
+                return;
+            }
+
             var withheld = new HashSet<string>(
                 PrimaryPosition.StaffedCoveredSectors(frequencySector, myCallsign),
                 StringComparer.OrdinalIgnoreCase);
@@ -654,6 +664,20 @@ public class AfvSectorClaimer
         {
             DeferOnUiThread(() => RemoveHeldFromMmi(sector, owner.Cid));
             ExternalControl.Notify(new[] { sector.Name }, owner.Callsign);
+            return;
+        }
+
+        // Neither asked for nor taken when it would be one enroute position too many (issue #11).
+        if (!ExtensionLimit.Allows(sector, _tracker.Owned))
+        {
+            DeferOnUiThread(() =>
+            {
+                RemoveHeldFromMmi(sector, owner.Cid);
+                if (frequency.Transmit)
+                    frequency.Transmit = false;
+                frequency.Receive = true;
+            });
+            ExtensionLimit.ReportFull(sector);
             return;
         }
 

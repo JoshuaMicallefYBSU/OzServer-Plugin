@@ -101,6 +101,7 @@ public class Plugin : IPlugin
         _ownershipTracker = new OzServerOwnershipTracker();
         // As early as possible: its VSCSFrequenciesChanged handler has to run before VatpacPlugin's.
         VscsLines.Initialise(_ownershipTracker);
+        ExtensionLimit.Initialise();
         // After the tracker: its connect-time grant keeps the tracker's RecentlyResumed sectors.
         _afvSectorClaimer = new AfvSectorClaimer(_ownershipTracker);
         // A request sent from a VSCS transmit press opens the Sectors window on it.

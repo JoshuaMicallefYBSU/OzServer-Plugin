@@ -74,6 +74,57 @@ static class VscsLines
 
         foreach (var sector in primaries)
             TransmitOn(sector, reason);
+
+        RemoveSubSectorLines(primaries, reason);
+    }
+
+    // The lines of sub-sectors this controller now works through their primary's line (issue #11):
+    // the airspace is answered on the primary's frequency, so they only clog the panel. Left alone:
+    // a line that is transmitting (the controller chose to), the logon station's, one waiting to be
+    // switched on, and a sub-sector somebody else holds (a neighbour's frequency worth keeping).
+    //
+    // Also what keeps VatpacPlugin's Sectors.CheckActive off them: it drops any controlled sector
+    // whose line is on the panel without transmitting, and every tag inside it with it (PHR, on
+    // PH_APP's logon on 23 Nov 2026).
+    static void RemoveSubSectorLines(IEnumerable<SectorsVolumes.Sector> primaries, string reason)
+    {
+        if (OzServerMode.Disabled || !Network.IsConnected)
+            return;
+
+        List<string> waiting;
+        lock (_pending)
+            waiting = _pending.Keys.ToList();
+
+        foreach (var primary in primaries)
+        {
+            var stations = PrimaryPosition.CoveredBy(primary)
+                .Where(s => !s.Equals(primary) && _tracker?.IsMine(s) == true)
+                .Select(s => s.Callsign)
+                .Where(station => !string.IsNullOrEmpty(station)
+                                  && !string.Equals(station, primary.Callsign, StringComparison.OrdinalIgnoreCase)
+                                  && !string.Equals(station, Network.Callsign, StringComparison.OrdinalIgnoreCase)
+                                  && !waiting.Contains(station, StringComparer.OrdinalIgnoreCase))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var line in Audio.VSCSFrequencies.Where(f => stations.Contains(f.Name) && !f.Transmit).ToList())
+            {
+                try
+                {
+                    Audio.RemoveFrequency(line);
+                    ActionLog.Log("Primary", $"Removed VSCS line {line.Name} - worked on {primary.Name}'s line ({reason})", new
+                    {
+                        action = "vscs_subsector_line_removed",
+                        removed = line.Name,
+                        primary = primary.Name,
+                        reason
+                    });
+                }
+                catch (Exception ex)
+                {
+                    ErrorThrottle.Report("vscs-remove:" + line.Name, $"Couldn't remove the VSCS line {line.Name}: {ex.Message}", ex);
+                }
+            }
+        }
     }
 
     public static void TransmitOn(SectorsVolumes.Sector sector, string reason)
