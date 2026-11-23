@@ -112,8 +112,8 @@ static class ExtensionLimit
         var message = $"Unable to add sector {sector.Name}, Maximum of {MaxPositions} ENR Sectors has already been reached."
                       + Environment.NewLine + Environment.NewLine
                       + (_hours is { } hours && hours < ExperiencedHours
-                          ? $"Controllers with under {ExperiencedHours:0} hours at C1 and above may work their own position and {Extensions} extensions."
-                          : $"Controllers may work their own position and {ExperiencedExtensions} extensions.")
+                          ? $"Controllers with under {ExperiencedHours:0} hours at C1 and above may work their own position and {Extensions} extensions. Refer ATS Policy 2.13.3 for details."
+                          : $"Controllers may work their own position and {ExperiencedExtensions} extensions. Refer ATS Policy 2.13.3 for details.")
                       + " Release a sector first to add another.";
 
         MMI.InvokeOnGUI(() =>

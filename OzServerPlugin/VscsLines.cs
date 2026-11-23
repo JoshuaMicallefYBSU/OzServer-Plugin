@@ -73,9 +73,41 @@ static class VscsLines
             .ToList();
 
         foreach (var sector in primaries)
+        {
+            if (IsOtherTier(sector))
+            {
+                ActionLog.Log("Primary", $"Left {sector.Name}'s VSCS line alone - {reason}, but not this position's ENR/APP tier", new
+                {
+                    action = "vscs_transmit_skipped_other_tier",
+                    sector = sector.Name,
+                    station = sector.Callsign,
+                    own_callsign = Network.Callsign,
+                    reason
+                });
+                continue;
+            }
+
             TransmitOn(sector, reason);
+        }
 
         RemoveSubSectorLines(primaries, reason);
+    }
+
+    // Automatic transmit stays within this position's own tier: an enroute controller is put on
+    // enroute lines, an approach controller on APP/DEP lines, never one onto the other's. ENR
+    // covering an approach unit's airspace after it logs off keeps the airspace, not the frequency.
+    // Positions that are neither (TWR, FMP, ...), and sectors that are neither, are not restricted.
+    static bool IsOtherTier(SectorsVolumes.Sector sector)
+    {
+        var own = Network.Callsign;
+        if (string.IsNullOrEmpty(own))
+            return false;
+
+        var ownEnroute = own.EndsWith("_CTR", StringComparison.OrdinalIgnoreCase) || own.EndsWith("_FSS", StringComparison.OrdinalIgnoreCase);
+        var ownTma = own.EndsWith("_APP", StringComparison.OrdinalIgnoreCase) || own.EndsWith("_DEP", StringComparison.OrdinalIgnoreCase);
+
+        return (ownEnroute && PrimaryPosition.IsTmaSector(sector))
+               || (ownTma && ExtensionLimit.IsEnroute(sector));
     }
 
     // The lines of sub-sectors this controller now works through their primary's line (issue #11):
