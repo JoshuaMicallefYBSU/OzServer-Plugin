@@ -657,6 +657,17 @@ public class AfvSectorClaimer
             return;
         }
 
+        // Held for a controller whose connection dropped: nobody can answer a request, so the
+        // controller is asked whether to take it now instead (ConfirmTakeDroppedAsync). Off the
+        // scope until they say yes, like a request.
+        if (owner.Dropped)
+        {
+            _tracker.HoldForTransmitPrompt(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));
+            DeferOnUiThread(() => RemoveHeldFromMmi(sector, owner.Cid));
+            _ = TakeDroppedFromTransmitAsync(frequency, sector, owner);
+            return;
+        }
+
         // Kept out of the claim path while this is being decided, so the tracker does not also try
         // to claim it and ask its own "already owned" question about the same press.
         _tracker.HoldForTransmitPrompt(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));
@@ -725,6 +736,38 @@ public class AfvSectorClaimer
             prompt.BringToFront();
             timeout.Start();
         });
+    }
+
+    // The sector and whatever under it the same dropped controller holds, which is what a claim of
+    // it takes. Yes claims it (staying on Transmit, as pressed); No goes back to Receive.
+    async System.Threading.Tasks.Task TakeDroppedFromTransmitAsync(VSCSFrequency frequency, SectorsVolumes.Sector sector, OzServerControlledSectorOwnerDto owner)
+    {
+        var held = PrimaryPosition.CoveredBy(sector)
+            .Where(s => _tracker.ControlledByOthers.TryGetValue(s.Name, out var o) && o.Dropped && o.Cid == owner.Cid)
+            .Select(s => new OzServerSectorConflictDto { Sector = s.Name, Owner = _tracker.ControlledByOthers[s.Name] })
+            .ToList();
+        if (held.Count == 0)
+            held.Add(new OzServerSectorConflictDto { Sector = sector.Name, Owner = owner });
+
+        bool take;
+        try
+        {
+            take = await _tracker.ConfirmTakeDroppedAsync(held, askAgain: true);
+        }
+        catch (Exception ex)
+        {
+            OzErrors.Add(new Exception($"Couldn't ask about {sector.Name}: {ex.Message}", ex), "OzServer");
+            take = false;
+        }
+
+        if (!take)
+        {
+            RunOnUiThread(() => BackToReceive(frequency, sector));
+            return;
+        }
+
+        _tracker.ReleaseTransmitPromptHold(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));
+        await _tracker.ClaimAsync(sector);
     }
 
     async System.Threading.Tasks.Task RequestFromTransmitAsync(SectorsVolumes.Sector sector)

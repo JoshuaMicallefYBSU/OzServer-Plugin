@@ -354,6 +354,13 @@ public class OzServerOwnershipTracker
             lock (_ownPositionDeclined)
                 _ownPositionDeclined.Clear();
 
+            // And so is either answer about a dropped controller's sectors.
+            lock (_takeDroppedGate)
+            {
+                _takeDroppedAgreed.Clear();
+                _takeDroppedDeclined.Clear();
+            }
+
             ResetSession();
         };
         _pollTimer = new System.Threading.Timer(_ =>
@@ -839,7 +846,9 @@ public class OzServerOwnershipTracker
                 exclude.Add(name);
         }
 
-        return await _api.ClaimSectorAsync(sector.Name, exclude);
+        // Anything a dropped controller holds is taken only once this controller has agreed to it
+        // (ConfirmTakeDroppedAsync).
+        return await _api.ClaimSectorAsync(sector.Name, exclude, CoversAgreedDropped(sector));
     }
 
     // Takes back top-down cover that was withheld while somebody was logged on as it, once they
@@ -1479,7 +1488,9 @@ public class OzServerOwnershipTracker
                 toClaim.Select(s => s.Name),
                 toRelease.Select(s => s.Name),
                 (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name),
-                staffed);
+                staffed,
+                // Staged from a dropped controller after the window asked (ConfirmTakeDroppedAsync).
+                toClaim.Any(CoversAgreedDropped));
 
             result.Claimed.AddRange(response.Result.Claimed);
             result.Released.AddRange(response.Result.Released);
@@ -1884,6 +1895,18 @@ public class OzServerOwnershipTracker
         //     top-down when ML_APP is away.
         //   - Anything held by a controller without the plugin (Owner.External): nobody can answer.
         //     The controller is told to coordinate it by hand instead (ExternalControl.Notify).
+        //   - Anything held for a controller whose connection dropped (Owner.Dropped): nobody can
+        //     answer that either. The controller is asked whether to take it now instead
+        //     (ConfirmTakeDroppedAsync), and it is claimed with the rest if they say so.
+        var dropped = conflicts.Where(c => c.Owner?.Dropped == true).ToList();
+        var takeDropped = dropped.Count > 0 && await ConfirmTakeDroppedAsync(dropped);
+        // What the claim below leaves out and what is pulled back out of MMI: every conflict, less
+        // the dropped controller's sectors once this controller has agreed to take them.
+        IReadOnlyList<OzServerSectorConflictDto> leaveOut = takeDropped
+            ? conflicts.Where(c => !dropped.Contains(c)).ToList()
+            : conflicts;
+        conflicts = conflicts.Where(c => !dropped.Contains(c)).ToList();
+
         var external = conflicts.Where(c => c.Owner?.External == true).ToList();
         foreach (var holder in external.GroupBy(c => c.Owner!.Callsign, StringComparer.OrdinalIgnoreCase))
             ExternalControl.Notify(holder.Select(c => c.Sector), holder.Key);
@@ -1923,7 +1946,7 @@ public class OzServerOwnershipTracker
             .Select(conflict => SectorDescription.DescribeWithOwner(conflict.Sector, conflict.Owner?.Callsign))
             .ToList();
 
-        var contestedNames = new HashSet<string>(conflicts.Select(c => c.Sector), StringComparer.OrdinalIgnoreCase);
+        var contestedNames = new HashSet<string>(leaveOut.Select(c => c.Sector), StringComparer.OrdinalIgnoreCase);
         var staffed = new HashSet<string>(
             PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign), StringComparer.OrdinalIgnoreCase);
         var taking = PrimaryPosition.CoveredBy(sector)
@@ -1954,14 +1977,14 @@ public class OzServerOwnershipTracker
         // holds contests all of it, and a retry that excludes every sector the claim covers has
         // nothing to do.
         var leftOut = new HashSet<string>(
-            conflicts.Select(c => c.Sector).Concat(PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign)),
+            leaveOut.Select(c => c.Sector).Concat(PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign)),
             StringComparer.OrdinalIgnoreCase);
 
         if (PrimaryPosition.CoveredBy(sector).Any(covered => !leftOut.Contains(covered.Name)))
         {
             try
             {
-                await ClaimWithExclusionsAsync(sector, conflicts.Select(c => c.Sector));
+                await ClaimWithExclusionsAsync(sector, leaveOut.Select(c => c.Sector));
             }
             catch (Exception ex)
             {
@@ -1971,7 +1994,7 @@ public class OzServerOwnershipTracker
 
         RunOnUiThread(() =>
         {
-            var contested = conflicts
+            var contested = leaveOut
                 .Select(c => SectorsVolumes.Sectors.FirstOrDefault(s => s.Name == c.Sector))
                 .Where(s => s != null)
                 .Select(s => s!)
@@ -1988,6 +2011,116 @@ public class OzServerOwnershipTracker
                     freq.Transmit = false;
             }
         });
+    }
+
+    // Sectors held for a controller whose connection dropped (Owner.Dropped) that this controller has
+    // agreed to take, each until the server would have freed it anyway (ReleasedAt). Any claim
+    // covering one is sent with takeDropped. And the prompts open and answered No, by the sorted
+    // sector list, so the claim pass's retries neither stack nor repeat them. Cleared on
+    // disconnect.
+    readonly Dictionary<string, DateTime> _takeDroppedAgreed = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _takeDroppedAsking = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> _takeDroppedDeclined = new(StringComparer.OrdinalIgnoreCase);
+    readonly object _takeDroppedGate = new();
+
+    public bool AgreedToTakeDropped(string sectorName)
+    {
+        lock (_takeDroppedGate)
+            return _takeDroppedAgreed.TryGetValue(sectorName, out var until) && DateTime.UtcNow < until;
+    }
+
+    bool CoversAgreedDropped(SectorsVolumes.Sector sector) =>
+        PrimaryPosition.CoveredBy(sector).Any(s => AgreedToTakeDropped(s.Name));
+
+    // A controller dropped without releasing, and OzServer keeps their sectors for them for a few
+    // minutes in case they come straight back (the API's DISCONNECT_GRACE_MINUTES). They can still
+    // be taken - a crash should not leave airspace unworkable - but only once the controller taking
+    // them has been told whose they are and until when, since the dropped controller may be back
+    // any moment expecting them. Answers whether to take them.
+    //
+    // askAgain is for the controller's own explicit actions (a transmit press, the Sectors window),
+    // which ask even after an earlier No; the claim pass's automatic retries do not.
+    public async Task<bool> ConfirmTakeDroppedAsync(IReadOnlyList<OzServerSectorConflictDto> held, bool askAgain = false)
+    {
+        held = held.Where(c => c.Owner?.Dropped == true).ToList();
+        var names = held.Select(c => c.Sector).Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList();
+        if (names.Count == 0)
+            return false;
+        if (names.All(AgreedToTakeDropped))
+            return true;
+
+        var key = string.Join(",", names);
+        lock (_takeDroppedGate)
+        {
+            if ((!askAgain && _takeDroppedDeclined.Contains(key)) || !_takeDroppedAsking.Add(key))
+                return false;
+        }
+
+        try
+        {
+            var owners = held.Select(c => c.Owner!)
+                .GroupBy(o => o.Callsign, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
+            var who = string.Join(", ", owners.Select(o => o.Callsign));
+            var lastSeen = owners.Where(o => o.LastSeenAt != null).Select(o => o.LastSeenAt!.Value.ToUniversalTime()).DefaultIfEmpty().Max();
+            var until = owners.Where(o => o.ReleasedAt != null).Select(o => o.ReleasedAt!.Value.ToUniversalTime()).DefaultIfEmpty().Max();
+            if (until == default)
+                until = DateTime.UtcNow.AddMinutes(2);
+
+            var nl = Environment.NewLine;
+            var droppedAt = lastSeen == default
+                ? ""
+                : $" at {lastSeen:HH:mm}Z ({Math.Max(0, (int)(DateTime.UtcNow - lastSeen).TotalMinutes)} min ago)";
+            var message = (names.Count == 1 ? "This sector is" : "These sectors are")
+                          + $" held for {who}, who disconnected without releasing{droppedAt}."
+                          + nl + nl
+                          + "Held:" + nl
+                          + string.Join(nl, held.Select(c => SectorDescription.DescribeWithOwner(c.Sector, c.Owner?.Callsign)))
+                          + nl + nl
+                          + $"They are kept for {who} until {until:HH:mm}Z in case they reconnect, but can be taken now if required."
+                          + $" If {who} comes back, coordinate with them."
+                          + nl + nl
+                          + (names.Count == 1 ? "Take this sector now?" : "Take these sectors now?");
+
+            var answer = await AskYesNoAsync(message, "Sectors held for a disconnected controller", "Take Sectors", "Leave");
+
+            ActionLog.Log("Ownership",
+                answer
+                    ? $"Taking {key} from {who} - disconnected, held until {until:HH:mm}Z"
+                    : $"Leaving {key} with {who} - disconnected, held until {until:HH:mm}Z",
+                new
+                {
+                    action = answer ? "take_dropped_accepted" : "take_dropped_declined",
+                    sectors = names.ToArray(),
+                    owners = owners.Select(o => o.Callsign).ToArray(),
+                    last_seen_at = lastSeen == default ? (DateTime?)null : lastSeen,
+                    released_at = until,
+                    own_callsign = Network.Me?.Callsign
+                });
+
+            lock (_takeDroppedGate)
+            {
+                if (answer)
+                {
+                    foreach (var name in names)
+                        _takeDroppedAgreed[name] = until;
+                    _takeDroppedDeclined.Remove(key);
+                }
+                else
+                {
+                    _takeDroppedDeclined.Add(key);
+                }
+            }
+
+            return answer;
+        }
+        finally
+        {
+            lock (_takeDroppedGate)
+                _takeDroppedAsking.Remove(key);
+        }
     }
 
     // Own-position prompts, by the sorted sector list they ask about: open right now, and answered

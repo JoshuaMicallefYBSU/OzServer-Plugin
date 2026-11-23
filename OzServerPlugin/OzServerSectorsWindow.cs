@@ -1903,7 +1903,9 @@ public class OzServerSectorsWindow : BaseForm
             // Marked on the row itself, and consistently, since SameOwner compares these: a
             // controller without the plugin can't be asked for it (ExternalControl).
             if (!string.IsNullOrEmpty(dto.Owner?.Callsign))
-                owners[sector.Name] = dto.Owner!.External ? $"{dto.Owner.Callsign} - no plugin" : dto.Owner.Callsign;
+                owners[sector.Name] = dto.Owner!.External ? $"{dto.Owner.Callsign} - no plugin"
+                    : dto.Owner.Dropped ? $"{dto.Owner.Callsign} - disconnected{(dto.Owner.ReleasedAt is { } until ? $", held until {until.ToUniversalTime():HH:mm}Z" : "")}"
+                    : dto.Owner.Callsign;
         }
 
         var sectorNodes = new List<TreeNode>();
@@ -2665,6 +2667,32 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
+    // The owner of a sector held for a controller whose connection dropped, or null.
+    OzServerControlledSectorOwnerDto? DroppedHolder(SectorsVolumes.Sector sector) =>
+        _tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner) && owner.Dropped ? owner : null;
+
+    // Asks, then stages the sector as a claim if the controller agreed. The sector and whatever
+    // under it the same dropped controller holds are asked about together, as a claim takes them.
+    async System.Threading.Tasks.Task StageAfterTakeDroppedAsync(SectorsVolumes.Sector sector, OzServerControlledSectorOwnerDto owner)
+    {
+        var held = PrimaryPosition.CoveredBy(sector)
+            .Where(s => DroppedHolder(s) is { } o && o.Cid == owner.Cid)
+            .Select(s => new OzServerSectorConflictDto { Sector = s.Name, Owner = DroppedHolder(s) })
+            .ToList();
+        if (held.Count == 0)
+            held.Add(new OzServerSectorConflictDto { Sector = sector.Name, Owner = owner });
+
+        try
+        {
+            if (await _tracker.ConfirmTakeDroppedAsync(held, askAgain: true))
+                RunOnUiThread(() => StageSectorChange(sector, true));
+        }
+        catch (Exception ex)
+        {
+            OzErrors.Add(new Exception($"Couldn't ask about {sector.Name}: {ex.Message}", ex), "OzServer");
+        }
+    }
+
     // Moves the row between Owned and Available locally and stops there. Nothing is claimed,
     // released or requested, and nothing is activated in vatSys, until Apply: the lists are a
     // selection the controller builds up and then commits. While anything is staged the list
@@ -2681,10 +2709,21 @@ public class OzServerSectorsWindow : BaseForm
             return;
         }
 
+        // Held for a controller whose connection dropped: nobody can answer a request, so the
+        // controller is asked whether to take it instead (ConfirmTakeDroppedAsync). Yes stages it as
+        // an ordinary claim, which Apply sends with takeDropped; No leaves it where it is.
+        if (owned && DroppedHolder(sector) is { } dropped && !_tracker.AgreedToTakeDropped(sector.Name))
+        {
+            _availSectorsView.SelectedNode = null;
+            UpdateArrowButton();
+            _ = StageAfterTakeDroppedAsync(sector, dropped);
+            return;
+        }
+
         // Taking a sector somebody else holds is a request, not a claim, and is shown as one from
         // the moment it is staged: under Requested By Me, marked as staged because nothing has
         // been sent. The selection is dropped, since the row has moved to a different list.
-        if (owned && IsOwnedByAnotherController(sector))
+        if (owned && IsOwnedByAnotherController(sector) && !_tracker.AgreedToTakeDropped(sector.Name))
         {
             if (!_stagedRequests.Any(r => r.Name == sector.Name))
             {

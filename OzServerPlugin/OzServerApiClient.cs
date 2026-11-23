@@ -128,6 +128,8 @@ public class OzServerCommitResultDto
     // but logged, so "why did that Apply not take X" has an answer.
     [JsonProperty("withheld")] public List<string> Withheld { get; set; } = new();
     [JsonProperty("failed")] public List<string> Failed { get; set; } = new();
+    // Who holds each sector in Skipped, as a claim's 409 lists them.
+    [JsonProperty("conflicts")] public List<OzServerSectorConflictDto> Conflicts { get; set; } = new();
 }
 
 // A message from the people running OzServer, sent from the website's /console (GET /messages).
@@ -175,6 +177,14 @@ public class OzServerControlledSectorOwnerDto
     // external-control.ts). Nothing can be requested from them: see ExternalControl. Their Cid is 0
     // where OzServer does not know it.
     [JsonProperty("external")] public bool External { get; set; }
+
+    // An OzServer controller whose client went quiet without releasing (the API's droppedOwner): their
+    // sectors are kept for them until ReleasedAt in case they reconnect. Nobody can answer a request
+    // for one, but it may be taken by claiming with takeDropped once the controller has agreed to
+    // (OzServerOwnershipTracker.ConfirmTakeDroppedAsync).
+    [JsonProperty("dropped")] public bool Dropped { get; set; }
+    [JsonProperty("last_seen_at")] public DateTime? LastSeenAt { get; set; }
+    [JsonProperty("released_at")] public DateTime? ReleasedAt { get; set; }
 }
 
 // One controller connected without the plugin, as OzServer worked out their airspace.
@@ -554,11 +564,15 @@ public class OzServerApiClient
     //
     // The backend never takes a sector off a present controller, not even for that position's
     // own primary; it has to be requested.
-    public async Task<IReadOnlyList<string>?> ClaimSectorAsync(string sectorName, IEnumerable<string> exclude)
+    //
+    // takeDropped also takes whatever a controller whose connection dropped still holds (see
+    // OzServerControlledSectorOwnerDto.Dropped), which is otherwise a conflict.
+    public async Task<IReadOnlyList<string>?> ClaimSectorAsync(string sectorName, IEnumerable<string> exclude, bool takeDropped = false)
     {
         var body = await PostRawAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/claim", new
         {
-            exclude = exclude.ToArray()
+            exclude = exclude.ToArray(),
+            take_dropped = takeDropped
         }).ConfigureAwait(false);
 
         try
@@ -609,13 +623,14 @@ public class OzServerApiClient
     // PrimaryPosition.StaffedCoveredSectors.
     public Task<OzServerCommitResponseDto> CommitAsync(
         IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request,
-        IEnumerable<string> exclude) =>
+        IEnumerable<string> exclude, bool takeDropped = false) =>
         PostAsync<OzServerCommitResponseDto>("/sectors/commit", new
         {
             claim = claim.ToArray(),
             release = release.ToArray(),
             request = request.ToArray(),
             exclude = exclude.ToArray(),
+            take_dropped = takeDropped,
         });
 
     // One round trip for owned, controlled and requests, which are always consumed together.
