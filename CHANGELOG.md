@@ -8,6 +8,8 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
 
 ### Added
 
+- **OzServer How-To** button in the vatSys menu bar. It opens the controller guide at
+  [ozserver.org/how-to](https://ozserver.org/how-to) in vatSys's own browser window.
 - Ready for the [vatSys Launcher](https://github.com/badvectors/vatSysLauncher). Each release ships
   `OzServerPlugin-v<version>.zip`, with `OzServerPlugin.dll` and `LICENSE.txt` at its root, and is
   published as a normal release so the launcher can see it.

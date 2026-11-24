@@ -225,6 +225,8 @@ public class Plugin : IPlugin
             CustomToolStripMenuItemCategory.Tools,
             selcalDebugItem));
 
+        AddHowToButton();
+
         _ozServerMenuItems.Add(sectorsMenuItem.Item);
 
         // vatSys inserts Settings-category plugin items at the bottom of the Settings menu, not
@@ -481,6 +483,71 @@ public class Plugin : IPlugin
             mainForm.BeginInvoke(UiThread.Guard(() => ShowPopup(notice)));
         else
             ShowPopup(notice);
+    }
+
+    // "OzServer How-To" in the main menu bar, opening the controller guide in vatSys's own browser
+    // window. Stays when OzServer is disabled: the guide covers that too, and it changes nothing.
+    //
+    // vatSys only lets a plugin add an entry under a category, so the guide is added as the one entry
+    // of a custom "OzServer How-To" category, which vatSys shows as a top-level menu. Once the menu
+    // exists the entry is taken out of it and the header itself opens the guide - a top-level item
+    // with no dropdown raises Click - so it acts as a button. Until then, or if the header can't be
+    // found, the entry under it still works.
+    void AddHowToButton()
+    {
+        var entry = new ToolStripMenuItem("Open the OzServer guide");
+        entry.Click += (_, _) => OpenHowTo();
+        MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
+            CustomToolStripMenuItemWindowType.Main, HowToMenuText, entry));
+
+        EventHandler? makeButton = null;
+        makeButton = (_, _) =>
+        {
+            if (entry.OwnerItem is not ToolStripMenuItem header)
+                return;
+
+            Application.Idle -= makeButton;
+            header.DropDownItems.Remove(entry);
+            header.Click += (_, _) => OpenHowTo();
+        };
+        Application.Idle += makeButton;
+    }
+
+    const string HowToMenuText = "OzServer How-To";
+    const string HowToUrl = "https://ozserver.org/how-to";
+
+    BaseForm? _howToWindow;
+
+    // vatSys's browser window (vatsys.BrowserWindow, as Info's browser entries open) is internal, so
+    // it is built by reflection through its public (string name, Uri url) constructor. Should that
+    // ever fail, the guide opens in the default web browser instead.
+    void OpenHowTo()
+    {
+        try
+        {
+            if (_howToWindow is { IsDisposed: false })
+            {
+                ShowWindow(_howToWindow);
+                return;
+            }
+
+            var browserType = typeof(BaseForm).Assembly.GetType("vatsys.BrowserWindow", throwOnError: true)!;
+            _howToWindow = (BaseForm)Activator.CreateInstance(browserType, HowToMenuText, new Uri(HowToUrl));
+            ShowWindow(_howToWindow);
+        }
+        catch (Exception ex)
+        {
+            ActionLog.Log("Ui", $"Couldn't open the guide in vatSys's browser ({ex.GetBaseException().Message}); opening it in the default browser",
+                new { action = "how_to_browser_fallback" });
+            try
+            {
+                System.Diagnostics.Process.Start(HowToUrl);
+            }
+            catch (Exception fallback)
+            {
+                OzErrors.Add(new OzServerNotice($"The OzServer guide is at {HowToUrl} (couldn't open it: {fallback.Message})."), "OzServer");
+            }
+        }
     }
 
     void OpenSectorsWindow()
