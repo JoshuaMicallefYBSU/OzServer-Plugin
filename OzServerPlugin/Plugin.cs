@@ -87,8 +87,20 @@ public class Plugin : IPlugin
     readonly List<ToolStripItem> _ozServerMenuItems = new();
     ToolStripMenuItem? _disableItem;
 
+    // Set on a second installed copy, which does nothing for the session - see DuplicateInstallGuard.
+    readonly bool _inactive;
+
+    // An inactive copy returns before assigning the fields below; nothing reads them when it is.
+#pragma warning disable CS8618
     public Plugin()
     {
+        // Before anything else: a second copy must not start a single timer or touch vatSys.
+        if (!DuplicateInstallGuard.TryClaim())
+        {
+            _inactive = true;
+            return;
+        }
+
         // First, so every decision logged below is forwarded from the outset.
         _clientLogForwarder = new ClientLogForwarder();
         // Straight after it, so an error raised by anything constructed below is forwarded too.
@@ -282,6 +294,7 @@ public class Plugin : IPlugin
         };
         Application.Idle += repositionUnderSectors;
     }
+#pragma warning restore CS8618
 
     // Sounds the notification for request groups not announced before, and opens the Sectors window,
     // where a request is answered and the airspace involved is shaded on the scope
@@ -515,7 +528,7 @@ public class Plugin : IPlugin
 
     public void OnFDRUpdate(FDP2.FDR updated)
     {
-        if (OzServerMode.Disabled)
+        if (_inactive || OzServerMode.Disabled)
             return;
 
         // Each subsystem is isolated from the next: vatSys calls this inside its own
@@ -537,7 +550,7 @@ public class Plugin : IPlugin
 
     public void OnRadarTrackUpdate(RDP.RadarTrack updated)
     {
-        if (OzServerMode.Disabled)
+        if (_inactive || OzServerMode.Disabled)
             return;
 
         Isolate("FdrSync", () => _fdrSync.OnRadarTrackUpdate(updated));

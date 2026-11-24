@@ -59,11 +59,16 @@ the reasoning changes.
 Every installed copy updates itself from this repository's GitHub releases, and it trusts the
 **assembly's** version, not the tag. A release must therefore be:
 
-1. **Versioned** — raise `<Version>` in `OzServerPlugin.csproj` and build in `Release` from that
-   commit.
-2. **Tagged to match** — `v0.1.9` for version `0.1.9`.
-3. **Published with the DLL attached** — the built file, named exactly `OzServerPlugin.dll`. A zip
-   may be attached as well for manual installs.
+1. **Versioned.** Raise `<Version>` in `OzServerPlugin.csproj`, add it to `CHANGELOG.md`, and run
+   `.\Release.ps1` from that commit. The script checks the DLL's name and FileVersion.
+2. **Tagged to match.** Use `v0.1.9` for version `0.1.9`, titled `OzServer Plugin v0.1.9`.
+3. **Published with both files attached**, zip first:
+   - `OzServerPlugin-v<version>.zip` (DLL and `LICENSE.txt` at the root), which the
+     [vatSys Launcher](https://github.com/badvectors/vatSysLauncher) installs
+   - `OzServerPlugin.dll`, which the self-updater installs
+4. **A normal release, marked latest.** The launcher's listing comes from VATPAC
+   (`https://vatpac.org/api/Plugins`), which follows GitHub's *latest* release, and a pre-release
+   or a draft is never "latest".
 
 The OzServer API picks a new release up within about five minutes, and each client installs it at
 its next check (as vatSys opens, then every six hours) and shows the controller a window
@@ -74,8 +79,14 @@ Things to know:
 - **Publishing announces it.** `.github/workflows/discord-release-notify.yml` posts the release's
   name and description to Discord through the `CHANGES_WEBHOOK` secret when a release or prerelease
   is published. Drafts are not announced, and editing a published release does not post again.
-- **Prereleases are offered like any other release.** Only a draft is held back, so keep a release
-  as a draft until it is ready.
+- **Prereleases still reach every installed copy.** The self-updater offers them like any other
+  release; only the launcher ignores them. Only a draft is held back, so keep a release as a draft
+  until it is ready.
+- **Never rename `OzServerPlugin.dll`, or the repository.** The DLL name is the launcher's
+  `DllName`, by which it finds existing installs, and the repository name is the launcher's install
+  folder (`Plugins\OzServer-Plugin`). Both are also built into the self-updater.
+- **The launcher compares FileVersions.** It offers an update when the installed DLL's FileVersion
+  is below the version VATPAC lists, which comes from the tag. Keep the tag and `<Version>` equal.
 - **A tag ahead of the assembly reaches nobody.** If `v0.1.9` carries a DLL still stamped `0.1.8`,
   every client downloads it, sees it is not newer, and discards it.
 - **To pause a rollout**, set `PLUGIN_RELEASE_MAX_VERSION` on the API to the last good version, or

@@ -8,9 +8,30 @@
         <!-- vatSys.exe is x86, and the plugin loads into its process. -->
         <PlatformTarget>x86</PlatformTarget>
 
+        <!--
+          Never rename: OzServerPlugin.dll is the DllName the vatSys Launcher detects an install by,
+          and the assembly name PluginUpdater accepts an upgrade from.
+        -->
         <AssemblyName>OzServerPlugin</AssemblyName>
         <RootNamespace>OzServerPlugin</RootNamespace>
-        <Version>0.3.1</Version>
+        <!--
+          Raise for every release, and tag it v<Version>. The SDK stamps it as the DLL's
+          AssemblyVersion and FileVersion (0.3.2 -> 0.3.2.0): the vatSys Launcher compares the
+          FileVersion with the version VATPAC lists, and PluginUpdater compares AssemblyVersion
+          with the release tag.
+        -->
+        <Version>0.3.2</Version>
+
+        <Product>OzServer Plugin</Product>
+        <AssemblyTitle>OzServer Plugin</AssemblyTitle>
+        <Description>Shared sector ownership for vatSys: claim, request and hand over sectors, and the aircraft in them, through OzServer.</Description>
+        <Authors>OzServer Dev Team</Authors>
+        <Company>OzServer</Company>
+        <Copyright>Copyright (c) 2026 OzServer Dev Team</Copyright>
+        <RepositoryUrl>https://github.com/JoshuaMicallefYBSU/OzServer-Plugin</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageProjectUrl>https://ozserver.org</PackageProjectUrl>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
     </PropertyGroup>
 
     <PropertyGroup>

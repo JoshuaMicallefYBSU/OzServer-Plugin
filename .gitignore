@@ -1,6 +1,8 @@
 # Build output
 bin/
 obj/
+# Release builds and zips from Release.ps1
+artifacts/
 
 # Visual Studio / Rider local state, including per-developer build settings (*.csproj.user)
 .vs/

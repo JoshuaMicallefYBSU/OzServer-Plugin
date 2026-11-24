@@ -67,6 +67,7 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 | `NetworkIdentity.cs` | The session's CID and callsign |
 | `NetworkServer.cs` | Which network the session is on: live, SweatBox 1 or SweatBox 2 |
 | `PluginUpdater.cs` | Self-update, staged to take effect at the next vatSys start |
+| `DuplicateInstallGuard.cs` | Reports other installed copies of the plugin, which vatSys silently ignores, and keeps a second loaded copy inert |
 | `ActionLog.cs` | The daily `ozserver_<date>.txt` log |
 | `ClientLogForwarder.cs` | Forwards log lines to `POST /client-logs` |
 | `ErrorThrottle.cs` | Stops a repeating failure flooding the vatSys Errors window |
@@ -177,7 +178,7 @@ All under `{BaseUrl}/api/v1`. Every call carries `controller_cid`, `controller_c
 | Event stream reconnect | 2 s, backing off to 30 s |
 | HTTP timeout | 20 s; 6 s for the ownership sync |
 | Concurrent HTTP connections | 8 |
-| Update check | 3 s after start, then every 6 h, with a 30 s timeout; retried after 2 min (up to 3 times) if neither source can be reached |
+| Update check | 3 s after start, then every 5 min until one is installed, with a 30 s timeout; retried after 2 min (up to 3 times) if neither source can be reached |
 
 ## Self-update
 
@@ -210,6 +211,24 @@ back.
 
 Failures to reach either source are logged and retried at the next check. A successful install is
 reported once, in the vatSys Errors window — the only notification surface a plugin has.
+
+### Alongside the vatSys Launcher
+
+The [vatSys Launcher](https://github.com/badvectors/vatSysLauncher) installs plugins listed by
+VATPAC. It unzips the release zip into `Profiles\<profile>\Plugins\OzServer-Plugin` (the repository
+name), finds the install again by a file named `OzServerPlugin.dll`, and offers an update when that
+file's FileVersion is below the version VATPAC lists for the latest (non-pre-release) GitHub release.
+An update deletes the folder and unzips the new release into it, `.backup` included.
+
+The two updaters don't conflict. The self-updater usually gets there first, and the launcher then
+sees a FileVersion at or above its own and offers nothing. Neither can be renamed away from the
+other: `OzServerPlugin.dll` is both the launcher's `DllName` and the updater's asset name.
+
+**Duplicate installs.** vatSys `Assembly.LoadFrom`s every `*.dll` under `<dataset>\Plugins` and
+then `bin\Plugins`, subfolders included. The plugin isn't strong-named, so a second copy of any
+version binds to the first one loaded and is dropped. A manual install directly in `Plugins\` is
+listed before `Plugins\OzServer-Plugin\`, so it would shadow a launcher install without a word.
+`DuplicateInstallGuard` names every other copy in the Errors window at startup.
 
 ## Matching the vatSys look
 

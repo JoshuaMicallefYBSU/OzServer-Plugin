@@ -64,7 +64,7 @@ static class ExtensionLimit
         {
             var body = await Http.GetStringAsync($"https://api.vatsim.net/v2/members/{cid}/stats").ConfigureAwait(false);
             var stats = JObject.Parse(body);
-            var hours = new[] { "c1", "c2", "c3", "i1", "i2", "i3", "sup", "adm" }
+            var hours = new[] { "c1", "c2", "c3", "i1", "i2", "i3" }
                 .Sum(rating => stats.Value<double?>(rating) ?? 0);
             if (session != _session)
                 return;

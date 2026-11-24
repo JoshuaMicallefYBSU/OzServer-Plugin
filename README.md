@@ -25,6 +25,7 @@ and shown publicly on the live map at [ozserver.org](https://ozserver.org).
 - [Settings](#settings)
 - [Troubleshooting](#troubleshooting)
 - [Building from source](#building-from-source)
+- [Releasing](#releasing)
 - [How it works](#how-it-works)
 - [Security](#security)
 - [Contributing](#contributing)
@@ -69,19 +70,42 @@ and shown publicly on the live map at [ozserver.org](https://ozserver.org).
 
 **Requirements:** vatSys, with an Australian or Pacific profile.
 
-1. Download `OzServerPlugin.dll` from the
-   [latest release](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases).
-2. Copy it into your profile's plugin folder:
+Install OzServer **once per profile**, in one place only. If vatSys finds two copies it uses only
+one of them, and OzServer names both in the Errors window. Delete the one you don't want.
+
+### With the vatSys Launcher
+
+1. Close vatSys.
+2. In the [vatSys Launcher](https://github.com/badvectors/vatSysLauncher), open **Plugins**, choose
+   `JoshuaMicallefYBSU/OzServer-Plugin` and your profile (not **All**), and press **Install**.
+3. Start vatSys.
+
+The launcher installs into `Profiles\<your profile>\Plugins\OzServer-Plugin\`. If you installed
+OzServer by hand before, delete that copy first. While OzServer is being trialled it may only be
+listed with the launcher's development plugins turned on.
+
+### Manually
+
+1. Download `OzServerPlugin-v<version>.zip` from the
+   [latest release](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/latest).
+2. Unzip it into a folder called `OzServer-Plugin` in your profile's plugin folder:
 
    ```
-   Documents\vatSys Files\Profiles\<your profile>\Plugins\
+   Documents\vatSys Files\Profiles\<your profile>\Plugins\OzServer-Plugin\
    ```
 
+   This is the folder the launcher uses, so the launcher recognises the install and can update it
+   later.
 3. Restart vatSys.
 
 > [!TIP]
-> If Windows has blocked the downloaded file, right-click it, choose **Properties**, and tick
-> **Unblock** before starting vatSys.
+> If Windows has blocked the downloaded file, right-click the zip, choose **Properties**, and tick
+> **Unblock** before unzipping it.
+
+### From source
+
+See [Building from source](#building-from-source). Copy the built `OzServerPlugin.dll` into the
+same `Plugins\OzServer-Plugin\` folder.
 
 Once loaded, the plugin adds:
 
@@ -93,7 +117,8 @@ Once loaded, the plugin adds:
 ## Updates
 
 You only install the plugin once. After that it keeps itself up to date: it checks as soon as
-vatSys opens and every six hours afterwards.
+vatSys opens and every five minutes afterwards. The vatSys Launcher can also update it, while vatSys
+is closed. It usually finds the plugin already current.
 
 An update never disturbs a running session. It is downloaded, verified, and put in place for the
 **next vatSys start**. When one has been installed an **OzServer update** window tells you a new
@@ -187,7 +212,8 @@ There is nothing to configure. The plugin always talks to `https://api.ozserver.
 
 | Symptom | Things to check |
 | --- | --- |
-| No OzServer entries under Settings | The DLL is in the profile's `Plugins` folder, is not blocked by Windows, and there is only one copy of it |
+| No OzServer entries under Settings | The DLL is in the profile's `Plugins\OzServer-Plugin` folder and is not blocked by Windows |
+| "Installed more than once" in the Errors window | vatSys found more than one copy and is using only one. Close vatSys, delete the copies the message says are ignored, and restart |
 | Sectors are not syncing | You are connected to the live network or a SweatBox server; OzServer has not been disabled this session; the Errors window for a connection message |
 | A sector you expect is taken | The **Controlled** view shows who holds it — send a request |
 | Something is badly wrong mid-session | **Tools → Disable OzServer** returns you to plain vatSys immediately |
@@ -214,6 +240,28 @@ dotnet build OzServerPlugin/OzServerPlugin.csproj -c Release -p:VatSysPath="D:\v
 The output is a single `OzServerPlugin.dll`, built for x86 to match vatSys. To build straight into
 a profile's `Plugins` folder, set `OutputPath` on the command line or in a git-ignored
 `OzServerPlugin.csproj.user`.
+
+## Releasing
+
+Releases are built with [`Release.ps1`](Release.ps1) and published on GitHub. The plugin's own
+updater and the vatSys Launcher both install from there.
+
+1. Raise `<Version>` in `OzServerPlugin/OzServerPlugin.csproj` (`MAJOR.MINOR.PATCH`) and add the
+   release to [CHANGELOG.md](CHANGELOG.md).
+2. Run `.\Release.ps1`. It builds Release into `artifacts\build\`, checks the DLL's name and version,
+   and writes:
+   - `artifacts\OzServerPlugin-v<version>.zip`: `OzServerPlugin.dll` and `LICENSE.txt` at the zip
+     root, for the launcher and manual installs
+   - `artifacts\OzServerPlugin.dll`: the bare DLL, which the self-updater downloads
+3. Commit, then publish a GitHub release tagged `v<version>`, titled `OzServer Plugin v<version>`,
+   with both files attached. Attach the zip first. Publish it as a normal release marked latest:
+   the launcher only sees GitHub's latest release, and that never includes a pre-release or a draft.
+   The script prints the `gh release create` command.
+4. Check it with `gh api repos/JoshuaMicallefYBSU/OzServer-Plugin/releases/latest`.
+
+VATPAC's plugin list picks up the new release by itself. [CONTRIBUTING.md](CONTRIBUTING.md#publishing-a-release)
+covers what else publishing sets off (the Discord announcement, every client's self-update), and
+how to pause a rollout.
 
 ## How it works
 
@@ -279,4 +327,5 @@ from [badvectors/ATISPlugin](https://github.com/badvectors/ATISPlugin) where it 
 
 ## Licence
 
-No licence has been chosen yet. Until a `LICENSE` file is added, all rights are reserved.
+[MIT](LICENSE). The bundled [Clipper2](OzServerPlugin/ThirdParty/Clipper2) is under the Boost
+Software License 1.0.
