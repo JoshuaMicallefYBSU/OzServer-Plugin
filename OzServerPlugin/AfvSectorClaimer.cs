@@ -658,15 +658,6 @@ public class AfvSectorClaimer
         if (!_tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner))
             return;
 
-        // A controller without the plugin can't be asked (ExternalControl): nothing of theirs stays
-        // on the scope, and the controller is told to coordinate it by hand.
-        if (owner.External)
-        {
-            DeferOnUiThread(() => RemoveHeldFromMmi(sector, owner.Cid));
-            ExternalControl.Notify(new[] { sector.Name }, owner.Callsign);
-            return;
-        }
-
         // Neither asked for nor taken when it would be one enroute position too many (issue #11).
         if (!ExtensionLimit.Allows(sector, _tracker.Owned))
         {
@@ -681,10 +672,10 @@ public class AfvSectorClaimer
             return;
         }
 
-        // Held for a controller whose connection dropped: nobody can answer a request, so the
-        // controller is asked whether to take it now instead (ConfirmTakeDroppedAsync). Off the
-        // scope until they say yes, like a request.
-        if (owner.Dropped)
+        // Held for a controller whose connection dropped, or by one without the plugin: nobody can
+        // answer a request, so the controller is asked whether to take it now instead
+        // (ConfirmTakeDroppedAsync). Off the scope until they say yes, like a request.
+        if (owner.Unanswerable)
         {
             _tracker.HoldForTransmitPrompt(PrimaryPosition.CoveredBy(sector).Select(s => s.Name));
             DeferOnUiThread(() => RemoveHeldFromMmi(sector, owner.Cid));
@@ -762,12 +753,13 @@ public class AfvSectorClaimer
         });
     }
 
-    // The sector and whatever under it the same dropped controller holds, which is what a claim of
-    // it takes. Yes claims it (staying on Transmit, as pressed); No goes back to Receive.
+    // The sector and whatever under it the same dropped controller, or controller without the
+    // plugin, holds, which is what a claim of it takes. Yes claims it (staying on Transmit, as
+    // pressed); No goes back to Receive.
     async System.Threading.Tasks.Task TakeDroppedFromTransmitAsync(VSCSFrequency frequency, SectorsVolumes.Sector sector, OzServerControlledSectorOwnerDto owner)
     {
         var held = PrimaryPosition.CoveredBy(sector)
-            .Where(s => _tracker.ControlledByOthers.TryGetValue(s.Name, out var o) && o.Dropped && o.Cid == owner.Cid)
+            .Where(s => _tracker.ControlledByOthers.TryGetValue(s.Name, out var o) && o.Unanswerable && o.SameHolder(owner))
             .Select(s => new OzServerSectorConflictDto { Sector = s.Name, Owner = _tracker.ControlledByOthers[s.Name] })
             .ToList();
         if (held.Count == 0)

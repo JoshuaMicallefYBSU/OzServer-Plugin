@@ -2667,16 +2667,17 @@ public class OzServerSectorsWindow : BaseForm
         }
     }
 
-    // The owner of a sector held for a controller whose connection dropped, or null.
+    // The owner of a sector held for a controller whose connection dropped, or by one without the
+    // plugin - nobody to request it from - or null.
     OzServerControlledSectorOwnerDto? DroppedHolder(SectorsVolumes.Sector sector) =>
-        _tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner) && owner.Dropped ? owner : null;
+        _tracker.ControlledByOthers.TryGetValue(sector.Name, out var owner) && owner.Unanswerable ? owner : null;
 
     // Asks, then stages the sector as a claim if the controller agreed. The sector and whatever
-    // under it the same dropped controller holds are asked about together, as a claim takes them.
+    // under it the same holder has are asked about together, as a claim takes them.
     async System.Threading.Tasks.Task StageAfterTakeDroppedAsync(SectorsVolumes.Sector sector, OzServerControlledSectorOwnerDto owner)
     {
         var held = PrimaryPosition.CoveredBy(sector)
-            .Where(s => DroppedHolder(s) is { } o && o.Cid == owner.Cid)
+            .Where(s => DroppedHolder(s) is { } o && o.SameHolder(owner))
             .Select(s => new OzServerSectorConflictDto { Sector = s.Name, Owner = DroppedHolder(s) })
             .ToList();
         if (held.Count == 0)
@@ -2699,16 +2700,6 @@ public class OzServerSectorsWindow : BaseForm
     // diverges from _tracker.Owned, and SyncOwnedFromTracker leaves it alone until Apply or Cancel.
     void StageSectorChange(SectorsVolumes.Sector sector, bool owned)
     {
-        // Held by a controller without the plugin: there is nobody to send a request to, so it is
-        // not staged, and the controller is told to coordinate it by hand.
-        if (owned && _tracker.ControlledByOthers.TryGetValue(sector.Name, out var holder) && holder.External)
-        {
-            ExternalControl.Notify(new[] { sector.Name }, holder.Callsign);
-            _availSectorsView.SelectedNode = null;
-            UpdateArrowButton();
-            return;
-        }
-
         // One enroute position more than this controller may work (issue #11), counting what is on
         // the Owned list and what is staged to be requested: not staged at all.
         if (owned
@@ -2721,9 +2712,10 @@ public class OzServerSectorsWindow : BaseForm
             return;
         }
 
-        // Held for a controller whose connection dropped: nobody can answer a request, so the
-        // controller is asked whether to take it instead (ConfirmTakeDroppedAsync). Yes stages it as
-        // an ordinary claim, which Apply sends with takeDropped; No leaves it where it is.
+        // Held for a controller whose connection dropped, or by one without the plugin: nobody can
+        // answer a request, so the controller is asked whether to take it instead
+        // (ConfirmTakeDroppedAsync). Yes stages it as an ordinary claim, which Apply sends with
+        // takeDropped or takeExternal; No leaves it where it is.
         if (owned && DroppedHolder(sector) is { } dropped && !_tracker.AgreedToTakeDropped(sector.Name))
         {
             _availSectorsView.SelectedNode = null;

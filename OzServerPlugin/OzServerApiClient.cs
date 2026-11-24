@@ -185,6 +185,17 @@ public class OzServerControlledSectorOwnerDto
     [JsonProperty("dropped")] public bool Dropped { get; set; }
     [JsonProperty("last_seen_at")] public DateTime? LastSeenAt { get; set; }
     [JsonProperty("released_at")] public DateTime? ReleasedAt { get; set; }
+
+    // Nobody on the other end to answer a request: a controller without the plugin, or one whose
+    // connection dropped. Either may be taken instead, once the controller taking it has agreed to
+    // (OzServerOwnershipTracker.ConfirmTakeDroppedAsync) - ML-GUN_CTR, without the plugin, handing
+    // GUN to ML-BLA_CTR by voice and logging off left BLA unable to transmit on it.
+    [JsonIgnore] public bool Unanswerable => Dropped || External;
+
+    // The same holder: by callsign, since a controller without the plugin has no Cid where OzServer
+    // does not know it.
+    public bool SameHolder(OzServerControlledSectorOwnerDto? other) =>
+        other != null && string.Equals(Callsign, other.Callsign, StringComparison.OrdinalIgnoreCase);
 }
 
 // One controller connected without the plugin, as OzServer worked out their airspace.
@@ -566,13 +577,15 @@ public class OzServerApiClient
     // own primary; it has to be requested.
     //
     // takeDropped also takes whatever a controller whose connection dropped still holds (see
-    // OzServerControlledSectorOwnerDto.Dropped), which is otherwise a conflict.
-    public async Task<IReadOnlyList<string>?> ClaimSectorAsync(string sectorName, IEnumerable<string> exclude, bool takeDropped = false)
+    // OzServerControlledSectorOwnerDto.Dropped), and takeExternal whatever a controller without the
+    // plugin is working (External). Each is otherwise a conflict.
+    public async Task<IReadOnlyList<string>?> ClaimSectorAsync(string sectorName, IEnumerable<string> exclude, bool takeDropped = false, bool takeExternal = false)
     {
         var body = await PostRawAsync($"/sectors/{Uri.EscapeDataString(sectorName)}/claim", new
         {
             exclude = exclude.ToArray(),
-            take_dropped = takeDropped
+            take_dropped = takeDropped,
+            take_external = takeExternal
         }).ConfigureAwait(false);
 
         try
@@ -623,7 +636,7 @@ public class OzServerApiClient
     // PrimaryPosition.StaffedCoveredSectors.
     public Task<OzServerCommitResponseDto> CommitAsync(
         IEnumerable<string> claim, IEnumerable<string> release, IEnumerable<string> request,
-        IEnumerable<string> exclude, bool takeDropped = false) =>
+        IEnumerable<string> exclude, bool takeDropped = false, bool takeExternal = false) =>
         PostAsync<OzServerCommitResponseDto>("/sectors/commit", new
         {
             claim = claim.ToArray(),
@@ -631,6 +644,7 @@ public class OzServerApiClient
             request = request.ToArray(),
             exclude = exclude.ToArray(),
             take_dropped = takeDropped,
+            take_external = takeExternal,
         });
 
     // One round trip for owned, controlled and requests, which are always consumed together.

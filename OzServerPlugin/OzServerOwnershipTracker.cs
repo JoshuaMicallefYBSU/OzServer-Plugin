@@ -846,9 +846,9 @@ public class OzServerOwnershipTracker
                 exclude.Add(name);
         }
 
-        // Anything a dropped controller holds is taken only once this controller has agreed to it
-        // (ConfirmTakeDroppedAsync).
-        return await _api.ClaimSectorAsync(sector.Name, exclude, CoversAgreedDropped(sector));
+        // Anything a dropped controller, or one without the plugin, holds is taken only once this
+        // controller has agreed to it (ConfirmTakeDroppedAsync).
+        return await _api.ClaimSectorAsync(sector.Name, exclude, CoversAgreedDropped(sector, external: false), CoversAgreedDropped(sector, external: true));
     }
 
     // Takes back top-down cover that was withheld while somebody was logged on as it, once they
@@ -1489,8 +1489,10 @@ public class OzServerOwnershipTracker
                 toRelease.Select(s => s.Name),
                 (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name),
                 staffed,
-                // Staged from a dropped controller after the window asked (ConfirmTakeDroppedAsync).
-                toClaim.Any(CoversAgreedDropped));
+                // Staged from a dropped controller, or one without the plugin, after the window asked
+                // (ConfirmTakeDroppedAsync).
+                toClaim.Any(s => CoversAgreedDropped(s, external: false)),
+                toClaim.Any(s => CoversAgreedDropped(s, external: true)));
 
             result.Claimed.AddRange(response.Result.Claimed);
             result.Released.AddRange(response.Result.Released);
@@ -1893,26 +1895,20 @@ public class OzServerOwnershipTracker
         //     rule for giving a sector to its controller). It is theirs, not cover to take back:
         //     BLA logging on while ML_APP was online asked ML_APP for MAE, which BLA only works
         //     top-down when ML_APP is away.
-        //   - Anything held by a controller without the plugin (Owner.External): nobody can answer.
-        //     The controller is told to coordinate it by hand instead (ExternalControl.Notify).
-        //   - Anything held for a controller whose connection dropped (Owner.Dropped): nobody can
-        //     answer that either. The controller is asked whether to take it now instead
-        //     (ConfirmTakeDroppedAsync), and it is claimed with the rest if they say so.
-        var dropped = conflicts.Where(c => c.Owner?.Dropped == true).ToList();
+        //   - Anything held by a controller without the plugin (Owner.External), or for a controller
+        //     whose connection dropped (Owner.Dropped): nobody can answer. The controller is asked
+        //     whether to take it now instead (ConfirmTakeDroppedAsync), and it is claimed with the
+        //     rest if they say so.
+        var dropped = conflicts.Where(c => c.Owner?.Unanswerable == true).ToList();
         var takeDropped = dropped.Count > 0 && await ConfirmTakeDroppedAsync(dropped);
         // What the claim below leaves out and what is pulled back out of MMI: every conflict, less
-        // the dropped controller's sectors once this controller has agreed to take them.
+        // the unanswerable holders' sectors once this controller has agreed to take them.
         IReadOnlyList<OzServerSectorConflictDto> leaveOut = takeDropped
             ? conflicts.Where(c => !dropped.Contains(c)).ToList()
             : conflicts;
         conflicts = conflicts.Where(c => !dropped.Contains(c)).ToList();
 
-        var external = conflicts.Where(c => c.Owner?.External == true).ToList();
-        foreach (var holder in external.GroupBy(c => c.Owner!.Callsign, StringComparer.OrdinalIgnoreCase))
-            ExternalControl.Notify(holder.Select(c => c.Sector), holder.Key);
-
-        var reliefCover = conflicts.Where(c => c.Owner?.External == true
-                                               || PrimaryPosition.IsFlowCallsign(c.Owner?.Callsign)
+        var reliefCover = conflicts.Where(c => PrimaryPosition.IsFlowCallsign(c.Owner?.Callsign)
                                                || IsHeldForTransmitPrompt(c.Sector)
                                                || HeldByItsOwnController(c)).ToList();
         if (reliefCover.Count > 0)
@@ -2013,36 +2009,50 @@ public class OzServerOwnershipTracker
         });
     }
 
-    // Sectors held for a controller whose connection dropped (Owner.Dropped) that this controller has
-    // agreed to take, each until the server would have freed it anyway (ReleasedAt). Any claim
-    // covering one is sent with takeDropped. And the prompts open and answered No, by the sorted
-    // sector list, so the claim pass's retries neither stack nor repeat them. Cleared on
-    // disconnect.
-    readonly Dictionary<string, DateTime> _takeDroppedAgreed = new(StringComparer.OrdinalIgnoreCase);
+    // Sectors held by somebody who cannot answer a request (Owner.Unanswerable) that this controller
+    // has agreed to take: a dropped controller's until the server would have freed them anyway
+    // (ReleasedAt), one without the plugin's for ExternalTakeWindow. Any claim covering one is sent
+    // with takeDropped or takeExternal. And the prompts open and answered No, by the sorted sector
+    // list, so the claim pass's retries neither stack nor repeat them. Cleared on disconnect.
+    readonly Dictionary<string, (DateTime Until, bool External)> _takeDroppedAgreed = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _takeDroppedAsking = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _takeDroppedDeclined = new(StringComparer.OrdinalIgnoreCase);
     readonly object _takeDroppedGate = new();
 
+    // Long enough for the claim that follows the answer, including a Sectors window Apply.
+    static readonly TimeSpan ExternalTakeWindow = TimeSpan.FromMinutes(2);
+
     public bool AgreedToTakeDropped(string sectorName)
     {
         lock (_takeDroppedGate)
-            return _takeDroppedAgreed.TryGetValue(sectorName, out var until) && DateTime.UtcNow < until;
+            return _takeDroppedAgreed.TryGetValue(sectorName, out var agreed) && DateTime.UtcNow < agreed.Until;
     }
 
-    bool CoversAgreedDropped(SectorsVolumes.Sector sector) =>
-        PrimaryPosition.CoveredBy(sector).Any(s => AgreedToTakeDropped(s.Name));
+    bool CoversAgreedDropped(SectorsVolumes.Sector sector, bool external) =>
+        PrimaryPosition.CoveredBy(sector).Any(s =>
+        {
+            lock (_takeDroppedGate)
+                return _takeDroppedAgreed.TryGetValue(s.Name, out var agreed) && DateTime.UtcNow < agreed.Until && agreed.External == external;
+        });
 
-    // A controller dropped without releasing, and OzServer keeps their sectors for them for a few
-    // minutes in case they come straight back (the API's DISCONNECT_GRACE_MINUTES). They can still
-    // be taken - a crash should not leave airspace unworkable - but only once the controller taking
-    // them has been told whose they are and until when, since the dropped controller may be back
-    // any moment expecting them. Answers whether to take them.
+    // Nobody can answer a request for these (Owner.Unanswerable), so the controller is asked whether
+    // to take them instead. Answers whether to take them.
+    //
+    //  - A controller who dropped without releasing: OzServer keeps their sectors for a few minutes
+    //    in case they come straight back (the API's DISCONNECT_GRACE_MINUTES). A crash should not
+    //    leave airspace unworkable, but the controller taking them is told whose they are and until
+    //    when, since the dropped controller may be back any moment expecting them.
+    //  - A controller without the plugin (the API's external-control.ts): OzServer only infers what
+    //    they work, from their frequencies and information lines, and can neither ask them nor see
+    //    them hand anything over. ML-GUN_CTR handed GUN to ML-BLA_CTR by voice and logged off, and
+    //    BLA could not transmit on it until the VATSIM datafeed stopped listing GUN minutes later.
+    //    The controller taking them is told to have coordinated it with them first.
     //
     // askAgain is for the controller's own explicit actions (a transmit press, the Sectors window),
     // which ask even after an earlier No; the claim pass's automatic retries do not.
     public async Task<bool> ConfirmTakeDroppedAsync(IReadOnlyList<OzServerSectorConflictDto> held, bool askAgain = false)
     {
-        held = held.Where(c => c.Owner?.Dropped == true).ToList();
+        held = held.Where(c => c.Owner?.Unanswerable == true).ToList();
         var names = held.Select(c => c.Sector).Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList();
         if (names.Count == 0)
@@ -2059,44 +2069,62 @@ public class OzServerOwnershipTracker
 
         try
         {
-            var owners = held.Select(c => c.Owner!)
-                .GroupBy(o => o.Callsign, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.First())
-                .ToList();
-            var who = string.Join(", ", owners.Select(o => o.Callsign));
-            var lastSeen = owners.Where(o => o.LastSeenAt != null).Select(o => o.LastSeenAt!.Value.ToUniversalTime()).DefaultIfEmpty().Max();
-            var until = owners.Where(o => o.ReleasedAt != null).Select(o => o.ReleasedAt!.Value.ToUniversalTime()).DefaultIfEmpty().Max();
+            var nl = Environment.NewLine;
+            var droppedHeld = held.Where(c => c.Owner!.Dropped && !c.Owner.External).ToList();
+            var externalHeld = held.Where(c => c.Owner!.External).ToList();
+            string Who(IEnumerable<OzServerSectorConflictDto> conflicts) =>
+                string.Join(", ", conflicts.Select(c => c.Owner!.Callsign).Distinct(StringComparer.OrdinalIgnoreCase));
+            string Listed(IEnumerable<OzServerSectorConflictDto> conflicts) =>
+                string.Join(nl, conflicts.Select(c => SectorDescription.DescribeWithOwner(c.Sector, c.Owner?.Callsign)));
+
+            var parts = new List<string>();
+
+            var lastSeen = droppedHeld.Where(c => c.Owner!.LastSeenAt != null).Select(c => c.Owner!.LastSeenAt!.Value.ToUniversalTime()).DefaultIfEmpty().Max();
+            var until = droppedHeld.Where(c => c.Owner!.ReleasedAt != null).Select(c => c.Owner!.ReleasedAt!.Value.ToUniversalTime()).DefaultIfEmpty().Max();
             if (until == default)
                 until = DateTime.UtcNow.AddMinutes(2);
-
-            var nl = Environment.NewLine;
-            var droppedAt = lastSeen == default
-                ? ""
-                : $" at {lastSeen:HH:mm}Z ({Math.Max(0, (int)(DateTime.UtcNow - lastSeen).TotalMinutes)} min ago)";
-            var message = (names.Count == 1 ? "This sector is" : "These sectors are")
-                          + $" held for {who}, who disconnected without releasing{droppedAt}."
-                          + nl + nl
-                          + "Held:" + nl
-                          + string.Join(nl, held.Select(c => SectorDescription.DescribeWithOwner(c.Sector, c.Owner?.Callsign)))
-                          + nl + nl
+            if (droppedHeld.Count > 0)
+            {
+                var who = Who(droppedHeld);
+                var droppedAt = lastSeen == default
+                    ? ""
+                    : $" at {lastSeen:HH:mm}Z ({Math.Max(0, (int)(DateTime.UtcNow - lastSeen).TotalMinutes)} min ago)";
+                parts.Add($"Held for {who}, who disconnected without releasing{droppedAt}:" + nl
+                          + Listed(droppedHeld) + nl + nl
                           + $"They are kept for {who} until {until:HH:mm}Z in case they reconnect, but can be taken now if required."
-                          + $" If {who} comes back, coordinate with them."
+                          + $" If {who} comes back, coordinate with them.");
+            }
+            if (externalHeld.Count > 0)
+            {
+                var who = Who(externalHeld);
+                parts.Add($"Worked by {who}, who is not using the OzServer plugin:" + nl
+                          + Listed(externalHeld) + nl + nl
+                          + $"Take {(externalHeld.Count == 1 ? "it" : "them")} only once {who} has handed {(externalHeld.Count == 1 ? "it" : "them")} to you or logged off."
+                          + $" Tag handoffs and coordination with {who} have to be done manually.");
+            }
+
+            var message = string.Join(nl + nl, parts)
                           + nl + nl
                           + (names.Count == 1 ? "Take this sector now?" : "Take these sectors now?");
+            var title = externalHeld.Count == 0 ? "Sectors held for a disconnected controller"
+                : droppedHeld.Count == 0 ? "Sectors held without the OzServer plugin"
+                : "Sectors held by controllers who can't answer";
 
-            var answer = await AskYesNoAsync(message, "Sectors held for a disconnected controller", "Take Sectors", "Leave");
+            var answer = await AskYesNoAsync(message, title, "Take Sectors", "Leave");
 
+            var everyone = Who(held);
             ActionLog.Log("Ownership",
-                answer
-                    ? $"Taking {key} from {who} - disconnected, held until {until:HH:mm}Z"
-                    : $"Leaving {key} with {who} - disconnected, held until {until:HH:mm}Z",
+                answer ? $"Taking {key} from {everyone} - nobody to request them from"
+                       : $"Leaving {key} with {everyone} - nobody to request them from",
                 new
                 {
                     action = answer ? "take_dropped_accepted" : "take_dropped_declined",
                     sectors = names.ToArray(),
-                    owners = owners.Select(o => o.Callsign).ToArray(),
+                    dropped = droppedHeld.Select(c => c.Sector).ToArray(),
+                    external = externalHeld.Select(c => c.Sector).ToArray(),
+                    owners = held.Select(c => c.Owner!.Callsign).Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
                     last_seen_at = lastSeen == default ? (DateTime?)null : lastSeen,
-                    released_at = until,
+                    released_at = droppedHeld.Count > 0 ? until : (DateTime?)null,
                     own_callsign = Network.Me?.Callsign
                 });
 
@@ -2104,8 +2132,10 @@ public class OzServerOwnershipTracker
             {
                 if (answer)
                 {
-                    foreach (var name in names)
-                        _takeDroppedAgreed[name] = until;
+                    foreach (var conflict in droppedHeld)
+                        _takeDroppedAgreed[conflict.Sector] = (until, false);
+                    foreach (var conflict in externalHeld)
+                        _takeDroppedAgreed[conflict.Sector] = (DateTime.UtcNow + ExternalTakeWindow, true);
                     _takeDroppedDeclined.Remove(key);
                 }
                 else
