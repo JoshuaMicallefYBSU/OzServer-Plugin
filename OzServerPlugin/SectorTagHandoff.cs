@@ -143,12 +143,16 @@ public class SectorTagHandoff
 
     sealed class DeferredHandoff
     {
-        public DeferredHandoff(SectorsVolumes.Sector toSector)
+        public DeferredHandoff(SectorsVolumes.Sector sector, SectorsVolumes.Sector toSector)
         {
+            Sector = sector;
             ToSector = toSector;
             Until = DateTime.UtcNow + DeferredHandoffWindow;
         }
 
+        // The sector that changed hands, to check its new owner still holds it when the handoff
+        // is finally sent - see RetryDeferredHandoffs.
+        public SectorsVolumes.Sector Sector { get; }
         public SectorsVolumes.Sector ToSector { get; }
         public DateTime Until { get; }
     }
@@ -365,8 +369,17 @@ public class SectorTagHandoff
         // TMA sectors first: an aircraft inside one is also inside the enroute sector stacked over
         // it, and must be kept for a manual handoff (KeepForManualHandoff) before that sector's
         // pass would hand it over.
-        foreach (var transfer in diff.Lost.OrderBy(t => PrimaryPosition.IsTmaSector(t.Sector) ? 0 : 1))
-            GiveAway(transfer, handedOver);
+        try
+        {
+            foreach (var transfer in diff.Lost.OrderBy(t => PrimaryPosition.IsTmaSector(t.Sector) ? 0 : 1))
+                GiveAway(transfer, handedOver);
+        }
+        finally
+        {
+            // Whatever GiveAway did or failed to do: the lost sectors leave MMI as soon as this
+            // returns, and every tag still controlled from one is dropped with them.
+            KeepTagsOffLostSectors(diff.Lost);
+        }
 
         foreach (var transfer in diff.Gained)
         {
@@ -403,6 +416,68 @@ public class SectorTagHandoff
             foreach (var fdr in FDP2.GetFDRs.ToList())
                 TryAcceptTransfer(fdr);
         }
+    }
+
+    // Keeps every tag this controller still tracks that is controlled from a sector being lost.
+    //
+    // AcceptTransfer, ReassertConfirmations and TagResumeRecovery point a tag's ControllingSector
+    // at the held sector it was in at the time, and vatSys never moves it for a tracked tag. When
+    // that sector later leaves MMI.SectorsControlled, MMI.SetControlledSectors stops tracking the
+    // tag, wherever the aircraft is by then. GiveAway hands over only what is inside the lost
+    // sector by live radar, so a tag that has flown on into another of this controller's sectors,
+    // has no radar return or Mode C, or belongs to a sector released to nobody or to a controller
+    // whose sector cannot be resolved, would be dropped to nobody and reported as dropped.
+    //
+    // Each is pointed at this session's own login sector (OwnAnchor), which no removal takes out,
+    // and stays tracked here. Tags GiveAway handed over are already there.
+    //
+    // Runs inside OzServerOwnershipTracker.ReconcileMmiWithOwned's OwnershipChanged, on the UI
+    // thread, before that method removes the lost sectors from MMI.
+    void KeepTagsOffLostSectors(List<SectorTransfer> lost)
+    {
+        if (OzServerMode.Disabled || lost.Count == 0)
+            return;
+
+        // Nothing to point them at: the login sector is not in MMI.SectorsControlled (around a
+        // disconnect, for one).
+        var anchor = OwnAnchor();
+        if (anchor == null)
+            return;
+
+        var kept = new List<string>();
+
+        foreach (var fdr in FDP2.GetFDRs.ToList())
+        {
+            // Read once: vatSys's Sector.Equals throws on a null argument.
+            var controlling = fdr.ControllingSector;
+            if (string.IsNullOrEmpty(fdr.Callsign) || !fdr.IsTrackedByMe || controlling == null)
+                continue;
+
+            if (controlling.Equals(anchor) || !lost.Any(transfer => transfer.Sector.Equals(controlling)))
+                continue;
+
+            fdr.ControllingSector = anchor;
+            if (MMI.FindTrack(fdr) is { } track)
+                MMI.SetTrackState(track);
+
+            // ReassertConfirmations would point it back at the sector that is leaving.
+            lock (_lock)
+                _confirming.Remove(fdr.Callsign);
+
+            kept.Add($"{fdr.Callsign} ({controlling.Name})");
+        }
+
+        if (kept.Count > 0)
+            ActionLog.Log("Tag",
+                $"Kept {string.Join(", ", kept)} under {anchor.Name} - not handed over with a sector being lost, "
+                + "and vatSys drops tags controlled from a sector that leaves this scope",
+                new
+                {
+                    action = "tag_kept_off_lost_sector",
+                    fdr_callsigns = kept.ToArray(),
+                    anchor = anchor.Name,
+                    lost = lost.Select(transfer => transfer.Sector.Name).ToArray()
+                });
     }
 
     // A TMA sector given away: its aircraft are not handed over, but they must not be dropped either.
@@ -507,17 +582,43 @@ public class SectorTagHandoff
                 continue;
             }
 
+            // Being handed to somebody else by hand, and not yet accepted. MMI.HandoffJurisdiction
+            // does not cancel a handoff in progress: a second one leaves both controllers offered
+            // the aircraft, and the sector's new owner accepts theirs silently. The controller's
+            // own handoff stands; KeepTagsOffLostSectors keeps the tag tracked meanwhile. Judged by
+            // the state as well: vatSys clears HandoffSector when a handoff is accepted or
+            // cancelled, but not on every path that leaves the tag controlled.
+            if (fdr.HandoffSector != null
+                && fdr.State is FDP2.FDR.FDRStates.STATE_HANDOVER or FDP2.FDR.FDRStates.STATE_HANDOVER_FIRST)
+            {
+                handedOver.Add(fdr.Callsign);
+                ActionLog.Log("Tag", $"{fdr.Callsign} is already being handed to {fdr.HandoffSector.Name} - not handed over with {transfer.Sector.Name}", new
+                {
+                    action = "sector_lost_tag_in_manual_handover",
+                    fdr_callsign = fdr.Callsign,
+                    sector = transfer.Sector.Name,
+                    to_callsign = toCallsign,
+                    handoff_sector = fdr.HandoffSector.Name
+                });
+                continue;
+            }
+
             // Deferred while toSector's controller is not visible in OnlineATC:
             // MMI.HandoffJurisdiction would drop the aircraft from tracking instead of handing it
             // off (see "Deferred handoffs" in the class comment).
             if (IsOnline(toSector))
             {
+                // The label as it stands, sent before the handoff: the receiving client reads the
+                // record the moment it accepts (ApplyClearanceDataAsync) and takes its cleared
+                // level over whatever vatSys shared, and the update the handoff itself queues
+                // only goes out on the next flush, after that read.
+                _fdrSync.PushNow(fdr);
                 MMI.HandoffJurisdiction(fdr, toSector);
             }
             else
             {
                 lock (_lock)
-                    _deferred[fdr.Callsign] = new DeferredHandoff(toSector);
+                    _deferred[fdr.Callsign] = new DeferredHandoff(transfer.Sector, toSector);
 
                 deferred.Add(fdr.Callsign);
             }
@@ -641,6 +742,30 @@ public class SectorTagHandoff
             if (!IsOnline(toSector))
                 continue;
 
+            // The sector may have changed hands again while this waited - given back, or passed
+            // on. Sent regardless, the tag would go to a controller who no longer holds the airspace.
+            // It stays tracked here instead, on the sector GiveAway left it on.
+            var owner = _tracker.OwnerOf(entry.Value.Sector)?.Callsign;
+            if (!string.Equals(owner, toSector.Callsign, StringComparison.OrdinalIgnoreCase))
+            {
+                lock (_lock)
+                    _deferred.Remove(callsign);
+
+                ActionLog.Log("Tag",
+                    $"{entry.Value.Sector.Name} is no longer {toSector.Callsign}'s - deferred handoff of {callsign} not sent",
+                    new
+                    {
+                        action = "handoff_deferred_owner_changed",
+                        fdr_callsign = callsign,
+                        sector = entry.Value.Sector.Name,
+                        to_sector = toSector.Name,
+                        owner
+                    });
+                continue;
+            }
+
+            // As in GiveAway: the label reaches the record before the receiving client reads it.
+            _fdrSync.PushNow(fdr);
             MMI.HandoffJurisdiction(fdr, toSector);
 
             lock (_lock)

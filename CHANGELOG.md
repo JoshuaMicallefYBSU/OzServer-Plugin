@@ -24,6 +24,62 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
 
 - The extension limit's 150 hours counts only controller and instructor ratings (C1 to I3). SUP
   and ADM hours no longer count.
+- **Your position is yours while you answer.** When part of a position is held by someone else,
+  the rest is claimed straight away rather than after the question about the held part is
+  answered.
+- **Taking sectors takes only what you agreed to.** Agreeing to take a sector from a controller who
+  disconnected, or one without the plugin, no longer also takes sectors another such controller
+  holds under the same group.
+- A change the Sectors window could not apply is now listed in the result, instead of the Apply
+  appearing to have worked.
+- Planned changes in the Sectors window are discarded when you disconnect.
+- **SELCAL Debug** only transmits when you are connected as a valid ATC position with a frequency
+  on transmit, as vatSys's own SELCAL window requires.
+
+### Fixed
+
+- **Sub-sectors released when their VSCS line was tidied away.** Removing a sub-sector's line from
+  the VSCS panel (0.3.1's "fewer lines on the panel") was read as you setting that line to Idle:
+  the sub-sector was dropped from your scope with its tags and released on OzServer. Taking over a
+  group, or logging on, could lose part of it this way.
+- **Tags dropped when you gave a sector away.** A tag you were still working from a sector you
+  handed over, but which had already flown on into another of your sectors, or had no radar
+  return, was dropped to nobody. It now stays with you.
+- **A failed logon released your sectors.** Pressing Connect after a drop and being refused
+  ("callsign in use", a wrong password) was treated as a deliberate disconnect, which gave up the
+  sectors OzServer was holding for you.
+- **Cleared levels arrived late, and old ones came back.** A new cleared level could take up to a
+  minute to reach OzServer. A sector transfer, a reconnect or another controller's label could then
+  put the previous level back on the tag. It now goes out within seconds, and before a handoff.
+- **Cancelled flight plans coming back.** A plan cancelled before departure, or one whose pilot had
+  disconnected at the gate, could be re-activated on every scope and then never cleared.
+- **Arrival List drags landing one place too high** when the list refreshed while you were
+  dragging. The landing time also shows as `HH:mm` whatever your Windows region.
+- A tag you were already handing to another controller is no longer also handed to the new owner
+  of its sector, and a handoff that had to wait is not sent if the sector has changed hands again.
+- An aircraft being handed to you from a sector you have requested keeps flashing, instead of
+  being drawn as one that would come with the sector.
+- A drop reported while OzServer was briefly unreachable is sent once it is back, so the tag is
+  not handed back to you on your next reconnect.
+- After a reconnect whose resume could not reach OzServer, sectors you had been handed earlier are
+  no longer given back to their position's controller.
+- An agreement to take a disconnected controller's sector could expire before it was used, and the
+  question was asked again.
+- An observer watching a controller no longer has their scope redrawn, and an error added, every
+  few seconds.
+- Frequencies are reported to OzServer the same way whatever your Windows region. With a decimal
+  comma they were unreadable, and a controller without the plugin could lose the sectors their
+  frequency stood for.
+- Two vatSys windows on one PC no longer lose each other's log lines, and an update one of them
+  has installed is no longer downloaded and failed by the other every five minutes.
+- A failure installing an update is reported at most three times in a session, not every five
+  minutes.
+
+### Security
+
+- The updater checks the full address of a download, not only how it starts. An address written to
+  begin with this repository's releases could be made to resolve somewhere else.
+- Windows account names are removed from file paths in errors before they are sent to OzServer.
 
 ## [0.3.1] - 2026-11-24 (pre-release)
 

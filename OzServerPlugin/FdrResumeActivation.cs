@@ -74,12 +74,14 @@ public class FdrResumeActivation
 
         Network.Disconnected += (_, _) =>
         {
-            ServerFdrSnapshot.Clear();
             lock (_gate)
             {
                 _pending.Clear();
                 _connectedAt = DateTime.MaxValue;
                 _session++;
+                // Under the gate and after the count, as ScanAsync's update is: a scan answered
+                // across the disconnect then cannot put the ended session's records back.
+                ServerFdrSnapshot.Clear();
             }
         };
 
@@ -121,8 +123,14 @@ public class FdrResumeActivation
         {
             var records = await _api.GetAllFlightsAsync();
             // FdrSync's watchdog reads this too, so it is refreshed even while the connect pass
-            // still owns activation.
-            ServerFdrSnapshot.Update(records);
+            // still owns activation. Not with an answer from a session that has since ended: that
+            // would refill what the disconnect cleared, with records that may be another server's.
+            lock (_gate)
+            {
+                if (session != _session)
+                    return;
+                ServerFdrSnapshot.Update(records);
+            }
             if (connectPassRunning)
                 return;
 
@@ -154,6 +162,11 @@ public class FdrResumeActivation
                         continue;
                     if (!local.TryGetValue(record.Callsign, out var fdr) || fdr.ESTed || fdr.IsTracked)
                         continue;
+                    // Cancelled before it departed - by a controller, or by vatSys ten minutes
+                    // after its pilot went (FDP2.CancelFDR leaves such a flight INACTIVE, not
+                    // FINISHED). Not pre-active, and not one to bring back - see Attempt.
+                    if (fdr.State == FDP2.FDR.FDRStates.STATE_INACTIVE)
+                        continue;
                     // Finished here only because it went out of view, and now back in view: brought
                     // back every time that happens. Any other finish (a controller's, a landing)
                     // stands.
@@ -161,6 +174,10 @@ public class FdrResumeActivation
                     if (fdr.State == FDP2.FDR.FDRStates.STATE_FINISHED && !backInView)
                         continue;
                     if (!backInView && _done.Contains(fdr))
+                        continue;
+                    // Last, as it copies vatSys's pilot list: a flight whose pilot is not on this
+                    // client's picture is not in view, whatever the record says.
+                    if (!FdrSync.IsPilotOnline(record.Callsign))
                         continue;
                     _pending[record.Callsign] = record;
                     added.Add(record.Callsign);
@@ -317,6 +334,24 @@ public class FdrResumeActivation
                     FdrSync.FinishedOutOfView.TryRemove(record.Callsign, out _);
 
                 var wasActive = fdr.ESTed;
+
+                // Never an FDR vatSys has cancelled, nor one whose pilot it cannot see. vatSys
+                // cancels a flight that has not departed to INACTIVE (FDP2.CancelFDR) - when a
+                // controller cancels it, and ten minutes after its pilot disconnects - and the
+                // record stays activated for a while after either. Activating it again clears its
+                // cancellation time (EstFDR), so vatSys never deletes it: a strip for a pilot who
+                // has gone, on every scope. A flight plan that arrived ahead of its pilot is
+                // INACTIVE too, and turns pre-active when vatSys sees them, so it waits here.
+                if (!wasActive && (fdr.State == FDP2.FDR.FDRStates.STATE_INACTIVE || !FdrSync.IsPilotOnline(record.Callsign)))
+                {
+                    if (expired)
+                    {
+                        settled.Add(record.Callsign);
+                        skipped.Add($"{record.Callsign} (cancelled, or its pilot is not online)");
+                    }
+                    continue;
+                }
+
                 if (!wasActive)
                     Activate(fdr, record);
 

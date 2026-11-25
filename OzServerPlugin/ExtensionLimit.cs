@@ -116,7 +116,8 @@ static class ExtensionLimit
                           : $"Controllers may work their own position and {ExperiencedExtensions} extensions. Refer ATS Policy 2.13.3 for details.")
                       + " Release a sector first to add another.";
 
-        MMI.InvokeOnGUI(() =>
+        // MMI.InvokeOnGUI posts to vatSys's UI thread as it is given, so the work is contained here.
+        var show = UiThread.Guard(() =>
         {
             var notice = new SectorNoticeWindow(message, "Maximum sectors reached");
             if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form mainForm)
@@ -125,5 +126,6 @@ static class ExtensionLimit
                 notice.Show();
             notice.BringToFront();
         });
+        MMI.InvokeOnGUI(() => show());
     }
 }

@@ -89,7 +89,11 @@ public class ObserverPositionMirror
             return;
 
         _mirrored = mirrored;
-        MMI.SetControlledSectors(mirrored);
+        // A copy: vatSys inserts its placeholder for the session's own callsign into the list it is
+        // handed, which for an observer is every time. In _mirrored that extra entry would make
+        // every later comparison above differ, and the write - with vatSys's "default owner is
+        // online" error - repeat on each refresh.
+        MMI.SetControlledSectors(mirrored.ToList());
     }
 
     void Clear() => _mirrored = new List<SectorsVolumes.Sector>();

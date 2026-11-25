@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel.Composition;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Windows.Forms;
 using vatsys;
 using vatsys.Plugin;
@@ -225,7 +226,19 @@ public class Plugin : IPlugin
             CustomToolStripMenuItemCategory.Tools,
             selcalDebugItem));
 
-        AddHowToButton();
+        // Contained: the button is the one thing here built on a custom menu category, and an
+        // exception leaving this constructor stops vatSys loading any plugin, and the profile.
+        // That includes a vatSys build without the member AddHowToButton calls, which is raised
+        // as AddHowToButton is compiled - hence a method of its own that is never inlined here.
+        try
+        {
+            AddHowToButton();
+        }
+        catch (Exception ex)
+        {
+            ActionLog.Log("Ui", $"The OzServer How-To button couldn't be added: {ex.Message}",
+                new { action = "how_to_button_failed" });
+        }
 
         _ozServerMenuItems.Add(sectorsMenuItem.Item);
 
@@ -493,6 +506,9 @@ public class Plugin : IPlugin
     // exists the entry is taken out of it and the header itself opens the guide - a top-level item
     // with no dropdown raises Click - so it acts as a button. Until then, or if the header can't be
     // found, the entry under it still works.
+    //
+    // NoInlining: see the call in the constructor.
+    [MethodImpl(MethodImplOptions.NoInlining)]
     void AddHowToButton()
     {
         var entry = new ToolStripMenuItem("Open the OzServer guide");

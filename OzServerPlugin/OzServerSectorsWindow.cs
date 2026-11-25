@@ -593,6 +593,13 @@ public class OzServerSectorsWindow : BaseForm
         // syncs only: reading it straight after starting a refresh would reuse the old snapshot.
         _tracker.Refreshed += (_, _) => RunOnUiThread(RefreshControlledSnapshot);
         Network.OnlineATCChanged += (_, _) => RefreshAvailableList();
+        // Staged moves belong to the session they were made in. Left in place with the window open,
+        // one Apply after reconnecting - on another position or another server - would commit them.
+        Network.Disconnected += (_, _) => RunOnUiThread(() =>
+        {
+            if (HasStagedEdits)
+                DiscardStagedChanges();
+        });
 
         // Runs only while the window is visible (see OnVisibleChanged). Another controller's claim,
         // release, request or handover has no local signal, so this tick is what surfaces it - at
@@ -2468,6 +2475,19 @@ public class OzServerSectorsWindow : BaseForm
                       + string.Join(Environment.NewLine, described));
         }
 
+        // What OzServer refused outright: a request for a sector its holder has since let go, a
+        // release of one no longer owned, a sector the server does not know. Nothing on screen moves
+        // for these either, and unreported the Apply reads as having worked.
+        if (result.Failed.Count > 0)
+        {
+            var described = result.Failed.Distinct().Select(DescribeWithCurrentOwner).ToList();
+            parts.Add((described.Count == 1
+                          ? "This change could not be applied:"
+                          : "These changes could not be applied:")
+                      + Environment.NewLine + Environment.NewLine
+                      + string.Join(Environment.NewLine, described));
+        }
+
         if (parts.Count == 0)
             return;
 
@@ -2686,7 +2706,18 @@ public class OzServerSectorsWindow : BaseForm
         try
         {
             if (await _tracker.ConfirmTakeDroppedAsync(held, askAgain: true))
-                RunOnUiThread(() => StageSectorChange(sector, true));
+                RunOnUiThread(() =>
+                {
+                    // The answer can come a minute after the arrow was pressed. A window hidden
+                    // since then has discarded what was staged and must not gain a staged move
+                    // nobody can see, and one staged over a running Apply or request action would
+                    // be wiped as it finishes (RunSectorAction refuses the same way). The agreement
+                    // stands, so moving the sector across again stages it without asking.
+                    if (!Visible || _applyRunning || _requestActionRunning)
+                        return;
+
+                    StageSectorChange(sector, true);
+                });
         }
         catch (Exception ex)
         {

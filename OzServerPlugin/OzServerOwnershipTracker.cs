@@ -848,7 +848,39 @@ public class OzServerOwnershipTracker
 
         // Anything a dropped controller, or one without the plugin, holds is taken only once this
         // controller has agreed to it (ConfirmTakeDroppedAsync).
-        return await _api.ClaimSectorAsync(sector.Name, exclude, CoversAgreedDropped(sector, external: false), CoversAgreedDropped(sector, external: true));
+        //
+        // The backend applies either flag to every sector the claim covers, so whatever else under
+        // it is held that way, and was not agreed to, is left out by name: agreeing to take BLA from
+        // one controller without the plugin must not take ELW from another. When the sector named is
+        // itself one of those, the flags are not sent at all, and the conflict that comes back asks
+        // about it.
+        var notAgreed = UnagreedUnanswerableUnder(sector);
+        var namedNotAgreed = notAgreed.Contains(sector.Name, StringComparer.OrdinalIgnoreCase);
+        var takeDropped = !namedNotAgreed && CoversAgreedDropped(sector, external: false);
+        var takeExternal = !namedNotAgreed && CoversAgreedDropped(sector, external: true);
+
+        if (takeDropped || takeExternal)
+        {
+            foreach (var name in notAgreed)
+            {
+                if (!exclude.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    exclude.Add(name);
+            }
+        }
+
+        return await _api.ClaimSectorAsync(sector.Name, exclude, takeDropped, takeExternal);
+    }
+
+    // The sectors a claim of this one covers that somebody who cannot answer a request holds
+    // (Owner.Unanswerable), and that this controller has not agreed to take. From the last sync, as
+    // every prompt about them is.
+    List<string> UnagreedUnanswerableUnder(SectorsVolumes.Sector sector)
+    {
+        var controlled = _controlled;
+        return PrimaryPosition.CoveredBy(sector)
+            .Where(s => controlled.TryGetValue(s.Name, out var owner) && owner.Unanswerable && !AgreedToTakeDropped(s.Name))
+            .Select(s => s.Name)
+            .ToList();
     }
 
     // Takes back top-down cover that was withheld while somebody was logged on as it, once they
@@ -971,6 +1003,8 @@ public class OzServerOwnershipTracker
 
         ActionLog.Log("Resume", $"requesting for {Network.Me?.Callsign ?? "(callsign unknown)"}");
 
+        var generation = Volatile.Read(ref _sessionGeneration);
+
         try
         {
             var positionSectors = PrimaryPosition.DefaultSectorsForCurrentSession(Network.Me?.Callsign)
@@ -1027,7 +1061,21 @@ public class OzServerOwnershipTracker
             // A backend without /sectors/resume, or a transient failure: fall back to the plain
             // connect refresh so the session still starts, without recovering anything.
             OzErrors.Add(new Exception($"Couldn't resume the previous session: {ex.Message}", ex), "OzServer");
-            await RefreshFromServerIfIdleAsync();
+            // The waiting variant: what follows reads the result.
+            await RefreshFromServerAsync();
+
+            // What that refresh found owned was this controller's before they connected, exactly as
+            // after a resume that answered: nothing is claimed until this method returns (see
+            // _awaitingResume). Left empty, nothing would count as carried over, and
+            // PrimaryPositionWatcher would give a sector held over from the last session to its
+            // position's controller as "already online". Not when the refresh failed as well (no
+            // baseline), nor for a session that has ended meanwhile.
+            if (_hasBaseline && Volatile.Read(ref _sessionGeneration) == generation)
+            {
+                var heldOver = _owned.Where(s => !s.IsDummy).Select(s => s.Name).ToList();
+                lock (_carriedOverGate)
+                    _carriedOver = new HashSet<string>(heldOver, StringComparer.OrdinalIgnoreCase);
+            }
         }
     }
 
@@ -1484,15 +1532,32 @@ public class OzServerOwnershipTracker
                 .Where(name => !toClaim.Any(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase)))
                 .ToList();
 
+            // Staged from a dropped controller, or one without the plugin, after the window asked
+            // (ConfirmTakeDroppedAsync).
+            var takeDropped = toClaim.Any(s => CoversAgreedDropped(s, external: false));
+            var takeExternal = toClaim.Any(s => CoversAgreedDropped(s, external: true));
+
+            // Either flag covers every claim in the batch, so anything else under them that is held
+            // the same way and was not agreed to is left out - see ClaimWithExclusionsAsync. Never a
+            // sector staged by name, as above.
+            if (takeDropped || takeExternal)
+            {
+                var notAgreed = toClaim
+                    .SelectMany(UnagreedUnanswerableUnder)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Where(name => !toClaim.Any(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase))
+                                   && !staffed.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
+                staffed.AddRange(notAgreed);
+            }
+
             var response = await _api.CommitAsync(
                 toClaim.Select(s => s.Name),
                 toRelease.Select(s => s.Name),
                 (toRequest ?? Array.Empty<SectorsVolumes.Sector>()).Select(s => s.Name),
                 staffed,
-                // Staged from a dropped controller, or one without the plugin, after the window asked
-                // (ConfirmTakeDroppedAsync).
-                toClaim.Any(s => CoversAgreedDropped(s, external: false)),
-                toClaim.Any(s => CoversAgreedDropped(s, external: true)));
+                takeDropped,
+                takeExternal);
 
             result.Claimed.AddRange(response.Result.Claimed);
             result.Released.AddRange(response.Result.Released);
@@ -1866,8 +1931,8 @@ public class OzServerOwnershipTracker
     }
 
     // One or more of the sectors a claim for `sector` covers is owned by someone else - GUN
-    // extending into WOL while BLA owns WOL's sub-sector SNO, say. Requests what should be
-    // requested, then claims whatever the conflict left uncontested. The contested sectors are
+    // extending into WOL while BLA owns WOL's sub-sector SNO, say. Claims whatever the conflict
+    // left uncontested, then requests what should be requested. The contested sectors are
     // pulled back out of MMI.SectorsControlled and their VSCS lines taken off Transmit:
     // AfvSectorClaimer.CheckActive adds a primary's whole group to MMI before any of this is known,
     // and a sector must not sit there as if owned when OzServer disagrees.
@@ -1875,6 +1940,36 @@ public class OzServerOwnershipTracker
     {
         if (OzServerMode.Disabled)
             return;
+
+        // Whatever the conflict leaves uncontested is claimed first, before any of the questions
+        // below. Each can stay open for ConflictPromptTimeout, and until this claim lands OzServer
+        // records none of the sector as this controller's - the position they logged on to
+        // included, free for anybody to take by name.
+        //
+        // Only when the conflict left something to take that is not this controller's already.
+        // Logging on to a position somebody present holds contests all of it, and a claim that
+        // excludes every sector it covers has nothing to do - nor has one for sectors already
+        // owned, which a conflict recurring on every poll would otherwise send each time.
+        var contestedOrStaffed = new HashSet<string>(
+            conflicts.Select(c => c.Sector).Concat(PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign)),
+            StringComparer.OrdinalIgnoreCase);
+        // Read before the claim: a sync landing while a question is open would otherwise make what
+        // it took read as already owned, and the question below would not list it.
+        var notYetMine = new HashSet<string>(
+            PrimaryPosition.CoveredBy(sector).Where(s => !IsMine(s)).Select(s => s.Name),
+            StringComparer.OrdinalIgnoreCase);
+
+        if (notYetMine.Any(name => !contestedOrStaffed.Contains(name)))
+        {
+            try
+            {
+                await ClaimWithExclusionsAsync(sector, conflicts.Select(c => c.Sector).ToList());
+            }
+            catch (Exception ex)
+            {
+                OzErrors.Add(new Exception($"Couldn't claim {sector.Name} on OzServer: {ex.Message}", ex), "OzServer");
+            }
+        }
 
         // Requested once the controller agrees (ConfirmOwnPositionRequestAsync):
         //
@@ -1890,7 +1985,7 @@ public class OzServerOwnershipTracker
         //     IsReliefCovered), and ending it is the FMP's decision.
         //   - Anything a transmit press is already asking about (IsHeldForTransmitPrompt).
         //
-        // Both are still left out of the claim below, like any conflict.
+        // Both are still left out of the claim, like any conflict.
         //   - A sector held by the controller logged on as it (the sector's own callsign - vatSys's
         //     rule for giving a sector to its controller). It is theirs, not cover to take back:
         //     BLA logging on while ML_APP was online asked ML_APP for MAE, which BLA only works
@@ -1946,7 +2041,7 @@ public class OzServerOwnershipTracker
         var staffed = new HashSet<string>(
             PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign), StringComparer.OrdinalIgnoreCase);
         var taking = PrimaryPosition.CoveredBy(sector)
-            .Where(s => !contestedNames.Contains(s.Name) && !staffed.Contains(s.Name) && !IsMine(s))
+            .Where(s => !contestedNames.Contains(s.Name) && !staffed.Contains(s.Name) && notYetMine.Contains(s.Name))
             .Select(s => SectorDescription.Describe(s))
             .ToList();
 
@@ -1969,14 +2064,9 @@ public class OzServerOwnershipTracker
 
         await RequestAsOneGroupAsync(asked);
 
-        // Only when the conflict left something to take. Logging on to a position somebody present
-        // holds contests all of it, and a retry that excludes every sector the claim covers has
-        // nothing to do.
-        var leftOut = new HashSet<string>(
-            leaveOut.Select(c => c.Sector).Concat(PrimaryPosition.StaffedCoveredSectors(sector, Network.Me?.Callsign)),
-            StringComparer.OrdinalIgnoreCase);
-
-        if (PrimaryPosition.CoveredBy(sector).Any(covered => !leftOut.Contains(covered.Name)))
+        // Claimed again only when an answer added something to take: the unanswerable holders'
+        // sectors this controller has just agreed to. The rest was claimed before the questions.
+        if (takeDropped)
         {
             try
             {
@@ -2010,10 +2100,9 @@ public class OzServerOwnershipTracker
     }
 
     // Sectors held by somebody who cannot answer a request (Owner.Unanswerable) that this controller
-    // has agreed to take: a dropped controller's until the server would have freed them anyway
-    // (ReleasedAt), one without the plugin's for ExternalTakeWindow. Any claim covering one is sent
-    // with takeDropped or takeExternal. And the prompts open and answered No, by the sorted sector
-    // list, so the claim pass's retries neither stack nor repeat them. Cleared on disconnect.
+    // has agreed to take, each for ExternalTakeWindow. Any claim covering one is sent with
+    // takeDropped or takeExternal. And the prompts open and answered No, by the sorted sector list,
+    // so the claim pass's retries neither stack nor repeat them. Cleared on disconnect.
     readonly Dictionary<string, (DateTime Until, bool External)> _takeDroppedAgreed = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _takeDroppedAsking = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> _takeDroppedDeclined = new(StringComparer.OrdinalIgnoreCase);
@@ -2132,8 +2221,14 @@ public class OzServerOwnershipTracker
             {
                 if (answer)
                 {
+                    // Both for ExternalTakeWindow from now, by this PC's clock. `until` is the
+                    // server's time and is only shown: the disconnect sweep can leave a dropped
+                    // controller's sector held a minute past it, and a PC clock running ahead
+                    // passes it sooner still. An agreement kept only until then can have lapsed
+                    // before the claim it was given for goes out, which then comes back as the
+                    // same conflict and the same question.
                     foreach (var conflict in droppedHeld)
-                        _takeDroppedAgreed[conflict.Sector] = (until, false);
+                        _takeDroppedAgreed[conflict.Sector] = (DateTime.UtcNow + ExternalTakeWindow, false);
                     foreach (var conflict in externalHeld)
                         _takeDroppedAgreed[conflict.Sector] = (DateTime.UtcNow + ExternalTakeWindow, true);
                     _takeDroppedDeclined.Remove(key);
@@ -2415,20 +2510,22 @@ public class OzServerOwnershipTracker
                 var prompt = new SectorConflictPromptWindow(message, caption, yesText, noText);
                 var timeout = new System.Windows.Forms.Timer { Interval = (int)ConflictPromptTimeout.TotalMilliseconds };
 
-                timeout.Tick += (_, _) =>
+                // Both run straight off vatSys's message loop, so each is contained like any other
+                // work on its UI thread (UiThread.Guard).
+                timeout.Tick += (_, _) => UiThread.Guard(() =>
                 {
                     timeout.Stop();
                     if (!prompt.IsDisposed)
                         prompt.Close();
-                };
+                })();
 
-                prompt.FormClosed += (_, _) =>
+                prompt.FormClosed += (_, _) => UiThread.Guard(() =>
                 {
                     timeout.Stop();
                     timeout.Dispose();
                     // Anything but an explicit Yes - No, the title bar's close, the timeout - is no.
                     answer.TrySetResult(prompt.Answer);
-                };
+                })();
 
                 if (Application.OpenForms["MainForm"] is Form mainForm)
                     prompt.Show(mainForm);

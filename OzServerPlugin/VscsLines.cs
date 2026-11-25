@@ -46,6 +46,29 @@ static class VscsLines
     static readonly Dictionary<string, Pending> _pending = new(StringComparer.OrdinalIgnoreCase);
     static OzServerOwnershipTracker? _tracker;
 
+    // The line this class is taking off the panel right now, on the thread doing it. vatSys clears
+    // Transmit and Receive on a line before removing it (Audio.RemoveVSCSFrequency), and both
+    // setters raise their event - which AfvSectorClaimer reads as the controller pressing Idle,
+    // taking the sector out of MMI with its tags and releasing it on OzServer. A line removed here
+    // is one whose sector is kept. Per line, not a plain flag: the removal also raises
+    // VSCSFrequenciesChanged, and ApplyPending can switch another line on from inside it.
+    [ThreadStatic] static VSCSFrequency? _removingLine;
+
+    public static bool IsRemoving(VSCSFrequency line) => ReferenceEquals(_removingLine, line);
+
+    static void RemoveLine(VSCSFrequency line)
+    {
+        _removingLine = line;
+        try
+        {
+            Audio.RemoveFrequency(line);
+        }
+        finally
+        {
+            _removingLine = null;
+        }
+    }
+
     // Called once at plugin load, before VatpacPlugin subscribes to the same events - see the
     // class comment.
     public static void Initialise(OzServerOwnershipTracker tracker)
@@ -142,7 +165,7 @@ static class VscsLines
             {
                 try
                 {
-                    Audio.RemoveFrequency(line);
+                    RemoveLine(line);
                     ActionLog.Log("Primary", $"Removed VSCS line {line.Name} - worked on {primary.Name}'s line ({reason})", new
                     {
                         action = "vscs_subsector_line_removed",
@@ -251,7 +274,7 @@ static class VscsLines
             return false;
         }
 
-        Audio.RemoveFrequency(victim);
+        RemoveLine(victim);
         ActionLog.Log("Primary", $"Removed idle VSCS line {victim.Name} to make room for {forSector.Name}", new
         {
             action = "vscs_line_removed_for_room",

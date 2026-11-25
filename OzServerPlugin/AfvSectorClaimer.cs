@@ -198,6 +198,12 @@ public class AfvSectorClaimer
             OnLineStateChanged(sender, e);
     }
 
+    // What the two handlers do, contained: vatSys raises these events from inside its own VSCS click
+    // handling (VSCSControlDX.Execute), where an exception would leave the panel locked out and end
+    // the process.
+    void OnLineStateChanged(object? sender, EventArgs e) =>
+        UiThread.Guard(() => HandleLineStateChanged(sender))();
+
     // Both events, because Idle and Receive cannot be told apart from TransmitChanged alone.
     // vatSys's VSCS buttons (VSCSControlDX, VSCS_Button_Freq_*) set the two flags in a fixed order:
     //
@@ -209,8 +215,13 @@ public class AfvSectorClaimer
     // transmitting state it is leaving. Only ReceiveChanged, which comes second, shows which button
     // it was. Both setters raise their event on every write, changed or not, so pressing Idle on a
     // line already on Receive still arrives here as a ReceiveChanged with both flags off.
-    void OnLineStateChanged(object? sender, EventArgs e)
+    void HandleLineStateChanged(object? sender)
     {
+        // A line this plugin is removing from the panel is not the controller going quiet on it -
+        // see VscsLines.IsRemoving.
+        if (sender is VSCSFrequency removing && VscsLines.IsRemoving(removing))
+            return;
+
         if (OzServerMode.Disabled)
             return;
 
@@ -725,14 +736,16 @@ public class AfvSectorClaimer
         {
             var prompt = new SectorConflictPromptWindow(message, "Request sector", "Accept", "Reject");
             var timeout = new System.Windows.Forms.Timer { Interval = (int)RequestPromptTimeout.TotalMilliseconds };
-            timeout.Tick += (_, _) =>
+            // Both run straight off vatSys's message loop, so each is contained like any other work
+            // on its UI thread (UiThread.Guard).
+            timeout.Tick += (_, _) => UiThread.Guard(() =>
             {
                 timeout.Stop();
                 if (!prompt.IsDisposed)
                     prompt.Close();
-            };
+            })();
 
-            prompt.FormClosed += (_, _) =>
+            prompt.FormClosed += (_, _) => UiThread.Guard(() =>
             {
                 timeout.Stop();
                 timeout.Dispose();
@@ -742,7 +755,7 @@ public class AfvSectorClaimer
                     _ = RequestFromTransmitAsync(sector);
                 else
                     BackToReceive(frequency, sector);
-            };
+            })();
 
             if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form mainForm)
                 prompt.Show(mainForm);

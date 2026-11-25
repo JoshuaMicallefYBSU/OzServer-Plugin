@@ -39,6 +39,9 @@ sealed class SelcalDebugWindow : BaseForm
     readonly ListBox _samples;
     readonly TextField _code;
     readonly TextBox _output;
+    // This window's own, unlike vatSys's shared fonts: a control does not dispose the font it is
+    // given, so it is disposed with the window.
+    readonly Font _outputFont = new(FontFamily.GenericMonospace, 9f);
     SoundPlayer? _player;
 
     public SelcalDebugWindow()
@@ -104,7 +107,7 @@ sealed class SelcalDebugWindow : BaseForm
             ReadOnly = true,
             ScrollBars = ScrollBars.Vertical,
             BorderStyle = BorderStyle.FixedSingle,
-            Font = new Font(FontFamily.GenericMonospace, 9f),
+            Font = _outputFont,
             BackColor = Colours.GetColour(Colours.Identities.StripBackground),
             ForeColor = Colours.GetColour(Colours.Identities.StripText)
         };
@@ -188,9 +191,22 @@ sealed class SelcalDebugWindow : BaseForm
             return;
         Check();
 
+        // The two checks vatSys's own SELCAL window makes before it sends (sendButton_Click). This
+        // goes out on a live frequency, and Audio.TransmitSELCAL makes neither.
+        if (!Network.ValidATC)
+        {
+            Log("Not transmitted: not connected as a valid ATC position.");
+            return;
+        }
         if (!AFV.IsConnected)
         {
             Log("Not transmitted: AFV is not connected.");
+            return;
+        }
+        // After the AFV check: there are no VSCS frequencies to read before audio has started.
+        if (!Audio.VSCSFrequencies.Any(f => f.Transmit))
+        {
+            Log("Not transmitted: no frequency is set to transmit.");
             return;
         }
         if (Audio.Transmitting)
@@ -269,5 +285,13 @@ sealed class SelcalDebugWindow : BaseForm
         _player?.Stop();
         _player?.Dispose();
         base.OnFormClosed(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        // After the controls, so nothing is still drawing with it.
+        base.Dispose(disposing);
+        if (disposing)
+            _outputFont.Dispose();
     }
 }

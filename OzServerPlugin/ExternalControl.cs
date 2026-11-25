@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -90,8 +91,11 @@ public sealed class ExternalControl
             {
                 Callsign = atc.Callsign.ToUpperInvariant(),
                 RealName = string.IsNullOrEmpty(atc.RealName) ? null : atc.RealName,
+                // Formatted here, as vatSys's Conversions.FSDFrequencyToString does but without the
+                // PC's regional settings: with a decimal comma that gives "134,2", which OzServer
+                // cannot read as a frequency.
                 Frequencies = (atc.Frequencies ?? Array.Empty<int>())
-                    .Select(f => Conversions.FSDFrequencyToString(f))
+                    .Select(f => "1" + (f / 1000.0).ToString("00.0##", CultureInfo.InvariantCulture))
                     .Where(f => !string.IsNullOrEmpty(f))
                     .Distinct()
                     .ToList(),
@@ -133,7 +137,8 @@ public sealed class ExternalControl
                       + "OzServer can't request or hand over sectors with them. Coordinate with "
                       + $"{callsign} directly, and hand off tags manually.";
 
-        MMI.InvokeOnGUI(() =>
+        // MMI.InvokeOnGUI posts to vatSys's UI thread as it is given, so the work is contained here.
+        var show = UiThread.Guard(() =>
         {
             var notice = new SectorNoticeWindow(message, "Controller not using OzServer");
             if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form mainForm)
@@ -142,5 +147,6 @@ public sealed class ExternalControl
                 notice.Show();
             notice.BringToFront();
         });
+        MMI.InvokeOnGUI(() => show());
     }
 }

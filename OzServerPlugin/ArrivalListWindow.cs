@@ -333,9 +333,19 @@ sealed class ArrivalLadder : Control
         // Top of the sequence first, as listed.
         _sequenced = list.Where(f => f.SeqIndex >= 0).OrderByDescending(f => f.SeqIndex).ToList();
 
-        // A strip being dragged that has gone from the list is let go.
-        if (_pressed != null && !list.Any(f => SameCallsign(f.Callsign, _pressed.Callsign)))
-            EndDrag();
+        // A strip being dragged that has gone from the list is let go. One still there is followed
+        // to its new object: every answer from OzServer replaces them all, and Rows and Drop tell
+        // the dragged strip from the rest by reference. Left on the old one, the strip would be
+        // counted among the others, and a drag up the sequence would land one place too high.
+        if (_pressed != null)
+        {
+            var pressedCallsign = _pressed.Callsign;
+            var current = list.FirstOrDefault(f => SameCallsign(f.Callsign, pressedCallsign));
+            if (current == null)
+                EndDrag();
+            else
+                _pressed = current;
+        }
 
         if (ContentHeight != height)
             ContentHeightChanged?.Invoke(this, EventArgs.Empty);
@@ -441,7 +451,8 @@ sealed class ArrivalLadder : Control
         // OzServer's, or this client's own estimate while the record has none yet (pushed by a
         // plugin from before it sent one).
         if ((flight.Eta ?? (fdr != null ? FdrSync.LandingTime(fdr) : null)) is { } eta)
-            TextRenderer.DrawText(g, eta.ToString("HH:mm"), MMI.eurofont_winsml, time, stripText, flags);
+            // Invariant: ":" in a custom format is the culture's time separator, a "." on some.
+            TextRenderer.DrawText(g, eta.ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture), MMI.eurofont_winsml, time, stripText, flags);
 
         var name = flight.Callsign.Length > 7 ? flight.Callsign.Substring(0, 7) : flight.Callsign;
         TextRenderer.DrawText(g, name, MMI.eurofont_sml, callsign, callsignColour, flags);

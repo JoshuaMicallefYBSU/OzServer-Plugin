@@ -59,9 +59,13 @@ the reasoning changes.
 Every installed copy updates itself from this repository's GitHub releases, and it trusts the
 **assembly's** version, not the tag. A release must therefore be:
 
-1. **Versioned.** Raise `<Version>` in `OzServerPlugin.csproj`, add it to `CHANGELOG.md`, and run
-   `.\Release.ps1` from that commit. The script checks the DLL's name and FileVersion.
-2. **Tagged to match.** Use `v0.1.9` for version `0.1.9`, titled `OzServer Plugin v0.1.9`.
+1. **Versioned.** Raise `<Version>` in `OzServerPlugin.csproj`, add it to `CHANGELOG.md`, commit
+   and push, and run `.\Release.ps1` from that commit. The script refuses a tree with uncommitted
+   changes, a commit that is on no remote branch and a tag that already exists, and checks the
+   DLL's name and version.
+2. **Tagged to match.** Use `v0.1.9` for version `0.1.9`, titled `OzServer Plugin v0.1.9`. The
+   `gh release create` command the script prints names the commit with `--target`; without it
+   GitHub tags the tip of the default branch instead.
 3. **Published with both files attached**, zip first:
    - `OzServerPlugin-v<version>.zip` (DLL and `LICENSE.txt` at the root), which the
      [vatSys Launcher](https://github.com/badvectors/vatSysLauncher) installs
@@ -71,8 +75,8 @@ Every installed copy updates itself from this repository's GitHub releases, and 
    or a draft is never "latest".
 
 The OzServer API picks a new release up within about five minutes, and each client installs it at
-its next check (as vatSys opens, then every six hours) and shows the controller a window
-offering to restart vatSys for them. It takes effect the next time that controller starts vatSys.
+its next check (as vatSys opens, then every five minutes until an update is installed) and shows
+the controller a window offering to restart vatSys for them. It takes effect the next time that controller starts vatSys.
 
 Things to know:
 
@@ -89,8 +93,10 @@ Things to know:
   is below the version VATPAC lists, which comes from the tag. Keep the tag and `<Version>` equal.
 - **A tag ahead of the assembly reaches nobody.** If `v0.1.9` carries a DLL still stamped `0.1.8`,
   every client downloads it, sees it is not newer, and discards it.
-- **To pause a rollout**, set `PLUGIN_RELEASE_MAX_VERSION` on the API to the last good version, or
-  return the release to draft. Clients that already installed it are not downgraded; publish a
-  fixed, higher version for them.
+- **To pause a rollout, return the release to draft.** Nothing else stops it. Setting
+  `PLUGIN_RELEASE_MAX_VERSION` on the API to the last good version only narrows it: a client that
+  gets no answer from OzServer — the API is restarting or unreachable, or the session has OzServer
+  disabled — asks GitHub directly and installs the newest published release. Clients that already
+  installed it are not downgraded; publish a fixed, higher version for them.
 - **Write access to this repository is the trust boundary.** Whatever is published here runs
   inside every controller's vatSys. Keep release rights restricted.

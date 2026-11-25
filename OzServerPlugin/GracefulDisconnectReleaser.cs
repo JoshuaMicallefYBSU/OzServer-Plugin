@@ -39,15 +39,37 @@ public class GracefulDisconnectReleaser
 
     readonly OzServerApiClient _api = new();
 
+    // Set once the network has confirmed this session as a controller, and taken back by the
+    // disconnect that ends it. vatSys raises Network.Disconnected for a logon that never got that
+    // far as well - a refused password, "callsign in use", a server that cannot be reached
+    // (Network.ProcessNetworkError) - and always with the Connect window open, since that is where
+    // Connect was pressed. Read as a deliberate disconnect, a failed attempt to get back on after a
+    // drop would release the very sectors OzServer is holding for this controller.
+    volatile bool _established;
+
     public GracefulDisconnectReleaser()
     {
+        // Only ever set here: Network.Disconnect clears ValidATC, and raises this, before it raises
+        // Disconnected.
+        Network.ValidATCChanged += (_, _) =>
+        {
+            if (Network.ValidATC)
+                _established = true;
+        };
+
         // Network.Disconnected fires off the UI thread for a network drop (vatSys installs no
         // SynchronizationContext on its FSDSession) and on it for a user-initiated disconnect.
-        // OnDisconnected reads Application.OpenForms, so it is marshalled either way.
-        Network.Disconnected += (_, _) => RunOnUiThread(OnDisconnected);
+        // OnDisconnected reads Application.OpenForms, so it is marshalled either way. The latch is
+        // read and reset before the marshal, so it cannot pick up the next session's.
+        Network.Disconnected += (_, _) =>
+        {
+            var established = _established;
+            _established = false;
+            RunOnUiThread(() => OnDisconnected(established));
+        };
     }
 
-    void OnDisconnected()
+    void OnDisconnected(bool established)
     {
         if (OzServerMode.Disabled)
             return;
@@ -57,18 +79,20 @@ public class GracefulDisconnectReleaser
         if (NetworkServer.Current == null)
             return;
 
-        // The Connect window is on screen, so the controller pressed Disconnect on it. A dropped
-        // connection does not open this window.
-        if (IsConnectWindowOpen())
+        // True only once MainForm's FormClosing handler has committed to closing - see the class
+        // comment. Tested first: with the Connect window also open, the fire-and-forget release
+        // below could be killed with the process.
+        if (BaseForm.AppClosing)
         {
-            _ = ReleaseAsync();
+            ReleaseBlocking();
             return;
         }
 
-        // True only once MainForm's FormClosing handler has committed to closing - see the class
-        // comment.
-        if (BaseForm.AppClosing)
-            ReleaseBlocking();
+        // The Connect window is on screen, so the controller pressed Disconnect on it. A dropped
+        // connection does not open this window. Only for a session that was established - see
+        // _established.
+        if (established && IsConnectWindowOpen())
+            _ = ReleaseAsync();
     }
 
     static bool IsConnectWindowOpen() =>

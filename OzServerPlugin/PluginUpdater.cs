@@ -8,6 +8,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -40,18 +41,25 @@ public class PluginUpdater
 {
     const string Repository = "JoshuaMicallefYBSU/OzServer-Plugin";
 
-    // The list endpoint rather than /releases/latest, which excludes prereleases - and releases are
-    // published as prereleases.
+    // The list endpoint rather than /releases/latest, which excludes prereleases: a prerelease is
+    // offered like any other release.
     const string GitHubReleasesApi = "https://api.github.com/repos/" + Repository + "/releases";
 
     // The only location a download is accepted from, whichever source named it. A compromised
     // OzServer can choose among published releases but cannot serve a file of its own.
     const string DownloadPrefix = "https://github.com/" + Repository + "/releases/download/";
 
+    // A release download in full: the prefix, a tag and an asset name, each a plain name. A prefix
+    // match alone is not enough - Uri resolves "../" before the request is made, so a URL that
+    // starts with the prefix can still end up in another repository.
+    static readonly Regex DownloadShape = new(
+        "^" + Regex.Escape(DownloadPrefix) + @"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     const string AssetName = "OzServerPlugin.dll";
     const string AssemblyIdentity = "OzServerPlugin";
 
-    // Far above any real build (about 300 KB), and a bound on what a bad response can make us buffer.
+    // Far above any real build (under 1 MB), and a bound on what a bad response can make us buffer.
     const long MaxDownloadBytes = 20 * 1024 * 1024;
 
     // Straight after vatSys opens. The check itself runs off the UI thread and costs the scope
@@ -71,6 +79,10 @@ public class PluginUpdater
     static readonly TimeSpan RetryDelay = TimeSpan.FromMinutes(2);
     const int MaxRetries = 3;
     int _retries;
+    // Installs that failed for a reason other than the network, after which the checks stop for
+    // the session - see CheckAsync.
+    const int MaxFailures = 3;
+    int _failures;
 
     // How long the update notice waits for vatSys's main window before falling back to the Errors
     // window: the check can finish while vatSys is still starting.
@@ -82,7 +94,8 @@ public class PluginUpdater
     sealed class Release
     {
         public Version Version = new();
-        public string Url = "";
+        // As TryAcceptDownload returned it: the form that was checked is the form requested.
+        public Uri Url = null!;
         // Hex SHA-256 of the asset, when the source reported one.
         public string? Sha256;
         public bool IsZip;
@@ -111,6 +124,16 @@ public class PluginUpdater
             if (release == null || release.Version.CompareTo(current) <= 0)
                 return;
 
+            // Another vatSys running from this folder has installed it already. Its backup is the
+            // DLL both instances have loaded, which cannot be replaced, so installing again would
+            // fail at every check.
+            if (OnDiskVersion(installedPath) is { } onDisk && release.Version.CompareTo(onDisk) <= 0)
+            {
+                _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                ActionLog.Log("Update", $"{release.Version} is already in place ({onDisk} on disk); it will be used the next time vatSys starts.");
+                return;
+            }
+
             var staged = installedPath + ".update";
             await DownloadAsync(release, staged).ConfigureAwait(false);
 
@@ -119,6 +142,8 @@ public class PluginUpdater
             if (!IsValidUpgrade(staged, current))
             {
                 TryDelete(staged);
+                // The same release would be downloaded and discarded again at every check.
+                _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
                 ActionLog.Log("Update", $"Discarded the {release.Version} download - it isn't a newer {AssemblyIdentity}.");
                 return;
             }
@@ -146,6 +171,12 @@ public class PluginUpdater
         catch (Exception ex)
         {
             // Anything else needs someone to look at it - a plugin folder that isn't writable, say.
+            // That will not fix itself within the session, and left running the timer would
+            // download the release and raise this again every CheckInterval. A few tries first,
+            // though: a virus scanner holding the DLL it has just been handed fails the same way,
+            // and is over by the next check.
+            if (Interlocked.Increment(ref _failures) >= MaxFailures)
+                _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
             OzErrors.Add(new Exception($"Couldn't check for a plugin update: {ex.Message}", ex), "OzServer");
         }
     }
@@ -293,14 +324,20 @@ public class PluginUpdater
         if (body.Type == JTokenType.Null)
             return (true, null);
 
-        var url = (string?)body["url"];
+        // The type first: only an object can be indexed by name, and anything else throws rather
+        // than leaving the question to GitHub.
         if (body.Type != JTokenType.Object
-            || !TryParseVersion((string?)body["version"], out var version)
-            || !IsAcceptedDownload(url))
+            || !TryParseVersion(StringOrNull(body["version"]), out var version)
+            || !TryAcceptDownload(StringOrNull(body["url"]), out var download))
             return (false, null);
 
-        return (true, new Release { Version = version, Url = url!, Sha256 = (string?)body["sha256"] });
+        return (true, new Release { Version = version, Url = download, Sha256 = StringOrNull(body["sha256"]) });
     }
+
+    // A field that is missing, null or not text reads as absent; a cast would throw on an object
+    // or an array.
+    static string? StringOrNull(JToken? token) =>
+        token != null && token.Type == JTokenType.String ? (string?)token : null;
 
     static async Task<Release?> GetGitHubReleaseAsync()
     {
@@ -342,8 +379,7 @@ public class PluginUpdater
                 : null;
 
             var chosen = dll ?? zip;
-            var url = (string?)chosen?["browser_download_url"];
-            if (chosen == null || !IsAcceptedDownload(url))
+            if (chosen == null || !TryAcceptDownload((string?)chosen["browser_download_url"], out var download))
                 continue;
 
             // GitHub reports the digest as "sha256:<hex>"; older assets have none.
@@ -352,7 +388,7 @@ public class PluginUpdater
             best = new Release
             {
                 Version = version,
-                Url = url!,
+                Url = download,
                 Sha256 = digest != null && digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) ? digest.Substring(7) : null,
                 IsZip = dll == null
             };
@@ -368,8 +404,27 @@ public class PluginUpdater
         return text != null && Version.TryParse(text.Trim().TrimStart('v', 'V'), out version!);
     }
 
-    static bool IsAcceptedDownload(string? url) =>
-        url != null && url.StartsWith(DownloadPrefix, StringComparison.OrdinalIgnoreCase);
+    // Hands back the Uri to download from, so what is requested is exactly what was checked.
+    // AbsoluteUri is the address after Uri has resolved it, and that is the form held to
+    // DownloadShape. "..", "%" and "\" are refused outright, before and after: none belongs in a
+    // release download, and each is a way to spell a path that is not the one it looks like.
+    static bool TryAcceptDownload(string? url, out Uri download)
+    {
+        download = null!;
+
+        if (url == null || LooksRewritten(url) || !Uri.TryCreate(url, UriKind.Absolute, out var parsed))
+            return false;
+
+        var resolved = parsed.AbsoluteUri;
+        if (LooksRewritten(resolved) || !DownloadShape.IsMatch(resolved))
+            return false;
+
+        download = parsed;
+        return true;
+    }
+
+    static bool LooksRewritten(string url) =>
+        url.Contains("..") || url.Contains("%") || url.Contains("\\");
 
     static async Task DownloadAsync(Release release, string destination)
     {
@@ -440,6 +495,20 @@ public class PluginUpdater
         {
             // Not a managed assembly - a truncated download or an error page.
             return false;
+        }
+    }
+
+    // The version of the DLL now at the installed path, which is not the running one once any
+    // vatSys has installed an update. Null if it cannot be read.
+    static Version? OnDiskVersion(string path)
+    {
+        try
+        {
+            return AssemblyName.GetAssemblyName(path).Version;
+        }
+        catch
+        {
+            return null;
         }
     }
 

@@ -274,7 +274,8 @@ public static class PrimaryPosition
                       + Environment.NewLine + Environment.NewLine
                       + "An FMP can only provide relief cover for a sector another controller holds, by requesting it from them.";
 
-        MMI.InvokeOnGUI(() =>
+        // MMI.InvokeOnGUI posts to vatSys's UI thread as it is given, so the work is contained here.
+        var show = UiThread.Guard(() =>
         {
             var notice = new SectorNoticeWindow(message, "Unable to assume sector");
             if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form mainForm)
@@ -283,6 +284,7 @@ public static class PrimaryPosition
                 notice.Show();
             notice.BringToFront();
         });
+        MMI.InvokeOnGUI(() => show());
     }
 
     // IsRealATC filters out observers and the other non-controlling connections in this list, so

@@ -61,6 +61,8 @@ public class TagResumeRecovery
             {
                 _pending.Clear();
                 _retakeSector.Clear();
+                // Labels read for the session that ended, possibly from another server.
+                _labelState.Clear();
             }
         };
 
@@ -158,8 +160,14 @@ public class TagResumeRecovery
             if (flight == null)
                 return;
 
+            // Kept only for a tag still outstanding. One that answers after the tag was settled, or
+            // after a disconnect, would otherwise wait here and be put onto the same callsign the
+            // next time it is retaken - a label from an earlier flight, session or server.
             lock (_gate)
-                _labelState[callsign] = flight;
+            {
+                if (_pending.ContainsKey(callsign))
+                    _labelState[callsign] = flight;
+            }
         }
         catch (Exception ex)
         {

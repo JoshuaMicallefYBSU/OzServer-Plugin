@@ -191,8 +191,9 @@ releases API directly. Prereleases count; drafts do not.
 
 **Verifying it.** Whichever source answered:
 
-1. the download URL must be under this repository's GitHub releases — a changed base URL or a
-   compromised server can choose among published releases, but cannot supply a file
+1. the download URL, once resolved, must be exactly a release download of this repository
+   (`…/releases/download/<tag>/<asset>`) — a changed base URL or a compromised server can choose
+   among published releases, but cannot supply a file
 2. the downloaded bytes must match the release asset's SHA-256, where one is published
 3. the file must be a managed assembly named `OzServerPlugin` with a version higher than the one
    running, read from its metadata without loading it
@@ -209,8 +210,14 @@ Neither staging file ends in `.dll`, so vatSys never tries to load one. The back
 once a later session has started, so a release that fails to load can be undone by renaming it
 back.
 
-Failures to reach either source are logged and retried at the next check. A successful install is
-reported once, in the vatSys Errors window — the only notification surface a plugin has.
+Failures to reach either source are logged and retried at the next check. Any other failure — a
+plugin folder that cannot be written to, say — is reported in the vatSys Errors window, and the
+third one ends the checks for that session. Finding the release already in place (a second vatSys
+running from the same folder installed it) ends them too, without an error.
+
+A successful install is reported once, in an **OzServer update** window whose **Restart** button
+closes vatSys and opens it again. The vatSys Errors window is used instead only if vatSys's main
+window has not appeared within a minute.
 
 ### Alongside the vatSys Launcher
 

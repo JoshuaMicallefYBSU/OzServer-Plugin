@@ -47,6 +47,9 @@ public class FdrSync
     // returned, and overlapping batches can land out of order, an older one overwriting a newer
     // one's positions. A tick that finds a flush running skips.
     int _flushing;
+    // Counts sessions, so a batch that fails after a disconnect is not put back into the next
+    // session's queue. Guarded by _lock.
+    int _session;
 
     readonly OzServerOwnershipTracker _tracker;
 
@@ -65,6 +68,8 @@ public class FdrSync
         {
             lock (_lock)
             {
+                // A batch still in flight belongs to the session that ended - see Requeue.
+                _session++;
                 _pending.Clear();
                 // Sent under this session's identity or not at all; the record then ages out.
                 _pendingCancels.Clear();
@@ -91,6 +96,13 @@ public class FdrSync
             lock (_lastRadarPush)
                 _lastRadarPush.Clear();
             Landed.Clear();
+            // A stand-in carried into the next session reads as one already under way, which is
+            // the one case TakeOverIfStale reports alongside the chosen controller.
+            lock (_standingIn)
+                _standingIn.Clear();
+            // vatSys starts the next session with new FDRs: a callsign left here would let
+            // FdrResumeActivation bring back a later flight that was finished for another reason.
+            FinishedOutOfView.Clear();
         };
     }
 
@@ -1139,10 +1151,10 @@ public class FdrSync
         }
     }
 
-    // The label state last queued per tracked flight: scratchpad, global ops and the "C" (see
-    // OzServerFdrUpdateDto.CPrompt). The C lives on the Track and vatSys raises nothing when a
-    // middle click toggles it, so no FDR update carries the change. It is looked for once per flush,
-    // on this controller's own tags only, and queued only when something has changed.
+    // The label state last queued per tracked flight: the cleared level, scratchpad, global ops and
+    // the "C" (see OzServerFdrUpdateDto.CPrompt). The C lives on the Track and vatSys raises nothing
+    // when a middle click toggles it, so no FDR update carries the change. It is looked for once per
+    // flush, on this controller's own tags only, and queued only when something has changed.
     readonly Dictionary<string, string> _labelStateKeys = new(StringComparer.OrdinalIgnoreCase);
 
     // Tags whose label this client must not speak for yet: just accepted from another controller,
@@ -1278,8 +1290,11 @@ public class FdrSync
                     continue;
 
                 var track = MMI.FindTrack(fdr);
-                // The deviation menu writes OTDLeft/OTDRight and raises nothing either.
-                var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.CPrompt}\u001f{fdr.OTDLeft}\u001f{fdr.OTDRight}";
+                // The deviation menu writes OTDLeft/OTDRight and raises nothing either. Nor does a
+                // cleared level: FDP2.SetCFL sets the two properties and sends them, with no FDR
+                // update. Left to the sweep, a new level would reach the record up to a minute late
+                // - and a sector transfer, a resume and LabelStateMirror all read it from there.
+                var key = $"{fdr.LabelOpData}\u001f{fdr.GlobalOpData}\u001f{track?.CPrompt}\u001f{fdr.OTDLeft}\u001f{fdr.OTDRight}\u001f{fdr.CFLLower}\u001f{fdr.CFLUpper}";
 
                 lock (_lock)
                 {
@@ -1329,6 +1344,7 @@ public class FdrSync
 
             List<OzServerFdrUpdateDto> batch;
             List<string> cancels;
+            int session;
 
             lock (_lock)
             {
@@ -1339,19 +1355,31 @@ public class FdrSync
                 _pending.Clear();
                 cancels = _pendingCancels.ToList();
                 _pendingCancels.Clear();
+                session = _session;
             }
 
             if (batch.Count > 0)
             {
+                // How much of the batch the server has taken.
+                var sent = 0;
                 try
                 {
                     // In parts: the server takes at most 500 flights and 2 MB in one request, and a
                     // sweep carrying full routes for a busy session can pass either.
                     for (var offset = 0; offset < batch.Count; offset += MaxBatchSize)
+                    {
                         await _api.UpdateFdrBatchAsync(batch.Skip(offset).Take(MaxBatchSize));
+                        sent = Math.Min(offset + MaxBatchSize, batch.Count);
+                    }
                 }
                 catch (Exception ex)
                 {
+                    // Not when the server refused the request outright: the same flights would be
+                    // refused again on every flush, and nothing else would get through behind them.
+                    var refused = ex is OzServerApiException api && api.StatusCode is >= 400 and < 500;
+                    if (!refused)
+                        Requeue(batch.Skip(sent).ToList(), session);
+
                     // Once per outage rather than once per flush - see ErrorThrottle.
                     ErrorThrottle.Report("fdr-flush", $"Couldn't push FDR batch to OzServer: {ex.Message}", ex);
                 }
@@ -1389,6 +1417,63 @@ public class FdrSync
         finally
         {
             Interlocked.Exchange(ref _flushing, 0);
+        }
+    }
+
+    // Puts back what a failed batch did not deliver. Positions, routes and labels are all sent
+    // again sooner or later, but a drop (SendDrop) is reported once: lost with its batch, the
+    // record would go on naming this controller, a resume would hand the tag back, and whoever
+    // assumed it next would have their updates refused.
+    //
+    // Each update goes back underneath whatever has been queued for the flight since, as Merge
+    // would have left it had it never been taken out.
+    void Requeue(List<OzServerFdrUpdateDto> unsent, int session)
+    {
+        // Who tracks what now. An update with nothing newer queued over it still states who held
+        // the tag when it was built, and it may have waited out an outage: one naming this
+        // controller is put back only while they still track the tag, and one naming nobody only
+        // while nobody does. Sent late, either would overwrite the name of whoever has it now.
+        var mine = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var someoneElses = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var fdr in FDP2.GetFDRs)
+            {
+                if (string.IsNullOrEmpty(fdr.Callsign))
+                    continue;
+                if (fdr.IsTrackedByMe)
+                    mine.Add(fdr.Callsign);
+                else if (fdr.IsTracked)
+                    someoneElses.Add(fdr.Callsign);
+            }
+        }
+        catch (Exception)
+        {
+            return; // nothing is put back: a flight still reported is queued again by its next update
+        }
+
+        lock (_lock)
+        {
+            // Disconnected meanwhile: it belongs to the session that ended, and may be for
+            // another server - see the Disconnected handler.
+            if (session != _session)
+                return;
+
+            foreach (var dto in unsent)
+            {
+                // Cancelled since, and awaiting its delete: nothing may recreate it (see Merge).
+                if (_pendingCancels.Contains(dto.Callsign))
+                    continue;
+
+                if (_pending.TryGetValue(dto.Callsign, out var newer))
+                    CopyNonNull(newer, dto);
+                else if (dto.ControllingCid != null
+                             ? !mine.Contains(dto.Callsign)
+                             : mine.Contains(dto.Callsign) || someoneElses.Contains(dto.Callsign))
+                    continue;
+
+                _pending[dto.Callsign] = dto;
+            }
         }
     }
 

@@ -14,7 +14,7 @@ with it. Everything is kept in step through the [OzServer API](https://github.co
 and shown publicly on the live map at [ozserver.org](https://ozserver.org).
 
 > [!NOTE]
-> OzServer is in pre-release testing. Expect frequent updates — the plugin installs them itself.
+> Expect frequent updates — the plugin installs them itself.
 
 ## Contents
 
@@ -52,7 +52,7 @@ and shown publicly on the live map at [ozserver.org](https://ozserver.org).
 | **Shared flight data** | Flight plans, positions and label data for the aircraft you hold are shared with OzServer, so another controller's scope and the public map agree with yours. |
 | **Couple assist** | Couples an activated flight plan to the radar track with the same callsign when vatSys's own route check will not. |
 | **Shared Arrival Lists** | The Arrival List (`A:YSSY List`) is OzServer's own window in place of vatSys's: every departed flight inbound, with its landing time, type and global ops, in one order for every controller. Anyone can reorder it unless the airport's FMP (`SY_FMP` for YSSY) is online, and then only the FMP can. Two badges above the list show how many controllers have it open (hover for who) and whether the FMP is online. Global ops can be edited from the list by any controller, up to the FDR's 15 characters. |
-| **Controllers without the plugin** | A controller connected without OzServer (`ML-TBD_CTR` on plain vatSys) still holds their airspace: their position, whatever their information lines say they are covering ("Extending MUN, GUN"), and the sectors their frequencies stand for, matched only to a sector of their own kind and unit. Those sectors show as controlled (marked "no plugin") and can't be claimed; asking for one explains that coordination and tag handoffs have to be done manually. The live map tints them light orange. |
+| **Controllers without the plugin** | A controller connected without OzServer (`ML-TBD_CTR` on plain vatSys) still holds their airspace: their position, whatever their information lines say they are covering ("Extending MUN, GUN"), and the sectors their frequencies stand for, matched only to a sector of their own kind and unit. Those sectors show as controlled (marked "no plugin") and nothing can be requested from them, as there is no plugin on their end to answer. Once that controller has handed one to you or logged off, transmitting on it or moving it across in the Sectors window asks whether to take it, with a reminder that coordination and tag handoffs have to be done manually. The live map tints them light orange. |
 | **ATIS** | Your ATIS — vatSys's own, and every [ATISPlugin](https://github.com/badvectors/ATISPlugin) broadcast — is published as it changes. |
 
 ### Resilience
@@ -247,17 +247,18 @@ a profile's `Plugins` folder, set `OutputPath` on the command line or in a git-i
 Releases are built with [`Release.ps1`](Release.ps1) and published on GitHub. The plugin's own
 updater and the vatSys Launcher both install from there.
 
-1. Raise `<Version>` in `OzServerPlugin/OzServerPlugin.csproj` (`MAJOR.MINOR.PATCH`) and add the
-   release to [CHANGELOG.md](CHANGELOG.md).
-2. Run `.\Release.ps1`. It builds Release into `artifacts\build\`, checks the DLL's name and version,
-   and writes:
+1. Raise `<Version>` in `OzServerPlugin/OzServerPlugin.csproj` (`MAJOR.MINOR.PATCH`), add the
+   release to [CHANGELOG.md](CHANGELOG.md), then commit and push.
+2. Run `.\Release.ps1` from that commit. It refuses uncommitted changes, an unpushed commit or an
+   existing tag, builds Release into `artifacts\build\`, checks the DLL's name and version, and
+   writes:
    - `artifacts\OzServerPlugin-v<version>.zip`: `OzServerPlugin.dll` and `LICENSE.txt` at the zip
      root, for the launcher and manual installs
    - `artifacts\OzServerPlugin.dll`: the bare DLL, which the self-updater downloads
-3. Commit, then publish a GitHub release tagged `v<version>`, titled `OzServer Plugin v<version>`,
+3. Publish a GitHub release tagged `v<version>` at that commit, titled `OzServer Plugin v<version>`,
    with both files attached. Attach the zip first. Publish it as a normal release marked latest:
    the launcher only sees GitHub's latest release, and that never includes a pre-release or a draft.
-   The script prints the `gh release create` command.
+   The script prints the `gh release create` command, with the commit as its `--target`.
 4. Check it with `gh api repos/JoshuaMicallefYBSU/OzServer-Plugin/releases/latest`.
 
 VATPAC's plugin list picks up the new release by itself. [CONTRIBUTING.md](CONTRIBUTING.md#publishing-a-release)

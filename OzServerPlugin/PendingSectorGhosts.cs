@@ -190,6 +190,11 @@ public class PendingSectorGhosts
         if (fdr.IsTrackedByMe || fdr.ControllingSector == null)
             return false;
 
+        // Being offered to this controller. Painted as a ghost, the tag would stop flashing and
+        // the handoff could go unanswered.
+        if (fdr.State == FDP2.FDR.FDRStates.STATE_HANDOVER || fdr.State == FDP2.FDR.FDRStates.STATE_HANDOVER_FIRST)
+            return false;
+
         var inside = SectorLocator.Resolve(fdr, pending);
         if (inside == null)
             return false;

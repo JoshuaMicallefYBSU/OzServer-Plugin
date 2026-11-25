@@ -1,4 +1,5 @@
 using System;
+using System.Text.RegularExpressions;
 using vatsys;
 
 namespace OzServerPlugin;
@@ -44,11 +45,11 @@ static class ErrorReporter
                 return;
 
             // A failure reported with new Exception(message, cause) carries its stack on the cause.
-            var cause = (e.Error.InnerException ?? (e.Error.StackTrace != null ? e.Error : null))?.ToString();
+            var cause = WithoutProfilePath((e.Error.InnerException ?? (e.Error.StackTrace != null ? e.Error : null))?.ToString());
             if (cause != null && cause.Length > MaxCauseLength)
                 cause = cause.Substring(0, MaxCauseLength);
 
-            ActionLog.Log(Category, e.Error.Message, new
+            ActionLog.Log(Category, WithoutProfilePath(e.Error.Message) ?? "", new
             {
                 source,
                 exception = (e.Error.InnerException ?? e.Error).GetType().Name,
@@ -59,6 +60,23 @@ static class ErrorReporter
         {
             // Reporting an error must never raise another inside vatSys's Errors.Add.
         }
+    }
+
+    // "C:\Users\<Windows account>" written as "~". A file-system exception quotes the path it
+    // failed on, these lines are sent to OzServer and on to the maintainers, and the account name
+    // is often the controller's own.
+    //
+    // The folder is looked up here, inside OnErrorsChanged's catch, rather than in a static field:
+    // a type initializer that threw would take Install, and the plugin's constructor, with it.
+    static string? WithoutProfilePath(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text;
+
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return string.IsNullOrEmpty(profile)
+            ? text
+            : Regex.Replace(text!, Regex.Escape(profile), "~", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
 }
 

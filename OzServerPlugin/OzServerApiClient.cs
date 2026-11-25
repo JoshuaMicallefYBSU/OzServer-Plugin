@@ -546,6 +546,13 @@ public class OzServerApiClient
         {
             if (ServicePointManager.DefaultConnectionLimit < TargetConnectionLimit)
                 ServicePointManager.DefaultConnectionLimit = TargetConnectionLimit;
+
+            // The default only reaches a ServicePoint created after it is set, and this host's
+            // usually exists by now with the old limit: PluginUpdater asks it for the current
+            // release seconds after vatSys starts, well before the first call made here.
+            var servicePoint = ServicePointManager.FindServicePoint(new Uri(OzServerSettings.BaseUrl));
+            if (servicePoint.ConnectionLimit < TargetConnectionLimit)
+                servicePoint.ConnectionLimit = TargetConnectionLimit;
         }
         catch
         {

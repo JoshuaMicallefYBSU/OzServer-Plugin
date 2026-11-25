@@ -42,7 +42,7 @@
           under the same plugin root; MEF then sees two IPlugin types and silently fails to load
           the plugin. To build straight into a vatSys profile, set OutputPath in
           OzServerPlugin.csproj.user (per-developer, gitignored) or on the command line:
-            dotnet build -p:OutputPath="C:\...\Profiles\Australia\Plugins\OzServerPlugin\"
+            dotnet build -p:OutputPath="C:\...\Profiles\Australia\Plugins\OzServer-Plugin\"
         -->
         <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     </PropertyGroup>

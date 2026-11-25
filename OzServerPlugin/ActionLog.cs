@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Security.AccessControl;
+using System.Text;
 using vatsys;
 
 namespace OzServerPlugin;
@@ -44,7 +46,13 @@ public static class ActionLog
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
 
-                File.AppendAllText(path, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {category}: {message}{Environment.NewLine}");
+                // Shared for writing, and opened for appending only: a second vatSys writes the
+                // same day's file, and each line then lands whole at the end whichever instance
+                // wrote last. File.AppendAllText shares for reading only, so the instance that
+                // opened second lost its line.
+                var line = new UTF8Encoding(false).GetBytes($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {category}: {message}{Environment.NewLine}");
+                using (var stream = new FileStream(path, FileMode.Append, FileSystemRights.AppendData, FileShare.ReadWrite, 4096, FileOptions.None))
+                    stream.Write(line, 0, line.Length);
             }
         }
         catch
