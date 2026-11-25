@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/ozserver-logo-on-dark.png">
+    <img src=".github/assets/ozserver-logo-on-light.png" alt="OzServer" width="420">
+  </picture>
+</p>
+
 # OzServer Plugin
 
 [![Latest release](https://img.shields.io/github/v/release/JoshuaMicallefYBSU/OzServer-Plugin?include_prereleases&label=release)](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases)
