@@ -4,7 +4,7 @@ Every release of the OzServer plugin, newest first. Versions follow `MAJOR.MINOR
 tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same number. Entries up to
 0.3.1 are the notes published with each GitHub release.
 
-## [0.3.2] - Unreleased
+## [0.3.2] - 2026-11-25
 
 ### Added
 
@@ -443,7 +443,7 @@ The ZIP contains OzServerPlugin.dll at its root.
 
 **Full Changelog**: https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/commits/v0.1.1
 
-[0.3.2]: https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/compare/v0.3.1...HEAD
+[0.3.2]: https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/tag/v0.3.2
 [0.3.1]: https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/tag/v0.3.1
 [0.3.0]: https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/tag/v0.3.0
 [0.2.9]: https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/tag/v0.2.9
