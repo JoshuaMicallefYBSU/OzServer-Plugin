@@ -4,7 +4,7 @@ Every release of the OzServer plugin, newest first. Versions follow `MAJOR.MINOR
 tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same number. Entries up to
 0.3.1 are the notes published with each GitHub release.
 
-## [Unreleased]
+## [0.3.3] - 2026-11-25
 
 ### Changed
 
