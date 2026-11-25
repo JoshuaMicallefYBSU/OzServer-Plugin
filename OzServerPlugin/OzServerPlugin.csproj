@@ -5,36 +5,52 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
-        <!-- vatSys.exe itself is built x86; match it so the plugin loads into the same process without an architecture mismatch. -->
+        <!-- vatSys.exe is x86, and the plugin loads into its process. -->
         <PlatformTarget>x86</PlatformTarget>
 
+        <!--
+          Never rename: OzServerPlugin.dll is the DllName the vatSys Launcher detects an install by,
+          and the assembly name PluginUpdater accepts an upgrade from.
+        -->
         <AssemblyName>OzServerPlugin</AssemblyName>
         <RootNamespace>OzServerPlugin</RootNamespace>
-        <Version>0.1.8</Version>
+        <!--
+          Raise for every release, and tag it v<Version>. The SDK stamps it as the DLL's
+          AssemblyVersion and FileVersion (0.3.2 -> 0.3.2.0): the vatSys Launcher compares the
+          FileVersion with the version VATPAC lists, and PluginUpdater compares AssemblyVersion
+          with the release tag.
+        -->
+        <Version>0.3.2</Version>
+
+        <Product>OzServer Plugin</Product>
+        <AssemblyTitle>OzServer Plugin</AssemblyTitle>
+        <Description>Shared sector ownership for vatSys: claim, request and hand over sectors, and the aircraft in them, through OzServer.</Description>
+        <Authors>OzServer Dev Team</Authors>
+        <Company>OzServer</Company>
+        <Copyright>Copyright (c) 2026 OzServer Dev Team</Copyright>
+        <RepositoryUrl>https://github.com/JoshuaMicallefYBSU/OzServer-Plugin</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageProjectUrl>https://ozserver.org</PackageProjectUrl>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
     </PropertyGroup>
 
     <PropertyGroup>
         <VatSysPath Condition="'$(VatSysPath)' == ''">$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path)</VatSysPath>
         <!--
-          vatSys discovers plugins by scanning the profile's Plugins folder, so the build output
-          needs to be a flat folder holding exactly one OzServerPlugin.dll - the same shape every
-          other installed plugin uses. The default bin\Debug\net472\ nesting would leave a second
-          copy of the assembly under the same plugin root, and MEF then sees two distinct IPlugin
-          types and silently fails to load the plugin (the same trap the Private=False notes below
-          guard against). To build straight into a vatSys profile rather than bin\, set OutputPath
-          in OzServerPlugin.csproj.user - per-developer and gitignored, so this shared project file
-          keeps no one machine's paths - or pass it on the command line:
-            dotnet build -p:OutputPath="C:\...\Profiles\Australia\Plugins\OzServerPlugin\"
+          vatSys scans the profile's Plugins folder, so the output must be a flat folder holding
+          one OzServerPlugin.dll. The default bin\Debug\net472\ nesting would leave a second copy
+          under the same plugin root; MEF then sees two IPlugin types and silently fails to load
+          the plugin. To build straight into a vatSys profile, set OutputPath in
+          OzServerPlugin.csproj.user (per-developer, gitignored) or on the command line:
+            dotnet build -p:OutputPath="C:\...\Profiles\Australia\Plugins\OzServer-Plugin\"
         -->
         <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     </PropertyGroup>
 
     <!--
-      Without this, a machine that simply doesn't have vatSys installed gets an empty VatSysPath,
-      every HintPath below resolves to a bare "\bin\vatSys.exe", and the build fails with a wall of
-      "the type or namespace 'vatsys' could not be found" errors that say nothing about the actual
-      cause. Fail early and say what's wrong instead. Set VatSysPath explicitly (e.g.
-      `dotnet build -p:VatSysPath="D:\vatSys"`) for a non-default install location.
+      Fails early with a clear message when vatSys cannot be found, rather than with a wall of
+      "the type or namespace 'vatsys' could not be found" errors. For a non-default install
+      location, build with -p:VatSysPath="D:\vatSys".
     -->
     <Target Name="EnsureVatSysPath" BeforeTargets="ResolveAssemblyReferences">
         <Error Condition="'$(VatSysPath)' == ''" Text="Could not locate vatSys. It is normally found via HKLM\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path, which is unset or unreadable here - install vatSys, or build with -p:VatSysPath=&quot;C:\Path\To\vatSys&quot;." />
@@ -42,49 +58,36 @@
     </Target>
 
     <ItemGroup>
-        <!-- Exclude any ignored Secrets.cs left over from token-authenticated older builds so an
-             obsolete shared credential cannot be embedded in a new assembly. -->
+        <!-- Secrets.cs belonged to early token-authenticated builds and is not compiled. -->
         <Compile Remove="Secrets.cs" />
         <!--
-          Reference the installed vatSys.exe so the plugin compiles against the
-          real vatsys/vatsys.Plugin types (BaseForm, Colours, MMI, IPlugin, etc).
-          Private=False is required: vatSys.exe must NOT be copied into the
-          plugin's output folder. If a second copy of vatSys.exe ships alongside
-          the plugin DLL, MEF composition inside the running vatSys process will
-          see two distinct IPlugin types (one per loaded copy of the assembly)
-          and silently fail to load the plugin.
+          Compiled against the installed vatSys.exe for the real vatsys/vatsys.Plugin types.
+          Private=False keeps it out of the output folder: with a second copy beside the plugin
+          DLL, MEF sees two distinct IPlugin types and silently fails to load the plugin.
         -->
         <Reference Include="vatSys">
             <HintPath>$(VatSysPath)\bin\vatSys.exe</HintPath>
             <Private>False</Private>
         </Reference>
         <!--
-          Same reasoning as vatSys.exe above: reference vatSys's own copy of the
-          control library (TreeViewEx, GenericButton, VATSYSControls.ScrollBar, ...)
-          rather than bundling one, so the Sectors window is built from the exact
-          same control types the real vatSys windows use.
+          vatSys's own control library (TreeViewEx, GenericButton, ...), so the plugin's windows
+          use the same control types as vatSys's. Private=False as above.
         -->
         <Reference Include="VATSYSControls">
             <HintPath>$(VatSysPath)\bin\VATSYSControls.dll</HintPath>
             <Private>False</Private>
         </Reference>
         <!--
-          Reference the copy of Newtonsoft.Json vatSys itself already ships and loads
-          (vatSys\bin\Newtonsoft.Json.dll), rather than bundling our own via NuGet.
-          Private=False keeps our plugin from shipping a second, possibly different-version
-          copy that could conflict with the one already resident in the process.
+          The copy of Newtonsoft.Json vatSys already loads, rather than one from NuGet.
+          Private=False avoids shipping a second, possibly different, version into the process.
         -->
         <Reference Include="Newtonsoft.Json">
             <HintPath>$(VatSysPath)\bin\Newtonsoft.Json.dll</HintPath>
             <Private>False</Private>
         </Reference>
         <!--
-          Network.Rating and Network.Facility are typed with this library's own enums
-          (NetworkRating/NetworkFacility) - the Rating and Position fields from vatSys's connection
-          window, and the only trustworthy way to tell an observer connection from a controller one
-          at connect time. Private=False for exactly the same reason as vatSys.exe and
-          Newtonsoft.Json above: a second copy shipped beside the plugin would be a different
-          assembly identity to the one already loaded in the vatSys process.
+          Supplies the NetworkRating/NetworkFacility enums that Network.Rating and
+          Network.Facility are typed with (see NetworkIdentity.IsObserver). Private=False as above.
         -->
         <Reference Include="RossCarlson.Vatsim.Network">
             <HintPath>$(VatSysPath)\bin\RossCarlson.Vatsim.Network.dll</HintPath>

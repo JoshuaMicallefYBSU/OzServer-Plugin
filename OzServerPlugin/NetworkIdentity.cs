@@ -5,20 +5,13 @@ namespace OzServerPlugin;
 
 // Who this session is, as OzServer needs it: a numeric CID and a callsign.
 //
-// vatSys stores both exactly as typed into the connection window - Network.Connect writes them
-// straight to its own `controllerID`/`callsign` fields - and exposes the CID only as
-// Network.ControllerId, a string. There is no numeric accessor anywhere on Network or NetworkATC, so
-// parsing is unavoidable; the point of this class is that it happens once, in one place, rather than
-// in each caller with its own idea of what to do when it fails.
-//
-// It used to be parsed in three places with three different failure behaviours: the API client threw,
-// FdrSync skipped the flight, and the ownership tracker ignored the result and carried on with cid 0
-// - which would have attributed a sector to "controller 0" rather than to nobody. Now they all get
-// the same answer, and the one that needs to fail loudly is the one that asks for it that way.
+// vatSys exposes the CID only as Network.ControllerId, a string holding whatever was typed into the
+// connection window; there is no numeric accessor. It is parsed here, in one place, so every caller
+// gets the same answer when it is missing or not a number.
 static class NetworkIdentity
 {
-    // Null until connected under a real callsign with a numeric CID. Anything that talks to OzServer
-    // has nothing meaningful to say before that point.
+    // Null until connected under a callsign with a numeric CID. Nothing can be said to OzServer
+    // before then.
     public static (int Cid, string Callsign)? Current
     {
         get
@@ -32,38 +25,17 @@ static class NetworkIdentity
     }
 
     // Whether this session connected as an observer, read from the two fields the vatSys connection
-    // window actually sets: Position (Network.Facility) and Rating (Network.Rating). OBS in either
-    // is an observer connection - the same rule the connection window itself presents.
+    // window sets: Position (Network.Facility) and Rating (Network.Rating). OBS in either is an
+    // observer connection.
     //
-    // Deliberately NOT Network.Me.IsRealATC, which every observer check here used to key on. That
-    // flag describes the ATC record the network has published about us, not what we connected as,
-    // and it reads false for a genuine controller for some seconds after Connected. Gating anything
-    // at connect time on it therefore refuses real controllers: it cost a live ML-ASP_CTR session
-    // its resume and, through the same test in the position mirror, its entire sector allocation.
-    // Facility and Rating are set from the connection window and are correct immediately.
+    // Not Network.Me.IsRealATC: that flag describes the ATC record the network has published about
+    // this session, and reads false for a real controller for some seconds after Connected. A check
+    // made on it at connect time refuses a real controller their resume and their sector
+    // allocation. Facility and Rating are correct immediately.
     public static bool IsObserver =>
         Network.Rating == NetworkRating.OBS || Network.Facility == NetworkFacility.OBS;
 
     // 0 when not connected. Only for callers where "not me" is the right reading of an absent
-    // identity - never for attributing ownership, where 0 would be a real controller id.
+    // identity - never for attributing ownership, where 0 would be recorded as a controller.
     public static int CidOrZero => Current?.Cid ?? 0;
-
-    // Whether this session may put shared markup - drawings, notes - on every other controller's
-    // scope. Reading it is unrestricted: an observer watching a position should see what that
-    // controller has marked up, the same way ObserverPositionMirror shows them the airspace. Writing
-    // is not, because an observer is not working traffic and shared markup is an operational
-    // statement made to everyone connected.
-    //
-    // Deliberately IsObserver (Position/Rating) rather than Network.Me.IsRealATC - see above for why
-    // that flag would silently drop the opening markup of a genuine session.
-    //
-    // The plugin being well behaved, not a security boundary: the API takes the caller's word for
-    // who they are, so it cannot tell an observer from anyone else.
-    //
-    // Gated on IsConnected as well, because Current is not: vatSys keeps the callsign and CID after
-    // a disconnect (which GracefulDisconnectReleaser relies on), so without it this stayed true once
-    // the session had ended. SharedNotes forgets its own notes on disconnect, found them again on the
-    // next poll, and published every one of them a second time while disconnected - a duplicate of
-    // each on every other controller's scope.
-    public static bool CanPublishMarkup => Network.IsConnected && Current != null && !IsObserver;
 }

@@ -7,38 +7,32 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Sends this session's log lines to OzServer, so every controller's log can be read in one place.
+// Sends this session's log lines to OzServer, so every controller's log can be read in one place:
+// a fault involving two controllers is two clients disagreeing, and neither log alone shows it.
 //
-// Diagnosing anything involving two controllers used to mean collecting a text file from each of
-// them and lining the timestamps up by hand - and the interesting client was usually the one whose
-// log nobody had. A sector handed to the wrong person, a tag that flashed instead of landing, a
-// position relinquished to somebody already online: each of those is two clients disagreeing, and
-// neither log alone shows it.
+// The local file remains the complete record; this is a partial copy. Not sent:
 //
-// The local file is unchanged and remains the complete record. This is a copy, and a partial one.
+//   - API lines. The server already logs every HTTP call it serves, and they are most of the
+//     volume.
+//   - Anything logged while not connected, which cannot be attributed to a controller. Errors
+//     (ErrorReporter) are the exception: they are held and sent once a session gives them one.
 //
-// What is not sent, and why:
-//
-//   - API lines. Every HTTP call this plugin makes is already logged by the server that served it,
-//     and they are the overwhelming majority of the volume - forwarding them would mean posting a
-//     log line about posting a log line.
-//   - Anything logged while not connected, which cannot be attributed to a controller anyway.
-//
-// What is sent is the decisions: what the plugin concluded and why. Those are the lines worth
-// comparing between two clients.
+// What is sent is the decisions: what the plugin concluded and why, and every error it raised.
 public class ClientLogForwarder
 {
-    // Batched rather than sent per line. A reconnect produces a burst of decisions in a second or
-    // two, and one request for the burst is cheaper for everyone than one per line.
+    // Batched rather than sent per line: a reconnect produces a burst of decisions within a second
+    // or two.
     static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(5);
 
-    // Matches the server's per-batch cap. Beyond this the oldest are dropped rather than the newest:
-    // if something is generating log lines faster than they can be sent, the recent ones are the
-    // ones that explain it.
+    // Matches the server's per-batch cap. Beyond it the oldest are dropped: if lines are produced
+    // faster than they can be sent, the recent ones are the ones that explain why.
     const int MaxQueued = 200;
 
     // Never forwarded - see the class comment.
     const string ApiCategory = "API";
+
+    // The server's limit on one line's message (batchSchema in routes/client-logs.ts).
+    const int MaxMessageLength = 2000;
 
     static readonly string SessionId = Guid.NewGuid().ToString("N");
     static readonly string? PluginVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString();
@@ -58,8 +52,17 @@ public class ClientLogForwarder
 
     void OnLine(string category, string message, object? context)
     {
-        if (category == ApiCategory || !Network.IsConnected)
+        if (category == ApiCategory || string.IsNullOrWhiteSpace(message))
             return;
+
+        // An error is kept even before a session is up, and goes out with the first flush that has
+        // an identity to send it under. Anything else logged while offline is not worth holding.
+        if (!Network.IsConnected && category != ErrorReporter.Category)
+            return;
+
+        // The server refuses a whole batch for one line over its limit.
+        if (message.Length > MaxMessageLength)
+            message = message.Substring(0, MaxMessageLength);
 
         lock (_lock)
         {
@@ -79,17 +82,20 @@ public class ClientLogForwarder
         }
     }
 
+    // The last of the log, sent while disabling (inside OzServerMode.AllowFinalCalls).
+    public Task FlushNowAsync() => FlushAsync();
+
     async Task FlushAsync()
     {
+        if (!OzServerMode.RequestsAllowed)
+            return;
+
         List<OzServerClientLogLineDto> batch;
 
         lock (_lock)
         {
-            // One flush at a time. Overlapping sends would reorder a narrative whose whole value is
-            // its order.
-            // Identity is all this needs - a line has to be attributable to a controller to be
-            // worth anything. Deliberately not the markup rule: an observer's log is as useful for
-            // diagnosis as anyone's, and forwarding it changes nothing anyone else sees.
+            // One flush at a time: overlapping sends would arrive out of order. An identity is the
+            // only requirement, so an observer's log is forwarded like anyone's.
             if (_sending || _queued.Count == 0 || NetworkIdentity.Current == null)
                 return;
 
@@ -104,9 +110,8 @@ public class ClientLogForwarder
         }
         catch
         {
-            // Silently dropped, and deliberately not re-queued or logged. This is a diagnostic
-            // convenience: it must never cost the controller anything, and a failure that logged
-            // its own failure would feed itself.
+            // Dropped without re-queueing or logging: this is a diagnostic convenience, and a
+            // failure that logged itself would produce more lines to send.
         }
         finally
         {

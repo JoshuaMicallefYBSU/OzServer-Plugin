@@ -116,10 +116,6 @@ unmentioned in `SectorLocator.cs`'s own comments.
 - `Plugin.cs`'s comment attributes the request-window title-bar flash to "the ATIS window" — the real
   vatSys precedent for `BaseForm.FlashTitleBar` is `ChatWindow`, not `ATISWindow` (which never calls
   it). No functional effect, just a misleading pointer for a future reader.
-- The debug menu's "Conflict (Yes/No)" preview (`Plugin.cs`) shows `SectorConflictPromptWindow`
-  non-modally via `Show()`, but the real code path always shows it modally via `ShowDialog`. The
-  preview doesn't reproduce the real window's modality, unlike the `SectorNoticeWindow` preview next to
-  it, which does.
 - `NotificationSound.cs`'s comment claims the sound is "loaded up front" — it's actually lazily loaded
   on the first real `PlayRequestArrived()` call, with no warm-up call anywhere in `Plugin.cs`. Trivial
   disk I/O, no real impact.
@@ -145,7 +141,7 @@ instant announcement on connect — this plugin already documents that exact lag
 (`OzServerOwnershipTracker.cs`, `PrimaryPositionWatcher.cs`: "VATSIM's own update cycle a few
 seconds") for a different symptom of the same fact. The scenario most likely to hit this: a
 controller logs on under a primary's callsign and OzServer reassigns that primary's sectors to them
-immediately (see the README's "Primary inheritance"), but the *previous* holder's client can run
+immediately (see "Primary positions" in the README), but the *previous* holder's client can run
 `GiveAway` before its own `OnlineATC` snapshot has caught up to the new controller's connection.
 
 `SectorTagHandoff` now checks `Network.GetOnlineATCs` itself before ever calling
@@ -240,7 +236,7 @@ independent of `WM_KEYDOWN`. A controller who has personally remapped "D" via Op
 would get a silent double-action (the plugin's draw toggle plus whatever they bound) — not a crash, no
 error, just an unexplained side effect. Only matters for controllers who've customized their input map.
 
-### UI / menu integration (`Plugin.cs`'s menu logic, `OzServerSectorsWindow`, `OzServerSettingsWindow`, `SectorMessageWindow`, `SectorNoticeWindow`, `SectorConflictPromptWindow`, `ToggleGenericButton`)
+### UI / menu integration (`Plugin.cs`'s menu logic, `OzServerSectorsWindow`, `SectorMessageWindow`, `SectorNoticeWindow`, `SectorConflictPromptWindow`, `ToggleGenericButton`)
 
 Every specific claim about `MainForm.LoadPluginMenuItem`'s placement rules, the built-in Sectors menu
 item's designer name (`sectorsToolStripMenuItem`), `MenuRenderer`'s Name/Tag/Checked-driven coloring and
@@ -359,6 +355,35 @@ vatSys refactor is most likely to change without notice.
 - `ATIS.Content` being replaced by reference (not mutated in place) inside `UpdateATIS`/
   `UpdateATISNoTTS` — relied on for safely reading it from an event handler.
 - `Conversions.FSDFrequencyToString`/`VSCSFrequencyToFSDFrequency`'s exact numeric formulas.
+
+**SELCAL32 (`Selcal32.cs`), all reflection targets. Each one is checked before it is written, and
+if anything doesn't match the window just stays SELCAL16 (logged under `SELCAL`):**
+
+- `vatsys.SELCALWindow+<>c`'s compiler-generated lambda caches for `CheckValidSelcal`
+  (`<>9__7_0`/`<>9__7_1` in 0.4.9305.35667, located by the `<CheckValidSelcal>b__*` method names, not
+  by these ordinals). They are overwritten with a SELCAL32 predicate. This relies on
+  `CheckValidSelcal` still using the `cache ?? (cache = new Func<char,bool>(...))` pattern, and on the
+  check still being per-character via `Enumerable.Any`.
+- `GeoVR.Client.SelcalInput.codeLookup`, the private static `Dictionary<char, float>` that both
+  `Play` (validation) and `AddSignalsToMixer` (frequencies) read. The sixteen SELCAL32 tones are
+  added to it. AFV client 2.2.0.0 ships only the sixteen SELCAL16 entries.
+
+**Arrival Lists (`ArrivalListSync.cs`), all reflection targets. If the required ones are missing,
+vatSys's own list is left alone (logged under `Arrivals`):**
+
+- `MMI.ArrivalLists` (internal static `IList<SequenceWindow>`), `SequenceWindow.Airport`, and the
+  internal static event `MMI.ArrivalListWindowsChanged`. Each `SequenceWindow` vatSys opens is closed
+  as it appears and `ArrivalListWindow` opened in its place. This relies on vatSys still opening
+  every Arrival List through `MMI.OpenArrivalListWindow` (which raises the event), and on it being
+  safe to `Close()` one from a `BeginInvoke` after the event. `MMI.OpenArrivalListWindow` (public)
+  reopens vatSys's own when OzServer is turned off.
+- `SequenceLadder.UnsubscribeAirport(string)`, optional. It stops vatSys polling sawbe.com for a list
+  it no longer shows.
+- `ArrivalListWindow` repaints vatSys's `SequenceLadderDX` by hand: its colour identities
+  (`StripBackground`, `StripText`, `ListSeparator`, and the jurisdiction set chosen by `Track.State`
+  as `SelectBrush` does), its fonts (`eurofont_sml` for the callsign, `eurofont_winsml` for the rest),
+  its 26 px strips, and the landing time it shows (the `ETO` of `ParsedRoute.Last()`, which FdrSync
+  sends as `eta`). A vatSys restyle of its own list would not carry across.
 
 **Plugin loading:**
 

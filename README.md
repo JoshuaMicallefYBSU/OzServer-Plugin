@@ -1,375 +1,340 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/ozserver-logo-on-dark.png">
+    <img src=".github/assets/ozserver-logo-on-light.png" alt="OzServer" width="420">
+  </picture>
+</p>
+
 # OzServer Plugin
 
-A [vatSys](https://virtualairtrafficsystem.com/) plugin that keeps sector ownership in sync with the
-OzServer backend, so every controller sees the same picture of who owns what — and can hand sectors
-between each other without leaving the scope.
+[![Latest release](https://img.shields.io/github/v/release/JoshuaMicallefYBSU/OzServer-Plugin?include_prereleases&label=release)](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases)
+![Platform](https://img.shields.io/badge/vatSys-plugin-blue)
+![.NET Framework 4.7.2](https://img.shields.io/badge/.NET%20Framework-4.7.2-512BD4)
 
-Claim a sector by transmitting on it, extending into it, or logging on under its callsign. Ask
-another controller for one they hold. Accept, reject, or cancel requests. Whatever happens on
-OzServer flows back into vatSys and onto your VSCS panel automatically.
+A [vatSys](https://virtualairtrafficsystem.com/) plugin that gives every controller the same
+picture of **who owns which sector** — and lets sectors, and the aircraft in them, move between
+controllers without anyone leaving the scope.
 
----
+Claim a sector by transmitting on its frequency, extending into it, or logging on under its
+callsign. Ask another controller for one they hold. When a sector changes hands, its aircraft go
+with it. Everything is kept in step through the [OzServer API](https://github.com/JoshuaMicallefYBSU/OzServer-API),
+and shown publicly on the live map at [ozserver.org](https://ozserver.org).
 
-## What it does
+> [!NOTE]
+> Expect frequent updates — the plugin installs them itself.
+
+## Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Updates](#updates)
+- [Using OzServer](#using-ozserver)
+- [Settings](#settings)
+- [Troubleshooting](#troubleshooting)
+- [Building from source](#building-from-source)
+- [Releasing](#releasing)
+- [How it works](#how-it-works)
+- [Security](#security)
+- [Contributing](#contributing)
+
+## Features
+
+### Sector ownership
 
 | | |
 | --- | --- |
-| **Two-way ownership sync** | Anything that changes your controlled sectors — logging on under a position's callsign, the built-in Sectors window, a VSCS/AFV transmit press, a profile auto-set, another plugin — is claimed on OzServer. A sector gained or lost *on OzServer* is pushed back into `MMI.SectorsControlled` and its VSCS line switched to Transmit or Idle to match. |
-| **Sector requests** | Ask another controller for a sector they own. Accepting the `Requested From Me` heading accepts every incoming request in one batch; accepting a row accepts just that one. A denial is reported back to whoever asked. |
-| **Conflict handling** | Claiming a primary that bundles sub-sectors someone else already holds takes everything that *isn't* contested and leaves the rest with their owner, reporting which. It never turns those into requests behind your back — asking is something you do explicitly, by staging the sector you want. |
-| **Primary inheritance** | Logging in under a position's own callsign takes that position's sectors regardless of who was holding them. Whoever had them is told, and gives them up. A primary is never kept from its own controller. |
-| **Disconnect handling** | A deliberate exit (closing vatSys, or pressing Disconnect) releases your sectors immediately. A crash or dropped connection says nothing at all, and that silence is what holds them for 5 minutes so reconnecting picks up where you left off. |
-| **Request indicator** | An incoming request flashes a trail inward — `Settings`, then `OzServer Sectors` once that menu is open, then the `Requested From Me` heading — plus the window's own title bar, the way the ATIS window does. |
-| **Extending line** | Keeps an `Extending ...` line in your Controller Info in step with the extra VSCS lines you're transmitting on. APP/DEP and CTR positions only. |
-| **Tag ownership** | An aircraft's tag follows the live geographic subsector it's physically in: sitting in one you own, on OzServer, gets it activated (if its flight plan hasn't been) and assumed (if nobody holds it) automatically; losing that subsector on OzServer hands off whatever you were tracking there. |
-| **Flight data** | Pushes FDR and radar-track updates to OzServer in 5-second batches, only for flights you currently hold (`IsTrackedByMe`) and have activated, attributing datalink authority as your own session's identity. Each push also reports the real geographic subsector the aircraft is physically inside of right now, independent of who (if anyone) owns it. |
+| **Two-way sync** | Anything that changes the sectors you control in vatSys — logging on, the Sectors window, a VSCS transmit press, another plugin — is claimed on OzServer. Anything gained or lost on OzServer is applied to vatSys and your VSCS lines. The two are reconciled every few seconds. |
+| **Sector requests** | Ask another controller for a sector they own. They accept or reject from their Sectors window; a rejection is reported back to you. |
+| **Conflict prompts** | Claiming airspace someone else holds opens a prompt showing what is owned and by whom, and asks whether to send a request. The uncontested part is yours either way. |
+| **Primary positions** | Log on while someone is covering your position and your client sends them one request for all of it. Nothing moves until they accept. |
+| **Request indicators** | An incoming request flashes the Settings menu, badges the Sectors window, plays vatSys's ATC-message tone, and shades the requested airspace on your scope — yellow incoming, light green outgoing. |
+| **Observers** | An observer claims nothing, and sees the airspace of the controller they are watching. |
 
-Ownership has exactly one source of truth: **OzServer's own record**. Every action calls the relevant
-endpoint and then re-reads it rather than guessing locally what the result must have been.
+### Aircraft and flight data
 
----
+| | |
+| --- | --- |
+| **Tags follow sectors** | When a sector changes hands, the aircraft its previous owner held inside it are handed to the new owner and accepted automatically, with their cleared level, scratchpad and label data. |
+| **Transfer preview** | While a sector is staged or requested, the aircraft that would come with it are drawn as ghost jurisdiction. |
+| **Shared flight data** | Flight plans, positions and label data for the aircraft you hold are shared with OzServer, so another controller's scope and the public map agree with yours. |
+| **Couple assist** | Couples an activated flight plan to the radar track with the same callsign when vatSys's own route check will not. |
+| **Shared Arrival Lists** | The Arrival List (`A:YSSY List`) is OzServer's own window in place of vatSys's: every departed flight inbound, with its landing time, type and global ops, in one order for every controller. Anyone can reorder it unless the airport's FMP (`SY_FMP` for YSSY) is online, and then only the FMP can. Two badges above the list show how many controllers have it open (hover for who) and whether the FMP is online. Global ops can be edited from the list by any controller, up to the FDR's 15 characters. |
+| **Controllers without the plugin** | A controller connected without OzServer (`ML-TBD_CTR` on plain vatSys) still holds their airspace: their position, whatever their information lines say they are covering ("Extending MUN, GUN"), and the sectors their frequencies stand for, matched only to a sector of their own kind and unit. Those sectors show as controlled (marked "no plugin") and nothing can be requested from them, as there is no plugin on their end to answer. Once that controller has handed one to you or logged off, transmitting on it or moving it across in the Sectors window asks whether to take it, with a reminder that coordination and tag handoffs have to be done manually. The live map tints them light orange. |
+| **ATIS** | Your ATIS — vatSys's own, and every [ATISPlugin](https://github.com/badvectors/ATISPlugin) broadcast — is published as it changes. |
 
-## Installing
+### Resilience
 
-1. Download the latest build, or build it yourself (see [Building](#building)).
-2. Copy `OzServerPlugin.dll` into your profile's plugin folder:
-   `Documents\vatSys Files\Profiles\<your profile>\Plugins\`
+| | |
+| --- | --- |
+| **Deliberate disconnect** | Closing vatSys or pressing Disconnect releases your sectors immediately. |
+| **Dropped connection** | After a crash or network drop your sectors stay yours for five minutes unless someone claims them. Reconnect in that time and your sectors, transmit lines, tags and traffic picture are restored. |
+| **Controller changes** | A controller logging on as your position within two minutes of you leaving takes over its sectors and the tags inside them. |
+| **Network separation** | The live network and each SweatBox server are kept completely apart. |
+| **Disable switch** | **Tools → Disable OzServer** takes OzServer out of your session entirely and restores plain vatSys until the next restart. |
+| **Automatic updates** | New releases install themselves and take effect the next time vatSys starts. |
+
+## Installation
+
+**Requirements:** vatSys, with an Australian or Pacific profile.
+
+Install OzServer **once per profile**, in one place only. If vatSys finds two copies it uses only
+one of them, and OzServer names both in the Errors window. Delete the one you don't want.
+
+### With the vatSys Launcher
+
+1. Close vatSys.
+2. In the [vatSys Launcher](https://github.com/badvectors/vatSysLauncher), open **Plugins**, choose
+   `JoshuaMicallefYBSU/OzServer-Plugin` and your profile (not **All**), and press **Install**.
+3. Start vatSys.
+
+The launcher installs into `Profiles\<your profile>\Plugins\OzServer-Plugin\`. If you installed
+OzServer by hand before, delete that copy first. While OzServer is being trialled it may only be
+listed with the launcher's development plugins turned on.
+
+### Manually
+
+1. Download `OzServerPlugin-v<version>.zip` from the
+   [latest release](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/latest).
+2. Unzip it into a folder called `OzServer-Plugin` in your profile's plugin folder:
+
+   ```
+   Documents\vatSys Files\Profiles\<your profile>\Plugins\OzServer-Plugin\
+   ```
+
+   This is the folder the launcher uses, so the launcher recognises the install and can update it
+   later.
 3. Restart vatSys.
 
-vatSys also loads plugins from `<install dir>\bin\Plugins`, which applies to every profile but needs
-administrator rights to write to.
+> [!TIP]
+> If Windows has blocked the downloaded file, right-click the zip, choose **Properties**, and tick
+> **Unblock** before unzipping it.
 
-Both windows live under **Settings**, slotted in directly beneath the built-in *Sectors...* entry:
+### From source
 
-- **Settings → OzServer Sectors**
-- **Settings → OzServer Settings**
+See [Building from source](#building-from-source). Copy the built `OzServerPlugin.dll` into the
+same `Plugins\OzServer-Plugin\` folder.
 
-### Staying up to date
+Once loaded, the plugin adds:
 
-Step 1 is only needed once. After that the plugin updates itself from this repository's
-[GitHub releases](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases), silently and with
-nothing to click. It checks two minutes after vatSys starts and every six hours afterwards.
+| Menu | Entry |
+| --- | --- |
+| **Settings** | **Sectors** — opens the OzServer Sectors window, in place of vatSys's own *Sectors...* entry while OzServer is running |
+| **Tools** | **Disable OzServer** |
+| **OzServer How-To** (menu bar) | Opens the [controller guide](https://ozserver.org/how-to) in vatSys's browser |
 
-A running session is never disturbed: **an update always takes effect at the next vatSys start**, not
-the moment it is found. That isn't a policy choice, it's the only thing Windows permits. vatSys holds
-`OzServerPlugin.dll` open for the whole session, so it cannot be overwritten or deleted while
-running — which is exactly why installing a build by hand means closing vatSys first. It *can* be
-renamed, though, so `PluginUpdater` stages the swap instead:
+## Updates
 
-1. download the new DLL beside the current one, as `OzServerPlugin.dll.update`
-2. verify it before it is allowed anywhere near the live name
-3. rename the running DLL to `OzServerPlugin.dll.backup`, and move `.update` into its place
-4. next start, vatSys loads the new one and the `.backup` is deleted
+You only install the plugin once. After that it keeps itself up to date: it checks as soon as
+vatSys opens and every five minutes afterwards. The vatSys Launcher can also update it, while vatSys
+is closed. It usually finds the plugin already current.
 
-Neither staging file can be mistaken for a plugin — vatSys enumerates `*.dll`, and these end in
-`.update`/`.backup` (short names `OZSERV~1.UPD` / `OZSERV~1.BAC`, so the 8.3 wildcard trap doesn't
-apply either). A half-finished download is never something vatSys tries to load.
+An update never disturbs a running session. It is downloaded, verified, and put in place for the
+**next vatSys start**. When one has been installed an **OzServer update** window tells you a new
+version has been found. Its **Restart** button closes vatSys and opens it again for you. Because
+the check runs as vatSys opens, that is usually before you have connected.
 
-Step 2 is the one that matters. A download is only installed if it is a real managed assembly, named
-`OzServerPlugin`, with a version genuinely higher than the running one — read via
-`AssemblyName.GetAssemblyName`, which reads the metadata without loading the file, because whether it
-can be trusted is not a question to answer by first running it. A truncated download or an error page
-saved under a `.dll` name is discarded, not installed.
+If a new version ever fails to load, the previous one is still beside it as
+`OzServerPlugin.dll.backup` — close vatSys, delete `OzServerPlugin.dll`, and rename the backup
+back.
 
-Nothing is deleted while it might still be needed. Step 4 only runs once the new version has
-successfully loaded, so if a release ever ships something that won't load, the previous version is
-still sitting there as `.backup` and **recovering is renaming that one file back**.
+How the updater chooses and verifies a release is described under [Security](#security) and in
+[docs/architecture.md](docs/architecture.md#self-update).
 
-A successful install is the one thing that does say so, as a single line in the vatSys Errors window:
-
-> `OzServer: An update (0.1.2) was detected and installed. It will be loaded at the next vatSys launch.`
-
-Not an error, but that window is the only notification surface vatSys gives a plugin, and it behaves
-well for the purpose — `ErrorWindow.AddError` shows it with `SW_SHOWNOACTIVATE`, so it appears above
-the main form without taking focus off whatever the controller is doing. It's worth the one line: the
-controller is now running a version that is no longer the one on disk, and restarting is what closes
-that gap.
-
-Failures, by contrast, are quiet by design: being offline, or the repo having no releases yet, goes to
-the daily `ozserver_<date>.txt` log and nothing else. There is nothing a controller can do about it
-mid-session, and the version they already have keeps working.
-
----
-
-## Using it
+## Using OzServer
 
 ### The Sectors window
 
-Three panes, left to right:
+**Settings → Sectors** opens it. It has three panes:
 
 | Pane | Shows |
 | --- | --- |
-| **Owned** | What OzServer says you currently own. Grouping sectors nest their covered sub-sectors underneath, with a `*` on any sector that bundles others. |
-| **Requested Changes** | `Requested By Me` (outgoing) and `Requested From Me` (incoming). Both are plain headings rather than dropdowns — they never fold away. Select the `Requested From Me` heading to accept every incoming request at once, or a single row for just that one. |
-| **Available / Controlled** | Toggles between two genuinely different data sets, described below. |
+| **Owned** | The sectors OzServer records as yours. A sector that bundles others is marked `*`, with its sub-sectors nested beneath. |
+| **Requested Changes** | `Requested By Me` and `Requested From Me`. |
+| **Available / Controlled** | Toggles between sectors nobody holds and sectors another controller holds, with their callsign. |
 
-Sectors are grouped under **Flow / Centre / Approach / Tower / Other**, derived from the callsign
-suffix in your profile's `Sectors.xml`.
+Sectors are grouped under **Flow / Centre / Approach / Tower / Other**.
 
-**Available vs Controlled** is not one list filtered two ways:
+Nothing is sent until you press **Apply**. Moving a sector only *stages* it, shown in yellow.
 
-- **Available** — claimable right now: nobody is live on that frequency on VATSIM *and* OzServer has
-  no ownership record for it. Both checks are needed — a controller who reached a sector by
-  *extending* into it is not logged in under that sector's callsign at all, so the live-frequency
-  test alone never sees them and the sector looked claimable when it was not.
-- **Controlled** — OzServer holds an active ownership record for it, owned by someone else, with
-  their callsign shown. A stray callsign somebody is logged into but never claimed through the
-  plugin correctly does *not* appear here.
-
-Nothing is sent to OzServer until **Apply**. Moving a sector across only *stages* it: the row turns
-yellow (the profile's `WindowWarning` identity) and stays that way until it is committed.
-
-| Control | What it does |
+| Control | Action |
 | --- | --- |
-| `<<` | Stages the selected Available sector into Owned. |
-| `>>` | Stages the selected Owned sector out. |
-| `<<>>` | Shown, disabled, when neither list has a selection — matching `vatsys.SectorsWindow`'s own button exactly. |
-| **Apply** | Commits every staged move: claims what is free, releases what you unpicked, and sends a request for anything another controller owns. |
-| **Cancel** | Throws the staged selection away and goes back to what OzServer says you own. |
-
-The arrow button acts only on **Owned** and **Available**. A row in Requested Changes is a request in
-flight, not a sector sitting somewhere it can be moved out of — everything you can do to one
-(Accept, Reject, Add, Remove) is on its **middle-click menu**, which is also where Expand/Collapse
-lives for every other row. Left click selects; left click on a category heading opens it.
-
-Staging a sector another controller owns puts it straight under `Requested By Me` in yellow, rather
-than pretending it is yours until Apply reveals otherwise.
-
-While the window is open it polls once every 2 seconds. Owned does not need polling — the tracker
-keeps it current whether the window is open or not.
+| `<<` | Stage the selected Available sector into Owned |
+| `>>` | Stage the selected Owned sector out |
+| **Apply** | Commit everything staged: claim what is free, release what you removed, and request anything another controller owns |
+| **Cancel** | Discard the staged changes |
+| **Accept** / **Reject** | Answer the selected incoming request — or every incoming request, with the `Requested From Me` heading selected |
 
 ### Claiming by transmitting
 
-Pressing Transmit on a VSCS line is the normal way to claim:
+Pressing **Transmit** on a VSCS line is the usual way to claim:
 
-- A **bare sub-sector's** line (e.g. `SNO`) adds only that sector. Extending into SNO should never
-  also hand you WOL and its siblings.
-- A **primary's** line (e.g. `WOL`) adds it *and its whole group*, matching what "extend" means on
-  the scope. Whether each sub-sector is actually claimable is then resolved once, on OzServer.
+- A **sub-sector's** line (for example `SNO`) claims only that sector.
+- A **primary's** line (for example `WOL`) claims it and its whole group.
 
-Releasing is never inferred from a sector merely disappearing from `MMI.SectorsControlled`. There are
-exactly four things that release: an applied `>>`, a genuine conflict, a position's own controller
-logging on (`PrimaryPositionWatcher`), and a deliberate disconnect (`GracefulDisconnectReleaser`).
+Dropping the line to **Idle** releases the sector for everyone else. **Receive** keeps it — you are
+still listening, so the airspace and its aircraft stay yours.
 
----
+Your own logged-on position is never released this way.
 
-## Configuration
+### Requests and conflicts
 
-**Settings → OzServer Settings** sets the backend base URL. It defaults to `https://api.ozserver.org` and
-is stored in `%AppData%\OzServerPlugin\settings.json` — not beside the DLL, since the vatSys
-`Plugins` folder isn't guaranteed writable.
+If the airspace you are claiming is held by someone else, a prompt shows what is owned and by whom.
+Choose **Accept** to send them a request, or **Reject** to take only the uncontested part. Nothing
+is ever requested without that answer.
 
-Only `https://` is accepted, with `http://` allowed for loopback addresses so a local dev server
-still works. A URL hand-edited into `settings.json` is held to the same rule and ignored (with an
-entry in the vatSys error log) if it fails.
+When a request arrives for you, the Settings menu flashes, a tone plays and the requested airspace
+is shaded on your scope. No window is put over your traffic: answer it from the Sectors window when
+you are ready. Accepting hands over the sector and the aircraft you hold inside it.
 
-**Note for backend maintainers:** since a flight is now only ever pushed to while a controller
-actually holds it (see Tag ownership / Flight data above), a row nothing has pushed to in 10 minutes
-is stale and safe to drop server-side — the same precedent as the existing 60-minute ATIS TTL. Not
-implemented in this repo; there is no backend code here to implement it in.
+### Disconnecting and reconnecting
 
-Every `/fdr`, `/fdr/batch` push now also sends `current_sector` (nullable string) — the *name* of the
-geographic subsector the aircraft is physically inside of, independent of `controlling_cid`/
-`controlling_callsign`, which say who owns the tag. `UpdateFlightDataRecordRequest` and the flight
-data table need a matching field before this is actually persisted or queryable; until then the
-plugin sends it but the backend has nowhere to put it.
+| What happened | What OzServer does |
+| --- | --- |
+| You closed vatSys or pressed Disconnect | Your sectors are released immediately, and your tags are left with nobody |
+| vatSys crashed or the connection dropped | Your sectors stay yours for five minutes, unless someone else claims them |
+| You reconnected within five minutes | Sectors, transmit lines, tags and traffic are restored — except anything someone has taken since |
+| Someone logged on as your position within two minutes | They take over your position's sectors and your tags inside them. Sectors you were extending into, and their tags, are not part of it |
+| Anyone else took one of your sectors | The sector is theirs; your tags in it are left with nobody |
+| Five minutes passed | Your sectors go to whoever is covering the position above, or become available. Your tags are left with nobody |
 
----
+A tag left with nobody is still shown on everyone's scope — OzServer activates every flight it has
+seen in the last 15 minutes — but it is never taken into anyone's jurisdiction automatically.
+Whoever now holds the airspace picks it up. Tags only move by themselves in a sector handover, your
+own reconnect, or a controller change on a position within two minutes.
 
-## Building
+### Turning it off
 
-**Requirements**
+**Tools → Disable OzServer** releases your sectors, stops all communication with OzServer, stops
+the plugin changing anything in vatSys, and brings back vatSys's own Sectors window. It lasts until
+vatSys is restarted.
 
-- .NET SDK with `net472` targeting support, or Visual Studio 2022
-- vatSys installed
+## Settings
 
-The project references `vatSys.exe`, `VATSYSControls.dll` and vatSys's own `Newtonsoft.Json.dll`
-directly, with `Private=False` so none of them are copied into the output. That is deliberate: a
-second copy of `vatSys.exe` next to the plugin DLL makes MEF composition see two distinct `IPlugin`
-types and the plugin silently fails to load.
+There is nothing to configure. The plugin always talks to `https://api.ozserver.org`.
 
-**Steps**
+## Troubleshooting
 
-1. Build:
+**Where is the log?** The plugin writes a daily log to
+`Documents\vatSys Files\ozserver_<yyyymmdd>.txt`. Attach it to any
+[bug report](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/issues/new/choose).
 
-   ```bash
-   dotnet build OzServerPlugin/OzServerPlugin.csproj -c Release
-   ```
+| Symptom | Things to check |
+| --- | --- |
+| No OzServer entries under Settings | The DLL is in the profile's `Plugins\OzServer-Plugin` folder and is not blocked by Windows |
+| "Installed more than once" in the Errors window | vatSys found more than one copy and is using only one. Close vatSys, delete the copies the message says are ignored, and restart |
+| Sectors are not syncing | You are connected to the live network or a SweatBox server; OzServer has not been disabled this session; the Errors window for a connection message |
+| A sector you expect is taken | The **Controlled** view shows who holds it — send a request |
+| Something is badly wrong mid-session | **Tools → Disable OzServer** returns you to plain vatSys immediately |
 
-vatSys is located via `HKLM\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path`. For a non-default install, pass
-the path explicitly — the build fails early with a clear message if it can't find one:
+If a problem involves two controllers, say what the other controller was holding and doing — most
+of what this plugin does is two clients agreeing with each other.
+
+## Building from source
+
+**Requirements:** the .NET SDK (or Visual Studio 2022) with .NET Framework 4.7.2 targeting, and a
+local vatSys installation. The project compiles against vatSys's own assemblies, which are not
+redistributed here.
+
+```bash
+dotnet build OzServerPlugin/OzServerPlugin.csproj -c Release
+```
+
+vatSys is located through the registry. For a non-default installation, pass its path:
 
 ```bash
 dotnet build OzServerPlugin/OzServerPlugin.csproj -c Release -p:VatSysPath="D:\vatSys"
 ```
 
-The project targets **x86** to match vatSys's own architecture. A mismatch means the plugin will not
-load into the vatSys process at all.
+The output is a single `OzServerPlugin.dll`, built for x86 to match vatSys. To build straight into
+a profile's `Plugins` folder, set `OutputPath` on the command line or in a git-ignored
+`OzServerPlugin.csproj.user`.
 
----
+## Releasing
+
+Releases are built with [`Release.ps1`](Release.ps1) and published on GitHub. The plugin's own
+updater and the vatSys Launcher both install from there.
+
+1. Raise `<Version>` in `OzServerPlugin/OzServerPlugin.csproj` (`MAJOR.MINOR.PATCH`), add the
+   release to [CHANGELOG.md](CHANGELOG.md), then commit and push.
+2. Run `.\Release.ps1` from that commit. It refuses uncommitted changes, an unpushed commit or an
+   existing tag, builds Release into `artifacts\build\`, checks the DLL's name and version, and
+   writes:
+   - `artifacts\OzServerPlugin-v<version>.zip`: `OzServerPlugin.dll` and `LICENSE.txt` at the zip
+     root, for the launcher and manual installs
+   - `artifacts\OzServerPlugin.dll`: the bare DLL, which the self-updater downloads
+3. Publish a GitHub release tagged `v<version>` at that commit, titled `OzServer Plugin v<version>`,
+   with both files attached. Attach the zip first. Publish it as a normal release marked latest:
+   the launcher only sees GitHub's latest release, and that never includes a pre-release or a draft.
+   The script prints the `gh release create` command, with the commit as its `--target`.
+4. Check it with `gh api repos/JoshuaMicallefYBSU/OzServer-Plugin/releases/latest`.
+
+VATPAC's plugin list picks up the new release by itself. [CONTRIBUTING.md](CONTRIBUTING.md#publishing-a-release)
+covers what else publishing sets off (the Discord announcement, every client's self-update), and
+how to pause a rollout.
+
+## How it works
+
+OzServer's record is the single source of truth for ownership. Every action calls the API and then
+re-reads the result rather than assuming what it must have been.
+
+```mermaid
+flowchart LR
+    vatsys["vatSys<br/>sectors · VSCS · tags · FDRs"] <--> plugin["OzServer plugin"]
+    plugin -- "claims, requests, flight data, ATIS" --> api["OzServer API"]
+    api -- "ownership, requests, change signals" --> plugin
+    api --> map["ozserver.org live map"]
+```
+
+- **Ownership** is polled every three seconds and re-read immediately when the API signals a
+  change over a Server-Sent Events stream.
+- **Releases are explicit.** A sector is only ever released by a VSCS line going idle, an applied
+  change in the Sectors window, a conflict you declined, your position's own controller already
+  being online when you connect, or a deliberate disconnect — never inferred from a sector simply
+  disappearing from vatSys.
+- **Flight data** is pushed in five-second batches, only for aircraft you hold.
+
+[docs/architecture.md](docs/architecture.md) covers the source layout, the API endpoints used,
+timings, the self-update mechanism and the vatSys behaviours the code depends on.
 
 ## Security
 
-The API uses the CID and callsign reported by the current vatSys session as the controller identity.
-It deliberately does not delay requests for a VATSIM datafeed cross-check: the live feed can lag a
-new connection long enough to reject valid controller actions during login.
+- **Identity.** The plugin identifies you to OzServer by the CID and callsign of your vatSys
+  session. OzServer is a coordination service between cooperating controllers; it does not
+  authenticate them independently.
+- **Transport.** All traffic is HTTPS. Plain HTTP is accepted only for a server on the local
+  machine.
+- **Updates.** The updater asks OzServer which release to install and falls back to GitHub's API if
+  OzServer cannot answer. Whichever answers, the file is downloaded only from this repository's
+  GitHub releases, checked against its published SHA-256, and installed only if it is a genuine
+  `OzServerPlugin` assembly with a higher version than the one running. Releases are not
+  code-signed, so **write access to this repository is the trust boundary** for what runs in
+  every controller's vatSys.
+- **Logs.** Plugin log lines other than raw API calls are forwarded to OzServer so a problem
+  between two controllers can be read from both sides, and errors are relayed to the maintainers
+  as they happen. They include your CID and callsign.
 
-**The updater executes what it downloads**, on the next vatSys start, so it is worth being explicit
-about what does and does not guard that:
+To report a security problem, please contact the maintainers privately rather than opening a
+public issue.
 
-- Transport is HTTPS to `api.github.com` and GitHub's own asset host, with TLS 1.2 forced (4.7.2
-  otherwise picks its protocol from an older default). The URL is a `const` — nothing the backend or
-  a settings field says can redirect it.
-- Only a real managed assembly named `OzServerPlugin`, versioned higher than the running one, is
-  installed. That catches corruption and mistakes.
-- It does **not** verify a signature or a publisher. Anyone who can publish a release to this
-  repository can therefore run code inside every controller's vatSys. **Write access to the repo is
-  the trust boundary** — treat it accordingly, and keep releases restricted to people who should have
-  that. Signing the assembly and checking the key before install is the durable fix, in the same way
-  VATSIM Connect is for the token above.
+## Contributing
 
----
+Bug reports and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md), which also
+covers how releases are published.
 
-## Matching the vatSys look
+Related repositories:
 
-Every window is a `BaseForm` and takes its palette from `Colours.GetColour`, so it follows whatever
-the loaded profile defines:
+- [OzServer-API](https://github.com/JoshuaMicallefYBSU/OzServer-API) — the backend this plugin
+  talks to.
+- [OzServer-Website](https://github.com/JoshuaMicallefYBSU/OzServer-Website) — ozserver.org and its
+  live map.
 
-| Element | Identity |
-| --- | --- |
-| Window backgrounds | `WindowBackground` |
-| Labels | `GenericText` |
-| Text boxes, trees, the message pane | `InteractiveText` (matches `vatsys.TextField`) |
-| Staged rows, flashing headings, the request trail | `WindowWarning` (BrightYellow in the Australia profile) |
-| Buttons | left entirely to `GenericButton`'s own defaults |
+## Acknowledgements
 
-Four rules if you touch the styling:
-
-- **Never set `BackColor` on a `GenericButton`.** It paints itself in `OnPaint`, filling with
-  `BackColor` and drawing text in `ForeColor`, and its constructor already applies the right
-  defaults. `WindowButtonSelected` and `WindowButtonDepressed` are hover and press states it applies
-  itself.
-- **Don't set `Font` on vatSys controls either.** `GenericButton` already defaults to Terminus 18px
-  bold, `TextLabel` to 16px bold, and `BaseForm` to 16px bold, which controls inherit. Where a plain
-  WinForms control genuinely needs a font — the URL box, the prompt's message pane — take it from
-  `MMI.eurofont_winsml` / `MMI.eurofont_winverysml` rather than naming the face in a string literal.
-- **Show windows with `ShowWithPlacement(owner)`, not `Show()`.** It restores the position and size
-  the controller last left the window at, keyed on `Control.Name` — which is why each form sets a
-  unique `Name`. An owner also keeps the window above the maximised main form.
-- **Use `SectorConflictPromptWindow` / `SectorNoticeWindow`, not `MessageBox`.** An OS message box is
-  the one thing on screen that ignores the profile entirely.
-- **Menus borrow vatSys's own renderer.** `ComboField.DefaultMenuRenderer` is the instance `MainForm`
-  builds and every built-in dropdown uses, so the middle-click menu is identical to a native one by
-  construction rather than being a close repaint of it (`vatsys.MenuRenderer` is itself private).
-
----
-
-## Layout
-
-| File | Role |
-| --- | --- |
-| `Plugin.cs` | MEF entry point; menu items and the incoming-request flash trail |
-| `PluginUpdater.cs` | Silent self-update from GitHub releases, staged so it lands at the next vatSys start |
-| `OzServerOwnershipTracker.cs` | Source of truth for owned sectors; syncs both ways with MMI/VSCS |
-| `OzServerApiClient.cs` | HTTP client and DTOs for the backend API |
-| `OzServerSectorsWindow.cs` | The Owned / Available / Controlled / Requested Changes window |
-| `OzServerSettingsWindow.cs` | Base-URL settings window |
-| `SectorConflictPromptWindow.cs` | vatSys-styled Yes/No prompt, in place of `MessageBox` |
-| `SectorMessageWindow.cs` | Shared chat-styled chrome for the two dialogs below it |
-| `SectorNoticeWindow.cs` | One-way notice (OK only) — position relinquished, request denied |
-| `PrimaryPosition.cs` | The one definition of which sectors a position takes when its controller logs on |
-| `PrimaryPositionWatcher.cs` | Hands those sectors back when a position's own controller appears |
-| `GracefulDisconnectReleaser.cs` | Releases everything on a deliberate exit, and stays silent on a crash |
-| `VatSysContextMenu.cs` | Middle-click menu, drawn with vatSys's own `MenuRenderer` |
-| `SectorChangeRequest.cs` | One pending request, as the window renders it |
-| `AfvSectorClaimer.cs` | Turns VSCS transmit state into `MMI.SectorsControlled` changes |
-| `ControllerInfoUpdater.cs` | Maintains the `Extending ...` Controller Info line |
-| `FdrSync.cs` | Batches FDR and radar-track pushes, gated on currently holding and having activated the flight |
-| `TagOwnershipSync.cs` | Activates/assumes a tag when it's sitting in a subsector you own; hands it off when OzServer says you no longer own that subsector |
-| `SectorLocator.cs` | Resolves which sector, out of a given candidate list, an FDR is physically inside of right now |
-| `AtisSync.cs` | Pushes vatSys's own built-in ATIS (`vatsys.ATIS`, slot 0) on change |
-| `BadVectorsAtisSync.cs` | Same, but for [badvectors/ATISPlugin](https://github.com/badvectors/ATISPlugin)'s up-to-4 broadcasts, via reflection |
-| `OzServerSettings.cs` | Base-URL persistence and validation |
-| `ToggleGenericButton.cs` | A `GenericButton` that can be held visually depressed |
-
-`AfvSectorClaimer` and `ControllerInfoUpdater` are ported from
-[badvectors/VatpacPlugin](https://github.com/badvectors/VatpacPlugin) (`Sectors.cs` and
-`Extending.cs`).
-
-### Backend endpoints
-
-All under `{BaseUrl}/api/v1`, with `controller_cid` and `controller_callsign` attached to every call.
-
-| Endpoint | Used for |
-| --- | --- |
-| `POST /sectors/{name}/claim` | Claim, optionally with an `exclude` list after a conflict |
-| `POST /sectors/{name}/release` | Release |
-| `POST /sectors/{name}/request` | Request from the current owner |
-| `GET /sectors/sync` | **The only GET the plugin makes.** Owned + controlled + requests in one response — the three below, which the poll used to fetch separately every tick |
-| `POST /sectors/release-all` | Give up everything, on a *graceful* disconnect only; staying silent is what marks a disconnect ungraceful |
-| `GET /sectors/mine` | The authoritative "what do I own" check — still routed, no longer called by the plugin |
-| `GET /sectors/controlled` | Sectors owned by someone else, pre-flattened server-side — still routed, no longer called by the plugin |
-| `GET /sector-requests` | Both directions of pending requests — still routed, no longer called by the plugin |
-| `POST /sector-requests/accept-batch` | Accept several at once, processed sequentially |
-| `POST /sector-requests/{id}/accept`, `/reject`, `/cancel` | Single-request actions |
-| `POST /sector-requests/{id}/acknowledge-rejection` | Confirms a denial has been shown to the requester, which is what finally deletes it |
-| `POST /fdr`, `POST /fdr/batch` | Flight data upserts, keyed by callsign |
-| `POST /atis` | ATIS upsert, keyed by ICAO; dropped 60 minutes after the last update |
-
-### Timings
-
-| | |
-| --- | --- |
-| Ownership / controlled / requests sync | 10s (always), 2s while the Sectors window is visible |
-| FDR batch flush | 5s |
-| ATISPlugin rescan (looking for its slots) | 5s |
-| HTTP request timeout | 20s |
-| Max concurrent HTTP connections | 8 (raised from .NET's default of 2) |
-| Update check | 2 min after start, then every 6h (30s timeout, its own client) |
-
-All three views arrive in one `GET /sectors/sync`, so a poll tick is a single request rather than
-three. A failed sync leaves all three as they were rather than half-updating them.
-
----
-
-## Notes for contributors
-
-**There is no CI build.** Compiling requires a vatSys installation, and its assemblies aren't ours to
-redistribute to a build runner. Build and test locally against a real install.
-
-**Publishing a release — bump `<Version>` and the tag together.** Everyone's copy updates itself from
-GitHub releases (see [Staying up to date](#staying-up-to-date)), and it trusts the *assembly's* version,
-not the tag. So a release must be:
-
-1. `<Version>` raised in `OzServerPlugin.csproj`, and built from that
-2. tagged to match (`v0.1.2` for `0.1.2` — a leading `v` is fine, it's stripped)
-3. published with the built `OzServerPlugin.dll` attached as an asset under exactly that name
-
-Tag a release `v0.1.2` but attach a DLL still stamped `0.1.1` and every client downloads it, sees it
-isn't actually newer, discards it and logs why — then does the same six hours later, forever. It fails
-safe rather than looping installs, but the release still reaches nobody. Drafts and prereleases are
-ignored, so a release only goes out when it is actually published.
-
-Building locally with the same `<Version>` as a published release is fine — it's only ever replaced by
-a *higher* one. Leave `<Version>` behind the latest release, though, and the updater will helpfully
-overwrite your own build with the released one at the next start; the `.backup` beside it is the
-previous file if you want it back.
-
-**The comments carry real history.** Several explain a specific bug a previous shape caused and why
-the current one avoids it — the claim/release loop, the stack overflow from a self-referencing sector
-grouping, the re-entrancy that let a request survive its own accept. Read the comment on a method
-before changing it, and update it if the reasoning changes.
-
-**Two vatSys behaviours worth knowing:**
-
-- `SectorsVolumes.Sector` overrides `Equals`/`GetHashCode` (callsign-based) but **not** the `==`
-  operator. Two instances of the same real sector reached through different lookups compare unequal
-  under `==`. Always use `.Equals`.
-- Plugins are discovered with MEF, so implementing `IPlugin` is not enough — the class also needs
-  `[Export(typeof(IPlugin))]`, or it loads but is never instantiated.
-
----
+The VSCS transmit handling is adapted from
+[badvectors/VatpacPlugin](https://github.com/badvectors/VatpacPlugin), and ATIS publishing reads
+from [badvectors/ATISPlugin](https://github.com/badvectors/ATISPlugin) where it is installed.
 
 ## Licence
 
-Not yet specified. Until a `LICENSE` file is added, no usage rights are granted by default.
+[MIT](LICENSE). The bundled [Clipper2](OzServerPlugin/ThirdParty/Clipper2) is under the Boost
+Software License 1.0.

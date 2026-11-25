@@ -7,10 +7,9 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// A layer of our own on the radar picture, drawn by vatSys's renderer rather than by us.
+// A map layer of the plugin's own on the radar picture, drawn by vatSys's renderer.
 //
-// Everything here is forced by what ASDControlDX.Render actually does, and none of it is guessable,
-// which is why it lives in one place instead of being written out per feature:
+// The constraints below come from what ASDControlDX.Render does:
 //
 //   var visible = DisplayMaps.Maps.Join(renderParams.VisibleMaps, m => m.Id, id => id, ...);
 //   ComputeAllMapElements(renderParams, visible);      // outside any try/catch
@@ -18,35 +17,31 @@ namespace OzServerPlugin;
 //       PaintMaps(visible);
 //   } catch (SharpDXException) { ... }
 //
-// 1. A map is drawn only if its Id is in RenderParams.VisibleMaps. Map.Id is initonly and
-//    VisibleMaps is get-only, which is why simply adding a layer to DisplayMaps.Maps draws nothing.
-//    The way through is ASDControlDX.SetMapVisible(map, true) - public, and it reads VisibleMaps,
-//    adds the Id and pushes it back through SetRenderParams. Map's public constructor already
-//    assigns a unique Id from DisplayMaps.GenerateId(), so no Id has to be forged.
+// 1. A map is drawn only if its Id is in RenderParams.VisibleMaps, so adding a layer to
+//    DisplayMaps.Maps is not enough. ASDControlDX.SetMapVisible(map, true) adds the Id through
+//    SetRenderParams; Map's public constructor assigns a unique Id.
 //
-// 2. Colour is per map. SelectMapBrush is called once per map and reused for that map's infills and
-//    its lines alike, so one layer is exactly one colour - two colours means two layers. A
-//    non-empty CustomColourName recolours the shared custom brush from Colours.GetCustomColorDX,
-//    which is registered here rather than in a profile file.
+// 2. Colour is per map: SelectMapBrush is called once per map and used for its infills and lines
+//    alike, so two colours means two layers. A non-empty CustomColourName takes the brush colour
+//    from Colours.GetCustomColorDX, which RegisterColour populates.
 //
-// 3. Render runs on its own thread (RenderLoop), which catches only OperationCanceledException;
-//    the paint block catches only SharpDXException, and the compute call sits outside even that. So
-//    an exception this code provokes escapes the render loop and stops the scope drawing for good.
-//    Thread safety is therefore a correctness requirement - see MutationSafety.
+// 3. Render runs on its own thread and does not catch exceptions caused by map data, so a mistake
+//    here stops the scope drawing permanently. See MutationSafety before changing how maps or
+//    points are published.
 public sealed class AsdMapLayer
 {
-    // Every layer is reasserted on one timer rather than each keeping its own: a scope opened after
-    // a layer was created has never been told about it, and reloading maps or a position replaces
-    // DisplayMaps.Maps wholesale and drops every layer at once.
+    // All layers are reasserted on one timer: a scope opened after a layer was created has not
+    // been told about it, and reloading maps or a position replaces DisplayMaps.Maps and drops
+    // every layer.
     static readonly TimeSpan ReassertInterval = TimeSpan.FromSeconds(2);
     static readonly List<AsdMapLayer> Layers = new();
     static readonly object LayersLock = new();
     static System.Threading.Timer? _reassertTimer;
 
-    // Three references to one Coordinate: a triangle of zero area, which paints nothing. Unused
-    // slots cannot simply be emptied - ComputeMapElements skips an empty point list, so no entry is
-    // written to the vector table, but PaintMap then calls EndFigure unconditionally on a figure it
-    // never began, and the SharpDXException that follows abandons the rest of the frame's maps.
+    // Three references to one Coordinate: a zero-area triangle, which paints nothing. An unused
+    // slot must not have an empty point list - ComputeMapElements skips it and writes no vector
+    // table entry, but PaintMap still calls EndFigure on a figure it never began, and the resulting
+    // SharpDXException abandons the rest of the frame's maps.
     static readonly List<Coordinate> Hidden = Degenerate();
 
     readonly string _mapName;
@@ -60,11 +55,15 @@ public sealed class AsdMapLayer
     readonly object _lock = new();
 
     List<List<Coordinate>> _polygons = new();
+    // Shapes set but not yet on the pool - an apply that found the maps reloading, or failed part
+    // way. Reassert applies them; without this they waited for the next change of shape, which
+    // SetPolygons no longer passes on when the shapes are the same.
+    bool _polygonsPending;
     DisplayMaps.Map? _map;
     DisplayMaps.Map.BasePolygon[]? _pool;
 
-    // lineWidth null draws filled shapes, otherwise strokes them at that width. Both are the same
-    // pipeline - Infill and Line are both BasePolygon, which is where Points lives.
+    // A null lineWidth draws filled shapes; otherwise they are stroked at that width. Infill and
+    // Line are both BasePolygon, which is where Points lives.
     public AsdMapLayer(string mapName, string colourName,
                        byte red, byte green, byte blue, byte alpha,
                        int poolSize, float? lineWidth)
@@ -86,23 +85,45 @@ public sealed class AsdMapLayer
         }
     }
 
-    // The shapes this layer draws, in lat/lon. Anything beyond the pool size is dropped rather than
-    // growing the pool - see MutationSafety for why the pool is fixed.
+    // The shapes this layer draws, in lat/lon. Any beyond the pool size are dropped: the pool is
+    // fixed (see MutationSafety).
+    //
+    // The same shapes again change nothing and are dropped here: every apply ends in a background
+    // redraw, which recomputes every map on every scope - see Reassert.
     public void SetPolygons(IEnumerable<List<Coordinate>> polygons)
     {
+        var next = polygons.Take(_poolSize).ToList();
         lock (_lock)
-            _polygons = polygons.Take(_poolSize).ToList();
+        {
+            if (SameShapes(_polygons, next))
+                return;
+            _polygons = next;
+            _polygonsPending = true;
+        }
 
         RunOnUiThread(ApplyNow);
     }
 
-    // The fast path, and it has to be fast: freehand drawing calls this on every captured point, so
-    // tens of times a second during a drag. Only the points are swapped and a repaint asked for.
-    //
-    // Creating the map and asserting its visibility are deliberately left to the timer - the first
-    // walks every loaded map, the second walks every open form and does reflection per scope, and
-    // neither changes between one point of a stroke and the next. The exception is the very first
-    // call, which has to build the layer before there is anything to put points into.
+    static bool SameShapes(List<List<Coordinate>> a, List<List<Coordinate>> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (a[i].Count != b[i].Count)
+                return false;
+            for (var j = 0; j < a[i].Count; j++)
+            {
+                if (a[i][j].Latitude != b[i][j].Latitude || a[i][j].Longitude != b[i][j].Longitude)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // The fast path: swaps the points and requests a repaint. Creating the map and asserting its
+    // visibility walk every loaded map and every open form, so they are left to the timer - except
+    // on the first call, when the layer has to exist before it can take points.
     void ApplyNow()
     {
         if (!DisplayMaps.Loaded)
@@ -142,49 +163,65 @@ public sealed class AsdMapLayer
         if (!DisplayMaps.Loaded)
             return;
 
+        // A background redraw only when this pass changed something - the layer re-added after a
+        // map reload, or made visible on a scope that did not show it. MMI.RequestRedraw(true)
+        // makes every scope drop its cached map image and recompute every map, as on a pan or
+        // zoom; asked for unconditionally, four layers every two seconds, it was steady load the
+        // slower PCs could not carry.
         try
         {
-            EnsureMap();
-            ApplyPolygons();
-            EnsureVisible();
-            MMI.RequestRedraw(true, false, false);
+            var changed = EnsureMap();
+            if (changed || PolygonsPending())
+            {
+                ApplyPolygons();
+                changed = true;
+            }
+            changed |= EnsureVisible();
+            if (changed)
+                MMI.RequestRedraw(true, false, false);
         }
         catch (Exception ex)
         {
-            // Swallowed deliberately. This is decoration; if the internals it leans on ever move,
-            // the layer should stop drawing, not take the plugin - or the scope - with it.
+            // Swallowed deliberately. The layer is decoration: if the vatSys internals it relies on
+            // change, it stops drawing rather than taking the plugin or the scope with it.
             ActionLog.Log("MapLayer", $"{_mapName}: {ex.Message}");
         }
+    }
+
+    bool PolygonsPending()
+    {
+        lock (_lock)
+            return _polygonsPending;
     }
 
     // ---------------------------------------------------------------------------------------------
     // MutationSafety
     //
-    // Render runs on its own thread and neither it nor RenderLoop catches the exceptions this code
-    // could cause, so a torn read does not drop a frame - it kills the scope permanently. Two
-    // hazards, both avoided the same way: never mutate a collection the renderer might be walking,
-    // swap a fresh one in instead. A reference assignment is atomic, so the renderer sees either the
-    // old collection or the new one, each internally consistent.
+    // Render runs on its own thread (RenderLoop), which catches only OperationCanceledException.
+    // The paint block catches only SharpDXException and the compute call is outside even that, so
+    // an exception caused by this code does not drop a frame: it escapes the render loop and the
+    // scope stops drawing permanently. A collection the renderer might be walking is therefore
+    // never mutated; a new one is built and swapped in. A reference assignment is atomic, so the
+    // renderer sees either the old collection or the new one, each internally consistent.
     //
-    // The first is enumeration. DisplayMaps.Maps is walked twice per frame - the Join is lazy, so
-    // both ComputeAllMapElements and PaintMaps enumerate it - and List throws if it is modified
-    // while enumerated. So maps are published by building a new list and swapping it in, never by
-    // DisplayMaps.Maps.Add.
+    // 1. Enumeration. DisplayMaps.Maps is enumerated twice per frame (the Join is lazy, so both
+    //    ComputeAllMapElements and PaintMaps walk it), and List throws if it is modified meanwhile.
+    //    Maps are published by swapping in a new list, never with DisplayMaps.Maps.Add.
     //
-    // The second is the vector table. ComputeAllMapElements clears it and refills it keyed by
-    // BasePolygon.Id; PaintMap then looks each one up with the indexer, not TryGetValue. A polygon
-    // appearing between compute and paint is a KeyNotFoundException. That is why the pool is fixed
-    // and allocated once: the set of Ids never changes, so every key paint asks for was written by
-    // the compute that preceded it. Only Points references are swapped, and paint never reads Points
-    // - it works purely from the table.
+    // 2. The vector table. ComputeAllMapElements clears it and refills it keyed by BasePolygon.Id,
+    //    and PaintMap reads it with the indexer, not TryGetValue, so a polygon that appears between
+    //    compute and paint is a KeyNotFoundException. The pool is therefore fixed and allocated
+    //    once, so the set of Ids never changes. Only Points references are swapped, and paint does
+    //    not read Points - it works from the table.
     // ---------------------------------------------------------------------------------------------
 
-    void EnsureMap()
+    // Returns whether the layer had to be (re)created.
+    bool EnsureMap()
     {
-        // Contains is a read, and concurrent reads of a List are safe - only mutation during
-        // enumeration throws. This catches a map reload having dropped our layer.
+        // Detects a map reload having dropped the layer. Contains only reads, and concurrent reads
+        // of a List are safe.
         if (_map != null && DisplayMaps.Maps.Contains(_map))
-            return;
+            return false;
 
         RegisterColour(_colourName, _red, _green, _blue, _alpha);
 
@@ -204,8 +241,8 @@ public sealed class AsdMapLayer
         {
             if (_lineWidth is { } width)
             {
-                // Patterns.Solid is the one branch that strokes with no StrokeStyle at all - a
-                // plain DrawLine per segment. Every other pattern applies a dash style.
+                // Patterns.Solid is the only pattern stroked without a StrokeStyle; every other one
+                // applies a dash style.
                 var line = new DisplayMaps.Map.Line
                 {
                     Name = _mapName,
@@ -235,11 +272,12 @@ public sealed class AsdMapLayer
         _map = map;
         _pool = pool;
 
-        // The swap described in MutationSafety. Any earlier copy of ours is filtered out by name
-        // rather than by reference, so a half-applied state cannot leave a duplicate behind.
+        // The swap described in MutationSafety. An earlier copy of this layer is filtered out by
+        // name rather than by reference, so a half-applied state cannot leave a duplicate.
         var replacement = DisplayMaps.Maps.Where(existing => existing.Name != _mapName).ToList();
         replacement.Add(map);
         SetMaps(replacement);
+        return true;
     }
 
     void ApplyPolygons()
@@ -250,43 +288,106 @@ public sealed class AsdMapLayer
 
         List<List<Coordinate>> polygons;
         lock (_lock)
+        {
             polygons = _polygons;
+            _polygonsPending = false;
+        }
 
         // Reference swaps only, never Points.Clear() or AddRange - see MutationSafety.
         for (var i = 0; i < pool.Length; i++)
             pool[i].Points = i < polygons.Count ? polygons[i] : Hidden;
     }
 
-    void EnsureVisible()
+    // Looked up once per scope type rather than on every reassert of every layer.
+    static readonly Dictionary<Type, (MethodInfo? Set, MethodInfo? Is)> VisibilityMethodCache = new();
+
+    static (MethodInfo? Set, MethodInfo? Is) VisibilityMethods(Type type)
     {
-        var map = _map;
-        if (map == null)
-            return;
-
-        foreach (var asd in AsdControls())
+        lock (VisibilityMethodCache)
         {
-            var type = asd.GetType();
-            var setVisible = type.GetMethod("SetMapVisible", new[] { typeof(DisplayMaps.Map), typeof(bool) });
-            if (setVisible == null)
-                continue;
-
-            // Checked first because SetMapVisible ends in SetRenderParams, which forces a full
-            // redraw of that scope. Called every couple of seconds unconditionally, that would be a
-            // permanent and pointless load on every open display.
-            var isVisible = type.GetMethod("IsMapVisible", new[] { typeof(DisplayMaps.Map) });
-            if (isVisible?.Invoke(asd, new object[] { map }) is true)
-                continue;
-
-            setVisible.Invoke(asd, new object[] { map, true });
+            if (!VisibilityMethodCache.TryGetValue(type, out var methods))
+            {
+                methods = (type.GetMethod("SetMapVisible", new[] { typeof(DisplayMaps.Map), typeof(bool) }),
+                           type.GetMethod("IsMapVisible", new[] { typeof(DisplayMaps.Map) }));
+                VisibilityMethodCache[type] = methods;
+            }
+            return methods;
         }
     }
 
-    // Registers a colour in the Colours custom table, so CustomColourName resolves. Done by
-    // reflection rather than by referencing SharpDX: the plugin has no SharpDX reference and adding
-    // one would mean shipping a second copy of an assembly vatSys already loads, which is the thing
-    // every Private=False in the csproj exists to prevent. The value is constructed through the
-    // dictionary's own value type, so it is whatever SharpDX.Color vatSys is using. An unregistered
-    // name is not fatal - GetCustomColorDX returns AliceBlue rather than throwing.
+    // Returns whether any scope had to be told to show the layer.
+    bool EnsureVisible()
+    {
+        var changed = false;
+        var map = _map;
+        if (map == null)
+            return false;
+
+        foreach (var asd in AsdControls())
+        {
+            var (setVisible, isVisible) = VisibilityMethods(asd.GetType());
+            if (setVisible == null)
+                continue;
+
+            // Checked first: SetMapVisible ends in SetRenderParams, which forces a full redraw of
+            // that scope, and this runs every ReassertInterval.
+            var visible = isVisible?.Invoke(asd, new object[] { map }) is true;
+
+            // The radar scopes only - vatSys's main display and popped-out ASD windows - not a
+            // ground (ASMGCS) window, which uses the same control: request shading for an enroute or
+            // TMA sector painted orange across YPPH's ground map. Taken off one that already has it.
+            if (IsGroundDisplay(asd))
+            {
+                if (visible)
+                {
+                    setVisible.Invoke(asd, new object[] { map, false });
+                    changed = true;
+                }
+                continue;
+            }
+
+            if (visible)
+                continue;
+
+            setVisible.Invoke(asd, new object[] { map, true });
+            changed = true;
+        }
+        return changed;
+    }
+
+    // ASDControlDX.ASDType is Ground for the ASMGCS window's control (ASMGCSWindow builds it with
+    // ASDTypes.Ground); MainASD and ASD are radar scopes. Read by reflection, as the control type is
+    // internal to vatSys. Unreadable counts as a radar scope, which is how every scope was treated
+    // before.
+    static readonly Dictionary<Type, PropertyInfo?> AsdTypeProperties = new();
+
+    static bool IsGroundDisplay(Control asd)
+    {
+        PropertyInfo? property;
+        lock (AsdTypeProperties)
+        {
+            if (!AsdTypeProperties.TryGetValue(asd.GetType(), out property))
+            {
+                property = asd.GetType().GetProperty("ASDType", BindingFlags.Public | BindingFlags.Instance);
+                AsdTypeProperties[asd.GetType()] = property;
+            }
+        }
+
+        try
+        {
+            return string.Equals(property?.GetValue(asd)?.ToString(), "Ground", StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Registers a colour in the Colours custom table so CustomColourName resolves. Done by
+    // reflection because the plugin has no SharpDX reference, and adding one would ship a second
+    // copy of an assembly vatSys already loads. The value is built through the dictionary's own
+    // value type, so it is the SharpDX.Color vatSys uses. An unregistered name is not fatal:
+    // GetCustomColorDX returns AliceBlue rather than throwing.
     static void RegisterColour(string name, byte red, byte green, byte blue, byte alpha)
     {
         if (Colours.CustomColourExists(name))
@@ -319,9 +420,8 @@ public sealed class AsdMapLayer
         typeof(DisplayMaps).GetField("<Maps>k__BackingField", Flags)?.SetValue(null, maps);
     }
 
-    // The scopes, found by walking the control tree rather than through the private ASDWindow.ASD
-    // and MainForm.ASD fields - one walk covers the main display, every popped-out ASD window and
-    // any opened later, without naming a field per host.
+    // Every scope, found by walking the control tree rather than through the private ASDWindow.ASD
+    // and MainForm.ASD fields: one walk covers the main display and every popped-out ASD window.
     public static IEnumerable<Control> AsdControls() =>
         Application.OpenForms.Cast<Form>()
             .ToList()
@@ -348,8 +448,8 @@ public sealed class AsdMapLayer
     public static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

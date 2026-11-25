@@ -4,11 +4,10 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// A GenericButton that can be held permanently "pressed" (sunken, depressed background) rather
-// than only while the mouse is actually down - used for the Available/Controlled toggle so the
-// active side reads as clicked-in. GenericButton's own pressed-look is driven by a private field
-// and a private DrawText method, so it can't be reused directly; this reimplements just enough of
-// it (same WindowButtonDepressed/Sunken look) to stay visually consistent with the real thing.
+// A GenericButton that can be held "pressed" rather than only while the mouse is down - used for
+// the Available/Controlled toggle, so the active side reads as selected. GenericButton's pressed
+// look is driven by a private field and a private DrawText method, so it is redrawn here with the
+// same WindowButtonDepressed colour and sunken border.
 public class ToggleGenericButton : GenericButton
 {
     public bool Pressed { get; set; }

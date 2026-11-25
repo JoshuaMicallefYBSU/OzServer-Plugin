@@ -1,0 +1,55 @@
+name: OzServer Plugin - Send Discord Release Notification
+
+# "published" fires once when a release or prerelease is published, including a draft being
+# published. It does not fire for drafts, so a release kept as a draft until ready is announced
+# when it goes out, which is also when clients start installing it.
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord Notification
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.CHANGES_WEBHOOK }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "::error::CHANGES_WEBHOOK secret is not set - cannot send the release notification."
+            exit 1
+          fi
+
+          title="${RELEASE_NAME:-$RELEASE_TAG}"
+          if [ "$PRERELEASE" = "true" ]; then
+            title="$title (pre-release)"
+          fi
+
+          # Discord rejects a message over 2000 characters. Long release notes are cut back to the
+          # last whole line that fits, and the link to the full release is always kept.
+          # <> stops Discord unfurling the link into a GitHub embed under the notes.
+          footer=$'\n\n'"<$RELEASE_URL>"
+          header="# $title"$'\n'
+          budget=$((2000 - ${#header} - ${#footer} - 20))
+          body="$RELEASE_BODY"
+          if [ ${#body} -gt $budget ]; then
+            body="${body:0:$budget}"
+            # Drop the partial last line, unless there is no line break to fall back to.
+            if [[ "$body" == *$'\n'* ]]; then
+              body="${body%$'\n'*}"
+            fi
+            body="$body"$'\n\n...'
+          fi
+
+          payload=$(jq -n --arg content "$header$body$footer" \
+            '{content: $content, allowed_mentions: {parse: []}}')
+
+          curl -sf -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$payload"

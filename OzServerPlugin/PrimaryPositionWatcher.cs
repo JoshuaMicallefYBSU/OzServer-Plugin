@@ -7,70 +7,61 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Hands a position's own sectors back when its primary logs on.
+// Gives a position's sectors back to a controller who was already online on it.
 //
-// A sector belongs to whoever is actually logged in on it. Until then anyone may extend into it -
-// AfvSectorClaimer.Init() grants the primary plus its uncovered sub-sectors on connect, and a VSCS
-// transmit press extends further - which leaves the ordinary case of a controller holding sectors
-// purely because nobody was on them yet. When that position's controller finally connects, those
-// sectors have to go back, and OzServer's ownership record has to say so, or the new arrival's own
-// claim simply collides with the previous holder's (see OzServerOwnershipTracker.HandleConflictAsync).
+// A sector belongs to whoever is logged on as it. Until then anyone may extend into it, so a
+// controller can hold sectors only because nobody was on them. This watches
+// Network.OnlineATCChanged for real ATC coming and going:
 //
-// This watches Network.OnlineATCChanged for a *newly* arrived real ATC, works out which sectors
-// that position takes by default, intersects that with what this controller currently owns, and
-// releases the overlap - telling them what happened rather than asking, because the handover is not
-// theirs to refuse.
+//   - A controller found already online when this session joins keeps their position: the overlap
+//     with what this session owns is released.
+//   - A controller who arrives during this session is handed nothing. They request their position
+//     and this controller accepts it (see HandleArrivalAsync), so the airspace and the aircraft in
+//     it move only when the controller working them agrees.
+//   - A controller who leaves frees the top-down cover withheld for them, which is taken back.
 //
-// Constructed unconditionally by Plugin, like AfvSectorClaimer and OzServerOwnershipTracker: a
-// controller who never opens the OzServer Sectors window still has to give a position back.
+// Constructed unconditionally by Plugin: a controller who never opens the Sectors window still has
+// to give a position back.
 public class PrimaryPositionWatcher
 {
     readonly OzServerOwnershipTracker _tracker;
 
-    // Every callsign online at all - observers included, and regardless of IsRealATC. Presence, not
-    // eligibility: this is what decides whether somebody is *new*.
+    // Every callsign online, observers included and regardless of IsRealATC. Presence, not
+    // eligibility: this decides whether somebody is new.
     HashSet<string> _onlineCallsigns = new(StringComparer.OrdinalIgnoreCase);
-    // Controllers already treated as arrived, so one logon produces one handover however many times
-    // the online list is republished. Cleared per callsign when they actually leave, so a genuine
-    // reconnect is a fresh arrival.
+    // Controllers already treated as arrived, so one logon is handled once however often the
+    // online list is republished. Cleared per callsign when they leave, so a reconnect is a fresh
+    // arrival.
     readonly HashSet<string> _handled = new(StringComparer.OrdinalIgnoreCase);
-    // Everyone visible during this window counts as already-online rather than newly arrived.
-    //
-    // One snapshot at connect is not enough on its own: the online list arrives progressively, and
-    // IsRealATC settles later still, so a controller who was on the network long before this session
-    // can first become visible several seconds in. That is exactly what announced ML_APP as having
-    // "logged on" to a controller who connected after them.
+    // Everyone first seen before this time counts as already online. One snapshot at connect is not
+    // enough: the online list arrives progressively and IsRealATC settles later still, so a
+    // controller who was on long before this session can first become visible seconds in.
     DateTime _settleUntil = DateTime.MinValue;
-    // Whoever is already online at the moment this session joins is not a "logon" - they were there
-    // first, and anything of theirs this controller somehow holds is a pre-existing situation
-    // rather than something this event just caused. The first update after connecting is therefore
-    // recorded as the baseline and acted on no further.
+    // False until the first update after connecting. Whoever is online then was there first: they
+    // are not logons, and their positions are enforced as already-online (EnforceAlreadyOnline).
     bool _hasBaseline;
-    // Releases are awaited one after another and can outlast the event that started them, so a
-    // second burst of arrivals must not start a parallel pass over the same Owned list.
+    // Arrivals are handled one at a time: a second burst must not start a parallel pass.
     bool _handling;
     readonly Queue<NetworkATC> _pending = new();
-    // Guards the two above. They are written from the UI thread (OnOnlineAtcChanged) and read and
-    // written again from wherever RunHandoverLoopAsync's continuations resume - which is not the UI
-    // thread: OzServerApiClient awaits with ConfigureAwait(false), so everything after the first
-    // await inside ReleaseAsync comes back on a pool thread. Without this, an arrival enqueued on
-    // the UI thread could race the loop's own Dequeue, and testing _handling then setting it had
-    // the same split-step race OzServerOwnershipTracker documents on _claimGate: a burst arriving
-    // between the loop's last Dequeue and its clearing of _handling would start no new loop and be
-    // silently dropped - the position never handed back at all.
+    // Guards the two above. Starting or stopping the loop has to be atomic with the test of the
+    // queue, or an arrival enqueued just as the loop decides to stop starts no new loop and is
+    // never handled.
     readonly object _pendingGate = new();
 
     // Long enough for the network's ATC list and its IsRealATC flags to settle after connecting,
-    // short enough that a genuine logon moments later is still caught.
+    // short enough that a logon moments later is still caught.
     static readonly TimeSpan SettleWindow = TimeSpan.FromSeconds(20);
+
+    // The longest an already-online check waits for the resume: its 5 s wait for Network.Me plus
+    // the request timeout.
+    static readonly TimeSpan ResumeWait = TimeSpan.FromSeconds(30);
 
     public PrimaryPositionWatcher(OzServerOwnershipTracker tracker)
     {
         _tracker = tracker;
 
         Network.OnlineATCChanged += (_, _) => RunOnUiThread(OnOnlineAtcChanged);
-        // A new session gets a new baseline: the online list this controller comes back to has
-        // nothing to do with the one they left, and every position on it was there before them.
+        // A new session gets a new baseline: everyone on the online list it joins was there first.
         Network.Disconnected += (_, _) => RunOnUiThread(ResetBaseline);
     }
 
@@ -87,28 +78,25 @@ public class PrimaryPositionWatcher
 
     void OnOnlineAtcChanged()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected)
         {
             ResetBaseline();
             return;
         }
 
-        // Presence is read from the raw list, eligibility from IsRealATC - and the two must not be
-        // conflated, which is the bug this replaced.
-        //
-        // IsRealATC reads false for a genuine controller for some seconds after they connect, and
-        // can drop out again later. Deriving "who is online" from the filtered list therefore had
-        // controllers repeatedly vanishing and reappearing, and every reappearance looked like a
-        // fresh logon: SY_TWR was announced twice ten minutes apart, and ML_APP was announced as
-        // having "logged on" to a controller who connected *after* them. Each false arrival tried to
-        // relinquish sectors that were never theirs to give, which is where the "Only the current
-        // owner may release this sector" errors came from.
+        // Presence is read from the raw list, eligibility from IsRealATC. IsRealATC reads false for
+        // a real controller for some seconds after they connect and can drop out again later, so
+        // deriving "who is online" from the filtered list would make every flicker look like a
+        // fresh logon.
         var raw = Network.GetOnlineATCs ?? new List<NetworkATC>();
         var present = new HashSet<string>(
             raw.Where(a => !string.IsNullOrEmpty(a.Callsign)).Select(a => a.Callsign),
             StringComparer.OrdinalIgnoreCase);
 
-        // Gone entirely - not merely filtered out - so a later reconnect counts as a new arrival.
+        // Gone entirely, not merely filtered out, so a later reconnect counts as a new arrival.
         _handled.RemoveWhere(callsign => !present.Contains(callsign));
 
         if (!_hasBaseline)
@@ -123,9 +111,8 @@ public class PrimaryPositionWatcher
             return;
         }
 
-        // Still settling: record who is there as already-online, but still enforce the sector
-        // boundary locally. Otherwise an enroute controller who connects after ML_APP can keep MAE
-        // in vatSys's own MMI window until some later ownership event happens to touch it.
+        // Still settling: whoever appears is recorded as already online and their position is
+        // enforced, so an enroute controller who connects after ML_APP does not keep MAE in MMI.
         if (DateTime.UtcNow < _settleUntil)
         {
             var alreadyOnline = UnhandledOnlineRealAtcs();
@@ -136,20 +123,16 @@ public class PrimaryPositionWatcher
             return;
         }
 
-        // Gone since we last looked, read from raw presence for the same reason arrivals are: an
-        // IsRealATC flicker must not read as somebody leaving, or this would take back airspace
-        // from a controller who never went anywhere.
-        //
-        // Handled before arrivals so that one controller replacing another on the same group
-        // settles in the right order.
+        // Departures are read from raw presence too: an IsRealATC flicker must not read as somebody
+        // leaving, or cover would be taken back from a controller who is still online. Handled
+        // before arrivals so one controller replacing another on the same group settles in order.
         var departed = _onlineCallsigns.Where(callsign => !present.Contains(callsign)).ToList();
 
         if (departed.Count > 0)
             TakeBackCoverFrom(departed);
 
-        // Arrived means: a real controller, not already handled, and not present under any guise
-        // when we last looked. The last clause is what a flag flicker cannot fake - they were
-        // already there.
+        // Arrived: a real controller, not already handled, and not present in any form at the last
+        // update - the clause a flag flicker cannot satisfy.
         var arrived = PrimaryPosition.OnlineRealAtcs()
             .Where(a => !_handled.Contains(a.Callsign) && !_onlineCallsigns.Contains(a.Callsign))
             .ToList();
@@ -158,11 +141,9 @@ public class PrimaryPositionWatcher
 
         _onlineCallsigns = present;
 
-        // Logged because this whole path used to be invisible: when a primary logged on and their
-        // group was not handed back, nothing anywhere said whether this client had even noticed
-        // them. Note the list this is derived from is filtered by IsRealATC, which lags a genuine
-        // controller's connect by some seconds - so an arrival can legitimately be seen a poll or
-        // two after the logon, and if it is never seen at all that is the thing to look at first.
+        // Logged so that whether this client noticed a logon can be traced. The list is filtered by
+        // IsRealATC, which lags a real connect by some seconds, so an arrival may be seen an update
+        // or two after the logon.
         if (arrived.Count > 0)
             ActionLog.Log("Primary", $"ATC arrived: {string.Join(", ", arrived.Select(a => a.Callsign))}");
 
@@ -171,17 +152,15 @@ public class PrimaryPositionWatcher
         {
             foreach (var atc in arrived)
             {
-                // Not this session's own logon: Network.Me appearing in the online list is this
-                // controller arriving, and "relinquishing" a position to yourself would release
-                // everything AfvSectorClaimer.Init() had just granted.
+                // Network.Me appearing in the online list is this session's own logon, not an
+                // arrival.
                 if (string.Equals(atc.Callsign, Network.Me?.Callsign, StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 _pending.Enqueue(atc);
             }
 
-            // Claiming the loop and enqueueing under the same lock: otherwise a loop that is about
-            // to stop can be observed as still running, and the arrival just queued is never acted on.
+            // Enqueued and the loop started under one lock - see _pendingGate.
             if (_pending.Count > 0 && !_handling)
             {
                 _handling = true;
@@ -193,16 +172,18 @@ public class PrimaryPositionWatcher
             _ = RunHandoverLoopAsync();
     }
 
-    // The mirror of a primary logging on. While an approach controller is online their sectors are
-    // withheld from the enroute controller who covers them top-down (see
-    // PrimaryPosition.StaffedCoveredSectors); when they log off, that cover is theirs again and they
-    // should not have to ask for it or wait for a poll to notice.
+    // The mirror of a controller logging on. While an approach controller is online their sectors
+    // are withheld from the enroute controller who covers them top-down (see
+    // PrimaryPosition.StaffedCoveredSectors); when they log off, the cover is claimed back without
+    // the enroute controller having to ask.
     //
-    // Deliberately not filtered to controllers this session knows anything about: whether a departed
-    // callsign matters is decided by whether it names a sector inside one of this controller's own
-    // groups, which the tracker works out.
+    // Not filtered to known controllers: a departed callsign matters only if it names a sector
+    // covered by one this session owns.
     void TakeBackCoverFrom(List<string> departed)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var freed = _tracker.Owned
             .SelectMany(PrimaryPosition.CoveredBy)
             .Where(covered => departed.Any(callsign =>
@@ -228,13 +209,15 @@ public class PrimaryPositionWatcher
 
     async Task RunHandoverLoopAsync()
     {
+        if (OzServerMode.Disabled)
+            return;
+
         try
         {
             while (true)
             {
                 NetworkATC next;
-                // Test-and-clear as one atomic step - see _pendingGate for the race that splitting
-                // "is the queue empty" from "stop running" would lose an arrival to.
+                // Test-and-clear as one atomic step - see _pendingGate.
                 lock (_pendingGate)
                 {
                     if (_pending.Count == 0)
@@ -251,9 +234,9 @@ public class PrimaryPositionWatcher
         }
         catch (Exception ex)
         {
-            // Deliberately fire-and-forget from the event handler, so nothing may escape as an
-            // unobserved task exception or leave _handling stuck true and every later logon ignored.
-            Errors.Add(new Exception($"Couldn't relinquish sectors to a primary position: {ex.Message}", ex), "OzServer");
+            // Fire-and-forget from the event handler, so nothing may escape as an unobserved task
+            // exception or leave _handling stuck true and every later logon ignored.
+            OzErrors.Add(new Exception($"Couldn't relinquish sectors to a primary position: {ex.Message}", ex), "OzServer");
 
             lock (_pendingGate)
                 _handling = false;
@@ -262,28 +245,91 @@ public class PrimaryPositionWatcher
 
     async Task HandleArrivalAsync(NetworkATC atc, bool notify = true)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (!Network.IsConnected)
             return;
 
-        // Owned, not MMI.SectorsControlled: OzServer's record is what another controller's claim
-        // actually collides with, and it is the thing that has to stop saying "mine". Releasing it
-        // pulls the sector out of MMI and drops its VSCS line back to Idle on its own, through
-        // OzServerOwnershipTracker.ReconcileMmiWithOwned.
-        // This session's own active position is never given away, but top-down cover that somebody
-        // else is logged on for is not active ownership. For BLA while ML_APP is online, MAE is in
-        // BLA's normal dataset group but must still be removed from BLA's current session.
+        // This session's own active position is never given away, but top-down cover whose own
+        // controller is logged on is not part of it: for BLA while ML_APP is online, MAE is in
+        // BLA's dataset group but is not kept.
         var mine = PrimaryPosition.DefaultSectorsForCurrentSession(Network.Me?.Callsign);
 
+        // Owned, not MMI.SectorsControlled: OzServer's record is what another controller's claim
+        // collides with.
         var owned = _tracker.Owned;
         var theirs = PrimaryPosition.DefaultSectorsFor(atc.Callsign);
-        var locallyRemoved = RemoveLocalCover(theirs, mine, atc.Callsign);
-        var relinquishing = theirs
-            .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name))
+
+        // A controller arriving on a position this session holds is not handed it. Their client
+        // requests it (OzServerOwnershipTracker.HandleConflictAsync) and it is given from the
+        // request window here. Releasing on arrival would move the airspace with no say from the
+        // controller working it, and removing the sector from MMI drops every aircraft tracked
+        // inside it: vatSys stops tracking any tag whose controlling sector leaves the list
+        // (MMI.SetControlledSectors).
+        //
+        // Someone found already online when this session joins (notify == false) is still
+        // enforced below: those sectors were theirs before this session existed.
+        if (notify)
+        {
+            var held = theirs.Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name)).Select(s => s.Name).ToList();
+            ActionLog.Log("Primary",
+                held.Count == 0
+                    ? $"{atc.Callsign} arrived - nothing of theirs is owned here"
+                    : $"{atc.Callsign} arrived - keeping {string.Join(", ", held)} until they request it",
+                new
+                {
+                    action = held.Count == 0 ? "arrival_no_owned_sectors" : "arrival_keep_until_requested",
+                    controller_callsign = atc.Callsign,
+                    their_group = theirs.Select(s => s.Name).ToArray(),
+                    held = held.ToArray()
+                });
+            return;
+        }
+
+        // Only once the resume has answered, so the previous session's sectors can be told from what
+        // this session's own logon claim took (see OzServerOwnershipTracker._carriedOver). Bounded:
+        // a resume that never answers must not leave the position unenforced for good.
+        var settled = _tracker.WhenResumeSettled;
+        if (!settled.IsCompleted)
+            await Task.WhenAny(settled, Task.Delay(ResumeWait));
+        if (!Network.IsConnected)
+            return;
+
+        // Re-read after the wait: the resume may have changed both.
+        mine = PrimaryPosition.DefaultSectorsForCurrentSession(Network.Me?.Callsign);
+        owned = _tracker.Owned;
+
+        // A sector this controller already held before connecting stays theirs: the controller
+        // online on it did not take it while they were away (OzServer would no longer list it), so
+        // they had handed it over or left it. BN-TRT_CTR handed TRT to BN-TRS_CTR; when BN-TRS_CTR
+        // reconnected, the resume gave TRT back and this then released it to BN-TRT_CTR.
+        var carriedOver = theirs
+            .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name) && _tracker.IsCarriedOver(s))
             .Where(s => !mine.Any(m => m.Name == s.Name))
             .ToList();
+        if (carriedOver.Count > 0)
+        {
+            ActionLog.Log("Primary",
+                $"{atc.Callsign} already online - keeping {string.Join(", ", carriedOver.Select(s => s.Name))}, held before connecting",
+                new
+                {
+                    action = "already_online_keep_carried_over",
+                    controller_callsign = atc.Callsign,
+                    sectors = carriedOver.Select(s => s.Name).ToArray(),
+                    their_group = theirs.Select(s => s.Name).ToArray()
+                });
+        }
 
-        // Both outcomes are logged. "Decided to relinquish nothing" and "never ran at all" look
-        // identical from the outside, and they have completely different causes.
+        var keep = mine.Concat(carriedOver).ToList();
+        var locallyRemoved = RemoveLocalCover(theirs, keep, atc.Callsign);
+        var relinquishing = theirs
+            .Where(s => owned.Any(o => !o.IsDummy && o.Name == s.Name))
+            .Where(s => !keep.Any(m => m.Name == s.Name))
+            .ToList();
+
+        // Both outcomes are logged: "decided to relinquish nothing" and "never ran" otherwise look
+        // the same from outside.
         if (relinquishing.Count == 0)
         {
             if (notify || locallyRemoved.Count > 0)
@@ -311,20 +357,16 @@ public class PrimaryPositionWatcher
                 locally_removed = locallyRemoved.Select(s => s.Name).ToArray()
             });
 
-        // Shown before the releases rather than after: each one is a round trip, and the controller
-        // should see why their sectors are about to disappear as it happens rather than several
-        // seconds later. A release that then fails is reported by ReleaseAsync into the same error
-        // log everything else here uses.
-        if (notify)
-            ShowNotice(atc, relinquishing);
+        // All of them are excused from RestoreOwnedToMmi before the first release goes out.
+        // RemoveLocalCover has already taken them off the scope, and the refresh after each release
+        // would otherwise put back the ones still in Owned waiting their turn.
+        _tracker.ExpectReleaseOf(relinquishing);
 
-        // Re-checked before each call because the backend cascades: releaseGroup releases the named
-        // sector *and* everything it covers, so releasing MAE also releases MDN, MDS, MAV and MAW.
-        // Walking the list blindly then asked to release four sectors this controller had already
-        // given up, and each answered "Only the current owner may release this sector" - four
-        // alarming errors for an operation that had in fact completely succeeded.
         foreach (var sector in relinquishing)
         {
+            // Re-checked before each call: the backend's releaseGroup releases the named sector
+            // and everything it covers (MAE takes MDN, MDS, MAV and MAW), and releasing a sector
+            // that has already gone is refused as "not the current owner".
             if (!_tracker.Owned.Any(o => o.Name == sector.Name))
                 continue;
 
@@ -346,6 +388,9 @@ public class PrimaryPositionWatcher
 
     void EnforceAlreadyOnline(List<NetworkATC> atcs)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (atcs.Count == 0)
             return;
 
@@ -403,45 +448,13 @@ public class PrimaryPositionWatcher
         return removed;
     }
 
-    static void ShowNotice(NetworkATC atc, List<SectorsVolumes.Sector> relinquishing)
-    {
-        var who = string.IsNullOrEmpty(atc.RealName) ? atc.Callsign : $"{atc.Callsign} ({atc.RealName})";
-
-        // Full description, callsign included - the same way every other list in the plugin writes a
-        // sector (SectorDescription). "ARA" on its own does not tell a controller which airspace is
-        // leaving them.
-        //
-        // No leading indent: the message pane centres its text (see SectorMessageWindow), so spaces
-        // on the left do not indent the list, they shift it off centre.
-        var list = string.Join(Environment.NewLine, relinquishing.Select(s => SectorDescription.Describe(s)));
-        var lead = relinquishing.Count == 1
-            ? "This sector belongs to that position and is being relinquished to them:"
-            : "These sectors belong to that position and are being relinquished to them:";
-
-        var message = $"{who} has logged on."
-                      + Environment.NewLine + Environment.NewLine
-                      + lead
-                      + Environment.NewLine + Environment.NewLine
-                      + list;
-
-        // Non-modal: this is a notification about something already decided, and ShowDialog would
-        // freeze the whole vatSys UI thread until the controller happened to notice and dismiss it.
-        var notice = new SectorNoticeWindow(message, "Position relinquished");
-        if (Application.OpenForms["MainForm"] is Form mainForm)
-            notice.Show(mainForm);
-        else
-            notice.Show();
-
-        notice.BringToFront();
-    }
-
-    // Same fire-and-forget marshaling OzServerOwnershipTracker uses: Network's events can arrive on
-    // a background thread, and everything here ends up touching MMI, VSCS or a window.
+    // Network's events can arrive on a background thread, and everything here touches MMI, VSCS or
+    // a window.
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

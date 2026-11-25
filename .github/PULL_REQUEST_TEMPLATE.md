@@ -13,7 +13,7 @@ is the only automated check and it runs on your machine. Say what you actually e
 
 - [ ] Builds against a real vatSys install
 - [ ] Tested connected to the network
-- [ ] Tested with a second controller (needed for anything touching ownership, requests or shared markup)
+- [ ] Tested with a second controller (needed for anything touching ownership, requests or handovers)
 - [ ] Checked `Documents\vatSys Files\ozserver_YYYYMMDD.txt` for errors during the test
 
 ## Anything reviewers should look at closely
@@ -32,6 +32,7 @@ Worth calling out if this touches:
 - [ ] Release — `<Version>` in `OzServerPlugin.csproj` bumped **and** the tag matches it
 
 <!--
-Everyone's copy updates itself from GitHub releases and trusts the assembly's version, not the tag.
-A tag without a matching build ships an update nobody receives. See "Notes for contributors".
+Every installed copy updates itself from GitHub releases and trusts the assembly's version, not the
+tag. A tag without a matching build ships an update nobody receives. See "Publishing a release" in
+CONTRIBUTING.md.
 -->

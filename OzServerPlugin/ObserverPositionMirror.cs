@@ -6,18 +6,16 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Shows an observer the airspace of the position they are watching, without ever letting them take
-// it. An observer connection has no sectors of its own - AfvSectorClaimer deliberately grants it
-// nothing, and OzServerOwnershipTracker refuses to claim for a session that is not real ATC - so
-// without this an observer sat on a bare scope with no airspace drawn at all.
+// Shows an observer the airspace of the position they are watching, without letting them take it.
+// An observer connection has no sectors of its own - AfvSectorClaimer grants it none and
+// OzServerOwnershipTracker does not claim for one - so without this its scope shows no airspace.
 //
-// What is mirrored is whatever the real controller currently holds on OzServer, not the position's
-// default group out of the dataset, so it follows them live as they claim, extend and release
-// rather than showing airspace nobody is working.
+// What is mirrored is what the watched controller holds on OzServer, not the position's default
+// group from the dataset, so it follows them as they claim, extend and release.
 //
-// Writing MMI.SectorsControlled is safe here precisely because the claim path is gated on
-// IsRealATC: the write raises MMI.SectorsControlledChanged, the tracker's claim loop runs, and it
-// returns without touching the API. The observer sees the airspace; OzServer never hears about it.
+// Writing MMI.SectorsControlled is safe because the tracker's claim path returns early for an
+// observer: the write raises MMI.SectorsControlledChanged, the claim loop runs, and nothing is
+// sent to the API.
 public class ObserverPositionMirror
 {
     readonly OzServerOwnershipTracker _tracker;
@@ -26,19 +24,18 @@ public class ObserverPositionMirror
     public ObserverPositionMirror(OzServerOwnershipTracker tracker)
     {
         _tracker = tracker;
-        // ControlledByOthers is what moves when the watched controller claims or releases, and that
-        // never reaches OwnedChanged - an observer's own Owned is permanently empty.
+        // Refreshed rather than OwnedChanged: the watched controller's claims and releases move
+        // ControlledByOthers, and an observer's own Owned is always empty.
         _tracker.Refreshed += (_, _) => RunOnUiThread(Apply);
         Network.Disconnected += (_, _) => RunOnUiThread(Clear);
     }
 
-    // An observer's callsign is the position they are watching plus the network's observer suffix,
-    // so the position is whatever sector callsign shares the prefix: BN-ISA_OBS -> BN-ISA_CTR.
+    // An observer's callsign is the watched position's prefix plus the observer suffix, so the
+    // position is the sector callsign that shares the prefix: BN-ISA_OBS -> BN-ISA_CTR.
     //
-    // Returns null when the prefix matches more than one position - a bare ML_OBS matches ML_TWR,
-    // ML_APP and ML_SMC alike, and mirroring an arbitrary one of those is worse than mirroring
-    // nothing: the observer would be shown airspace belonging to a controller they are not watching,
-    // with no way to tell that is what happened.
+    // Null when the prefix matches more than one position (ML_OBS matches ML_TWR, ML_APP and
+    // ML_SMC alike): mirroring an arbitrary one would show the observer airspace belonging to a
+    // controller they are not watching.
     public static string? ObservedPositionCallsign(string? observerCallsign)
     {
         if (string.IsNullOrEmpty(observerCallsign))
@@ -62,19 +59,18 @@ public class ObserverPositionMirror
 
     void Apply()
     {
-        // A real controller manages their own sectors through every other path in this plugin, so
-        // this must never run for one. Read from the connection's own Position/Rating
-        // (NetworkIdentity.IsObserver), never Network.Me.IsRealATC: that flag reads false for a
-        // genuine controller for seconds after Connected, and in that window this ran for a real
-        // ML-ASP_CTR session, resolved their own position, found nothing under "controlled by
-        // *others*" - their sectors are their own, not somebody else's - and wrote an empty set,
-        // taking their entire position off them.
+        if (OzServerMode.Disabled)
+            return;
+
+        // Must never run for a real controller, whose sectors are managed by the rest of the
+        // plugin. NetworkIdentity.IsObserver reads the connection's own details rather than
+        // Network.Me.IsRealATC, which reads false for a real controller for some seconds after
+        // connecting.
         if (!Network.IsConnected || !NetworkIdentity.IsObserver)
             return;
 
-        // Network.Callsign, not Network.Me?.Callsign - the connection's own field, set the moment
-        // the session exists, rather than the published ATC record which lags it (the same reason
-        // NetworkIdentity.IsObserver reads Rating/Facility).
+        // Network.Callsign rather than Network.Me?.Callsign: the connection's own field is set as
+        // soon as the session exists, while the published ATC record lags it.
         var position = ObservedPositionCallsign(Network.Callsign);
         if (position == null)
             return;
@@ -84,32 +80,34 @@ public class ObserverPositionMirror
                              && string.Equals(owner.Callsign, position, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
-        // Only written when it actually differs. Every MMI.SetControlledSectors re-fires
-        // SectorsControlledChanged synchronously, so rewriting an unchanged set on every refresh
-        // would spin the tracker's claim loop for nothing several times a minute.
-        // Never clear a scope. An empty result means the watched controller holds nothing we can
-        // see - which is indistinguishable from not knowing yet - and blanking MMI over that is the
-        // most destructive thing this class could do. Only ever writes an actual set of sectors.
+        // Written only when it differs: MMI.SetControlledSectors raises SectorsControlledChanged
+        // synchronously, which would run the tracker's claim loop on every refresh.
+        //
+        // An empty set is never written. It means the watched controller holds nothing visible
+        // here, which cannot be told apart from not knowing yet, and must not blank the scope.
         if (mirrored.Count == 0 || SameSectors(mirrored, _mirrored))
             return;
 
         _mirrored = mirrored;
-        MMI.SetControlledSectors(mirrored);
+        // A copy: vatSys inserts its placeholder for the session's own callsign into the list it is
+        // handed, which for an observer is every time. In _mirrored that extra entry would make
+        // every later comparison above differ, and the write - with vatSys's "default owner is
+        // online" error - repeat on each refresh.
+        MMI.SetControlledSectors(mirrored.ToList());
     }
 
     void Clear() => _mirrored = new List<SectorsVolumes.Sector>();
 
-    // Sector overrides Equals/GetHashCode but not ==, so two instances of the same real sector
-    // reached by different lookups compare unequal under == - the same trap documented in
-    // AfvSectorClaimer.CheckActive and PrimaryPosition.
+    // Sector overrides Equals and GetHashCode but not ==, so two instances of the same sector
+    // compare unequal under == and are compared with Equals.
     static bool SameSectors(List<SectorsVolumes.Sector> left, List<SectorsVolumes.Sector> right) =>
         left.Count == right.Count && left.All(sector => right.Any(other => other.Equals(sector)));
 
     static void RunOnUiThread(Action action)
     {
         if (Application.OpenForms["MainForm"] is Control mainForm && mainForm.InvokeRequired)
-            mainForm.BeginInvoke(action);
+            mainForm.BeginInvoke(UiThread.Guard(action));
         else
-            action();
+            UiThread.Guard(action)();
     }
 }

@@ -6,67 +6,67 @@ using vatsys;
 
 namespace OzServerPlugin;
 
-// Fills, on the controller's own scope, the sectors involved in a pending sector request in either
-// direction - shaded transparent with a solid border of the matching colour, so the airspace can be
-// seen rather than only named, and two requested sectors that share a boundary still read as two:
+// Shades, on the controller's own scope, the sectors in a pending sector request - a transparent
+// fill with a solid border of the same colour, so adjoining sectors still read as separate:
 //
-//   Incoming ("Requested From Me")  - somebody is asking this controller for one of their own
-//                                     sectors. Yellow - the colour this overlay has always used.
-//   Outgoing ("Requested By Me")    - this controller is asking somebody else for one of theirs.
-//                                     Orange - new, so the two directions read as distinct at a
-//                                     glance rather than "some airspace is involved, which way is
-//                                     anyone's guess". OzServerSectorsWindow's own Requested By/
-//                                     From Me headings carry a small swatch of each colour (see
-//                                     SectorsView_DrawNode), reading straight off IncomingColour/
-//                                     OutgoingColour below so the legend and the highlight it
-//                                     describes can never drift apart.
+//   Incoming ("Requested From Me") - another controller is asking for this controller's sectors.
+//                                    Yellow.
+//   Outgoing ("Requested By Me")   - this controller is asking for, or has staged, sectors.
+//                                    Light green.
+//   Releasing                      - sectors staged out of Owned in the Sectors window, which
+//                                    Apply will give back. Soft red.
 //
-// Shown while the sector management window is open and taken off the scope when it closes, not the
-// moment a request lands - see SetRevealed. The highlight answers "which airspace is this", a
-// question only being asked once the controller has gone to look at the request; painting the map
-// before then interrupts someone working traffic with something they have not asked about. The
-// arrival itself is announced by the Settings header's flash, its badge and NotificationSound.
+// OzServerSectorsWindow draws a swatch of each colour from IncomingColour, OutgoingColour and
+// ReleasingColour (SectorsView_DrawNode, beside the three Requested Changes headings), so the legend cannot drift from the
+// highlight.
 //
-// Two layers per direction because a map has exactly one brush (see AsdMapLayer): the fill would
-// swallow its own border at the same alpha. Each border layer is created after its fill so it
-// paints over the shading - PaintMaps walks DisplayMaps.Maps in order and the Join preserves it.
+// Shown only while the Sectors window is open (SetRevealed). The highlight answers "which airspace
+// is this", and painting the scope before the controller has gone to look would interrupt someone
+// working traffic. The arrival itself is announced by the Settings header's flash, its badge and
+// NotificationSound.
+//
+// Two layers per direction because a map has one brush (see AsdMapLayer), and a border at the
+// fill's alpha would not show. Each border layer is created after its fill so it paints over the
+// shading: PaintMaps walks DisplayMaps.Maps in order.
 public class RequestedSectorOverlay
 {
     const int PoolSize = 64;
 
-    const byte IncomingRed = 255, IncomingGreen = 235, IncomingBlue = 0; // yellow - unchanged from before this had a second direction
-    const byte OutgoingRed = 255, OutgoingGreen = 140, OutgoingBlue = 0; // orange
+    const byte IncomingRed = 255, IncomingGreen = 235, IncomingBlue = 0; // yellow
+    const byte OutgoingRed = 144, OutgoingGreen = 238, OutgoingBlue = 144; // light green
+    // Red for "going away", softened to the lightness of the other two so the three read as one
+    // family, and kept clear of vatSys's own saturated alert reds.
+    const byte ReleasingRed = 255, ReleasingGreen = 120, ReleasingBlue = 110; // soft red
     const byte FillAlpha = 70;
     const byte BorderAlpha = 255;
     const float BorderWidth = 2f;
 
     public static Color IncomingColour { get; } = Color.FromArgb(IncomingRed, IncomingGreen, IncomingBlue);
     public static Color OutgoingColour { get; } = Color.FromArgb(OutgoingRed, OutgoingGreen, OutgoingBlue);
+    public static Color ReleasingColour { get; } = Color.FromArgb(ReleasingRed, ReleasingGreen, ReleasingBlue);
 
     readonly OzServerOwnershipTracker _tracker;
     readonly AsdMapLayer _incomingFill;
     readonly AsdMapLayer _incomingBorder;
     readonly AsdMapLayer _outgoingFill;
     readonly AsdMapLayer _outgoingBorder;
+    readonly AsdMapLayer _releasingFill;
+    readonly AsdMapLayer _releasingBorder;
 
-    // What is being asked for in each direction, and whether the controller is currently looking at
-    // it. Tracked whether or not anything is on screen, so opening the window shows what is pending
-    // right now rather than only what arrives afterwards.
+    // Tracked whether or not anything is on screen, so opening the window shows what is already
+    // pending.
     List<SectorsVolumes.Sector> _incoming = new();
-    // Outgoing is two lists, not one, because a sector becomes "mine, pending" in two different
-    // ways that the tracker cannot see the first of at all: staged in this window but not yet
-    // Applied (a claim about to be made, or a request about to be sent - see SetStaged, called from
-    // OzServerSectorsWindow.RefreshStagedHighlight, the same single place that already tells
-    // PendingSectorGhosts about staged requests), and confirmed - already sent, waiting on the
-    // other controller's Accept (SetOutgoing, driven by the tracker's own RequestsChanged). Both
-    // read as the same orange; Apply unions them so a request does not visibly flicker off and back
-    // on in the moment it moves from one list to the other.
+    // Outgoing is two lists because a sector is pending in two ways: staged in the Sectors window
+    // but not yet applied (SetStaged), which the tracker cannot see, and sent and awaiting an
+    // answer (SetOutgoing). ApplyNow unions them, so a request does not flicker as it moves from
+    // one list to the other.
     List<SectorsVolumes.Sector> _stagedOutgoing = new();
     List<SectorsVolumes.Sector> _confirmedOutgoing = new();
+    // Staged releases, expanded to everything each gives back (see SetStaged).
+    List<SectorsVolumes.Sector> _stagedReleases = new();
     bool _revealed;
-    // The last line Apply logged. RequestsChanged fires on every sync - every one to three seconds,
-    // all session - and each one used to write an "Overlay" line to the daily log and forward it to
-    // client_logs, whether or not anything on the scope had changed.
+    // The last line ApplyNow logged. RequestsChanged fires on every sync, so a line is written
+    // only when it differs.
     string? _lastLogged;
 
     public RequestedSectorOverlay(OzServerOwnershipTracker tracker)
@@ -83,30 +83,26 @@ public class RequestedSectorOverlay
         _outgoingBorder = new AsdMapLayer("OzServer Requesting Border", "OzServerRequestingSectorBorder",
             OutgoingRed, OutgoingGreen, OutgoingBlue, BorderAlpha, PoolSize, BorderWidth);
 
+        _releasingFill = new AsdMapLayer("OzServer Releasing", "OzServerReleasingSector",
+            ReleasingRed, ReleasingGreen, ReleasingBlue, FillAlpha, PoolSize, lineWidth: null);
+        _releasingBorder = new AsdMapLayer("OzServer Releasing Border", "OzServerReleasingSectorBorder",
+            ReleasingRed, ReleasingGreen, ReleasingBlue, BorderAlpha, PoolSize, BorderWidth);
+
         _tracker.IncomingRequestsChanged += (_, requests) => SetIncoming(SectorsIn(requests));
-        // RequestsChanged carries both directions and fires on every sync (not only when the set
-        // actually changes, unlike IncomingRequestsChanged) - fine here, since Apply just
-        // recomputes the same handful of polygons each time rather than needing its own dedup.
+        // Unlike IncomingRequestsChanged, RequestsChanged fires on every sync whether or not the
+        // set changed. ApplyNow only recomputes a handful of polygons, so it is not deduplicated.
         _tracker.RequestsChanged += (_, requests) => SetOutgoing(requests.ByMe);
         Network.Disconnected += (_, _) => Clear();
     }
 
     public void SetIncoming(IReadOnlyList<SectorsVolumes.Sector> sectors)
     {
-        // Shaded to what would actually move, not the whole responsible-sectors group the named
-        // sector expands through. That WAS the whole group once - accepting a request for BLA handed
-        // over ELW and the Melbourne Approach sectors right along with it, because the backend's own
-        // transfer did the same undiscriminating expansion, and shading BLA alone would have shown
-        // only a fraction of the airspace actually at risk.
-        //
-        // It no longer works that way (see transferRequest/covered's own "only what the accepting
-        // controller actually holds" fix): a sector someone else is already working - staffed,
-        // running this plugin or not - stays with them, and only what THIS controller actually owns
-        // among the covered set would ever move. Still shading the old, wider group here kept this
-        // overlay telling the controller a request covered airspace that had not been at risk since
-        // that fix landed - MAE and MAV highlighted, and looking taken, for a BLA request while a
-        // controller was sitting on them the entire time. IsMine narrows it to what is actually
-        // being asked for, the same filter the backend itself now applies.
+        if (OzServerMode.Disabled)
+            return;
+
+        // Narrowed to what would move. The backend transfers only the sectors the accepting
+        // controller holds among those the named sector covers (transferRequest in the API), so a
+        // covered sector another controller holds is not shaded.
         _incoming = sectors
             .SelectMany(PrimaryPosition.CoveredBy)
             .Where(_tracker.IsMine)
@@ -119,12 +115,11 @@ public class RequestedSectorOverlay
 
     public void SetOutgoing(IReadOnlyList<OzServerSectorOwnershipRequestDto> requests)
     {
-        // Mirrors SetIncoming's own "what would actually move" narrowing, from the other side: a
-        // request only ever moves what its own target currently holds among the covered set (see
-        // the same transferRequest/covered fix referenced above), so each request is narrowed
-        // against its own TargetCid rather than the whole group it names - a covered sub-sector a
-        // *different* controller happens to hold is never at risk from this request and should not
-        // paint as if it were.
+        if (OzServerMode.Disabled)
+            return;
+
+        // The same narrowing as SetIncoming, from the other side: a request moves only what its
+        // target holds among the covered sectors, so each is narrowed against its own TargetCid.
         _confirmedOutgoing = requests
             .Where(request => request.RejectedAt == null && request.Sector != null)
             .SelectMany(request =>
@@ -144,23 +139,23 @@ public class RequestedSectorOverlay
         Apply();
     }
 
-    // Staged, not-yet-Applied changes - the other source of "about to be mine". Two different kinds,
-    // both narrowed the same way their eventual real counterpart is:
+    // Staged changes that have not been applied, each narrowed as its applied counterpart is:
     //
-    //   stagedClaims   - about to be claimed outright. Expands through the full covered-sectors
-    //                    group with no ownership narrowing, same as a real claim takes the whole
-    //                    group unconditionally (claimGroup on the backend) rather than only what a
-    //                    single other controller happens to hold.
-    //   stagedRequests - about to be sent as a request. Narrowed to whichever covered sub-sectors
-    //                    the *named* sector's own current owner holds - there is no per-request
-    //                    TargetCid yet (nothing has been sent), so the owner of the sector actually
-    //                    staged stands in for it, which is exactly who Apply will address the real
-    //                    request to.
+    //   stagedClaims   - expanded through the whole covered group with no ownership narrowing,
+    //                    which is what a claim asks for (claimGroup in the API).
+    //   stagedRequests - narrowed to the covered sectors held by the named sector's current owner.
+    //                    Nothing has been sent, so there is no TargetCid; that owner stands in.
+    //   stagedReleases - expanded through the covered group and narrowed to what this controller
+    //                    owns, which is what a release gives back (releaseGroup in the API).
     //
-    // Called from OzServerSectorsWindow.RefreshStagedHighlight, the single place every staging
-    // change already funnels through for PendingSectorGhosts' own staged-request preview.
-    public void SetStaged(IReadOnlyList<SectorsVolumes.Sector> stagedClaims, IReadOnlyList<SectorsVolumes.Sector> stagedRequests)
+    // Called from OzServerSectorsWindow.RefreshStagedHighlight, which every staging change goes
+    // through.
+    public void SetStaged(IReadOnlyList<SectorsVolumes.Sector> stagedClaims, IReadOnlyList<SectorsVolumes.Sector> stagedRequests,
+        IReadOnlyList<SectorsVolumes.Sector> stagedReleases)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         var claimed = stagedClaims.SelectMany(PrimaryPosition.CoveredBy);
 
         var requested = stagedRequests.SelectMany(named =>
@@ -174,13 +169,23 @@ public class RequestedSectorOverlay
             .Select(group => group.First())
             .ToList();
 
+        _stagedReleases = stagedReleases
+            .SelectMany(PrimaryPosition.CoveredBy)
+            .Where(_tracker.IsMine)
+            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+
         Apply();
     }
 
-    // Driven by the sector management window's visibility. Both directions matter: closing the
-    // window takes the shading off the scope, so it never outlives the reason it was drawn.
+    // Driven by the Sectors window's visibility, so the shading comes off the scope when the
+    // window closes.
     public void SetRevealed(bool revealed)
     {
+        if (OzServerMode.Disabled)
+            return;
+
         if (_revealed == revealed)
             return;
 
@@ -193,14 +198,17 @@ public class RequestedSectorOverlay
         _incoming = new List<SectorsVolumes.Sector>();
         _stagedOutgoing = new List<SectorsVolumes.Sector>();
         _confirmedOutgoing = new List<SectorsVolumes.Sector>();
+        _stagedReleases = new List<SectorsVolumes.Sector>();
         Apply();
     }
 
-    // Marshalled because its callers are not: the tracker raises IncomingRequestsChanged and
-    // RequestsChanged from its refresh continuation on a pool thread, while SetStaged and
-    // SetRevealed come from the UI. One thread doing every pass keeps a stale pool-thread pass from
-    // landing after a newer UI one and briefly putting back a highlight the controller just closed.
+    // Marshalled because the tracker raises IncomingRequestsChanged and RequestsChanged on a pool
+    // thread, while SetStaged and SetRevealed come from the UI. Running every pass on one thread
+    // stops a stale pool-thread pass landing after a newer UI one and restoring a highlight the
+    // controller has just closed.
     void Apply() => AsdMapLayer.RunOnUiThread(ApplyNow);
+
+    string? _lastShapesKey;
 
     void ApplyNow()
     {
@@ -211,21 +219,36 @@ public class RequestedSectorOverlay
                 .Select(group => group.First())
                 .ToList()
             : new List<SectorsVolumes.Sector>();
-        var incomingPolygons = incoming.SelectMany(Boundaries).ToList();
-        var outgoingPolygons = outgoing.SelectMany(Boundaries).ToList();
+        var releasing = _revealed ? _stagedReleases : new List<SectorsVolumes.Sector>();
+        // The same sectors as last time need no new shapes. This runs after every sync, and the
+        // merge is the most expensive thing it does - on the UI thread.
+        var shapesKey = string.Join(",", incoming.Select(s => s.Name)) + "|" + string.Join(",", outgoing.Select(s => s.Name))
+                        + "|" + string.Join(",", releasing.Select(s => s.Name));
+        if (shapesKey != _lastShapesKey)
+        {
+            _lastShapesKey = shapesKey;
 
-        // The same shapes drive each direction's pair of layers - the border is the outline of what
-        // the fill shades.
-        _incomingFill.SetPolygons(incomingPolygons);
-        _incomingBorder.SetPolygons(incomingPolygons);
-        _outgoingFill.SetPolygons(outgoingPolygons);
-        _outgoingBorder.SetPolygons(outgoingPolygons);
+            var incomingPolygons = incoming.SelectMany(Boundaries).ToList();
+            var outgoingPolygons = outgoing.SelectMany(Boundaries).ToList();
+            var releasingPolygons = releasing.SelectMany(Boundaries).ToList();
 
-        var message = incoming.Count == 0 && outgoing.Count == 0
-            ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing pending, revealed={_revealed})"
-            : $"{incoming.Count} incoming, {outgoing.Count} outgoing sector(s) highlighted"
+            // The border outlines every volume, so the sector boundaries show inside the shading;
+            // the fill is their merged outline, so overlapping volumes are shaded once (see
+            // SectorFill).
+            _incomingFill.SetPolygons(SectorFill.Merge(incomingPolygons));
+            _incomingBorder.SetPolygons(incomingPolygons);
+            _outgoingFill.SetPolygons(SectorFill.Merge(outgoingPolygons));
+            _outgoingBorder.SetPolygons(outgoingPolygons);
+            _releasingFill.SetPolygons(SectorFill.Merge(releasingPolygons));
+            _releasingBorder.SetPolygons(releasingPolygons);
+        }
+
+        var message = incoming.Count == 0 && outgoing.Count == 0 && releasing.Count == 0
+            ? $"highlight cleared ({_incoming.Count} incoming, {_stagedOutgoing.Count + _confirmedOutgoing.Count} outgoing, {_stagedReleases.Count} releasing pending, revealed={_revealed})"
+            : $"{incoming.Count} incoming, {outgoing.Count} outgoing, {releasing.Count} releasing sector(s) highlighted"
               + (incoming.Count > 0 ? $" - from me: {string.Join(", ", incoming.Select(s => s.Name))}" : "")
-              + (outgoing.Count > 0 ? $" - by me: {string.Join(", ", outgoing.Select(s => s.Name))}" : "");
+              + (outgoing.Count > 0 ? $" - by me: {string.Join(", ", outgoing.Select(s => s.Name))}" : "")
+              + (releasing.Count > 0 ? $" - releasing: {string.Join(", ", releasing.Select(s => s.Name))}" : "");
 
         if (message == _lastLogged)
             return;
@@ -245,8 +268,8 @@ public class RequestedSectorOverlay
             .Select(sector => sector!)
             .ToList();
 
-    // One polygon per volume. A sector is not necessarily a single polygon - it can be several
-    // disjoint volumes - and merging them would produce a shape that does not exist.
+    // One polygon per volume: a sector can be several disjoint volumes, and merging them would
+    // produce a shape that does not exist.
     static IEnumerable<List<Coordinate>> Boundaries(SectorsVolumes.Sector sector)
     {
         foreach (var volume in sector.Volumes)
@@ -256,9 +279,9 @@ public class RequestedSectorOverlay
 
             var points = volume.Boundary.ToList();
 
-            // Closed explicitly. The dataset's boundaries do not reliably repeat their first point,
-            // and for the border that would leave the ring visibly open along one edge - PaintMap
-            // strokes a line as its consecutive segments and closes nothing itself.
+            // Closed explicitly: the dataset's boundaries do not reliably repeat their first point,
+            // and PaintMap strokes a line as its consecutive segments without closing it, which
+            // would leave the border open along one edge.
             if (!points[0].Equals(points[points.Count - 1]))
                 points.Add(points[0]);
 

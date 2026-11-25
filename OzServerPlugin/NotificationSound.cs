@@ -7,45 +7,75 @@ namespace OzServerPlugin;
 
 // The sound an incoming sector request makes, alongside the Settings header's flash.
 //
-// Tone2.wav is vatSys's own: Audio.Network_ATCMessagesChanged plays it (as PlayVSCSSound(tone2))
-// when another controller sends an ATC message. A sector request is the same kind of event - another
-// controller wants something from you and it is waiting - so it should sound like one rather than
-// introduce a noise controllers have to learn.
+// Tone2.wav is vatSys's own: Audio.Network_ATCMessagesChanged plays it when another controller
+// sends an ATC message, and a sector request is the same kind of event.
 //
-// Deliberately not Audio.PlayAlert. That is the alert engine, its priorities are P1 to P4, and those
-// are the conflict and safety sounds; a sector request must never sound like an STCA. PlayAlert is
-// also internal and instance, so reaching it would mean reflecting onto Audio.Instance, and it loops
-// until StopAlert is called - none of which suits a one-shot notification.
+// Not Audio.PlayAlert: that is the alert engine, whose P1 to P4 priorities are the conflict and
+// safety sounds, and a sector request must never sound like an STCA. It is also internal, and
+// loops until StopAlert is called.
 //
-// Played through System.Media rather than through vatSys's audio engine on purpose: the engine mixes
-// into the VSCS output device, which is the controller's headset and the thing they are listening to
-// aircraft on. A UI notification belongs on the default output device, not in the radio path.
+// Played through vatSys's VSCS sound engine, the way vatSys plays Tone2 itself for an ATC message
+// (Audio.PlayVSCSSound): into the controller's headset, where they will hear it. On the default
+// output device instead, ML-HYD_CTR - on a headset - did not hear ML-ASP_CTR's request arrive. The
+// engine is private to vatSys, so it is reached by reflection; if this vatSys build does not have
+// it in that shape, the sound falls back to the default output device.
 public static class NotificationSound
 {
-    // Under Helpers.GetProgramFolder(), which is where vatSys itself loads these from - not a path
-    // of our own guessing, and it follows a non-default install.
+    static readonly System.Reflection.FieldInfo? AudioInstance =
+        typeof(Audio).GetField("Instance", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    static readonly System.Reflection.FieldInfo? Tone2 =
+        typeof(Audio).GetField("tone2", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    static readonly System.Reflection.MethodInfo? PlayVscsSound =
+        typeof(Audio).GetMethod("PlayVSCSSound", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    // Through the VSCS engine, as vatSys plays its own ATC-message tone. False if that is not
+    // available, or failed.
+    static bool TryPlayThroughVscs()
+    {
+        try
+        {
+            var audio = AudioInstance?.GetValue(null);
+            var tone = audio == null ? null : Tone2?.GetValue(audio);
+            if (audio == null || tone == null || PlayVscsSound == null)
+                return false;
+
+            var parameters = PlayVscsSound.GetParameters();
+            PlayVscsSound.Invoke(audio, parameters.Length == 2 ? new[] { tone, false } : new[] { tone });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ActionLog.Log("Sound", $"could not play the request sound through VSCS, using the default device: {ex.Message}");
+            return false;
+        }
+    }
+
+    // Relative to Helpers.GetProgramFolder(), where vatSys loads its own sounds from, so it
+    // follows a non-default install.
     const string RequestSoundFile = @"\wav\Tone2.wav";
 
     static readonly object Lock = new();
     static SoundPlayer? _player;
     static bool _loadAttempted;
 
-    // Fired once per new request group, not per poll - see Plugin.AnnounceNewRequestGroups.
+    // Called once per new request group, not per poll - see Plugin.AnnounceNewRequestGroups.
     public static void PlayRequestArrived()
     {
+        if (TryPlayThroughVscs())
+            return;
+
         try
         {
             var player = Player();
 
-            // Play, not PlaySync: this runs on the UI thread and PlaySync would block it for the
-            // length of the sample, freezing the client mid-notification.
+            // Play, not PlaySync: this runs on the UI thread, which PlaySync would block for the
+            // length of the sample.
             player?.Play();
         }
         catch (Exception ex)
         {
-            // A missing or unplayable sound file must not cost the controller the request itself.
-            // The flash and the badge are the load-bearing part of this notification; the sound is
-            // an addition to them.
+            // A missing or unplayable file must not affect the request itself. The flash and the
+            // badge carry the notification; the sound is an addition to them.
             ActionLog.Log("Sound", $"could not play request notification: {ex.Message}");
         }
     }
@@ -54,8 +84,7 @@ public static class NotificationSound
     {
         lock (Lock)
         {
-            // Loaded once and kept. LoadSoundFiles does the same thing on vatSys's side, and
-            // re-reading the file on every request would put disk access on the UI thread.
+            // Loaded once and kept, so the file is not read on the UI thread for every request.
             if (_loadAttempted)
                 return _player;
 
@@ -70,8 +99,7 @@ public static class NotificationSound
 
             var player = new SoundPlayer(path);
 
-            // Loaded up front so the first request is not the one that pays for reading the file,
-            // and so a corrupt file fails here - once, into the log - rather than on every request.
+            // Loaded up front so a corrupt file fails here, once, rather than on every request.
             player.Load();
             _player = player;
 
