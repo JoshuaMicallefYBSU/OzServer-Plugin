@@ -120,7 +120,7 @@ Once loaded, the plugin adds:
 | --- | --- |
 | **Settings** | **Sectors** — opens the OzServer Sectors window, in place of vatSys's own *Sectors...* entry while OzServer is running |
 | **Tools** | **Disable OzServer** |
-| **OzServer How-To** (menu bar) | Opens the [controller guide](https://ozserver.org/how-to) in vatSys's browser |
+| **Info** | **OzServer How-To** — opens the [controller guide](https://ozserver.org/how-to) in vatSys's browser |
 
 ## Updates
 

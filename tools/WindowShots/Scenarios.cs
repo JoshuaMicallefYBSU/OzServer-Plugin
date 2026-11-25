@@ -62,6 +62,7 @@ static class Scenarios
         Shots.Set(type, _tracker, "PluginClients",
             new HashSet<string>(new[] { Me, Mungo.Callsign, Gundagai.Callsign, Armidale.Callsign }, StringComparer.OrdinalIgnoreCase));
 
+        await Try("how-to menu entry", HowToMenuEntry);
         await Try("sectors window", SectorsWindow);
         await Try("prompts", Prompts);
         await Try("arrival list", ArrivalList);
@@ -78,6 +79,41 @@ static class Scenarios
         {
             Console.Error.WriteLine($"{what}: {(ex as TargetInvocationException)?.InnerException ?? ex}");
         }
+    }
+
+    // ---- menu ---------------------------------------------------------------------------------
+
+    // Not a picture: a check that the plugin puts "OzServer How-To" where it means to. The host
+    // window is given a menu shaped like vatSys's Info menu, then one without it.
+    static async Task HowToMenuEntry()
+    {
+        var menu = new MenuStrip { Name = "mainMenu" };
+        var info = new ToolStripMenuItem("Info") { Name = "aISToolStripMenuItem" };
+        info.DropDownItems.Add(new ToolStripMenuItem("About"));
+        info.DropDownItems.Add(new ToolStripMenuItem("AIS Display"));
+        info.DropDownItems.Add(new ToolStripSeparator { Name = "infoStripSeparator", Visible = false });
+        menu.Items.Add(info);
+        Shots.Host.Controls.Add(menu);
+        Shots.Host.MainMenuStrip = menu;
+
+        var plugin = System.Runtime.Serialization.FormatterServices.GetUninitializedObject(typeof(Plugin));
+        Shots.Call(typeof(Plugin), plugin, "AddHowToButton");
+        await Task.Delay(600);
+        var last = info.DropDownItems.Cast<ToolStripItem>().Last();
+        Console.WriteLine($"How-To entry: Info menu ends with \"{last.Text}\"; separator shown: {info.DropDownItems["infoStripSeparator"].Available}; entries: {info.DropDownItems.Count}");
+
+        // A vatSys with no menu of that name: the entry goes under Tools through the plugin API.
+        menu.Items.Remove(info);
+        var before = (Shots.Get(typeof(MMI), null, "PluginMenuItems") as System.Collections.ICollection)?.Count ?? 0;
+        Shots.Call(typeof(Plugin), plugin, "AddHowToButton");
+        await Task.Delay(600);
+        var after = (Shots.Get(typeof(MMI), null, "PluginMenuItems") as System.Collections.ICollection)?.Count ?? 0;
+        var fallback = ((System.Collections.IEnumerable)Shots.Get(typeof(MMI), null, "PluginMenuItems")!).Cast<vatsys.Plugin.CustomToolStripMenuItem>().LastOrDefault();
+        Console.WriteLine($"How-To entry without an Info menu: plugin menu items {before} -> {after}; category: {fallback?.Category}; text: \"{fallback?.Item.Text}\"");
+
+        Shots.Host.MainMenuStrip = null;
+        Shots.Host.Controls.Remove(menu);
+        menu.Dispose();
     }
 
     // ---- Sectors window -----------------------------------------------------------------------

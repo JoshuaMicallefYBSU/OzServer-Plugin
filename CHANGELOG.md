@@ -4,6 +4,13 @@ Every release of the OzServer plugin, newest first. Versions follow `MAJOR.MINOR
 tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same number. Entries up to
 0.3.1 are the notes published with each GitHub release.
 
+## [Unreleased]
+
+### Changed
+
+- **OzServer How-To** is now an entry in vatSys's **Info** menu, with the profile's other browser
+  entries, instead of a button of its own in the menu bar.
+
 ## [0.3.2] - 2026-11-25
 
 ### Added

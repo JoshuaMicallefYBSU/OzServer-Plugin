@@ -226,10 +226,10 @@ public class Plugin : IPlugin
             CustomToolStripMenuItemCategory.Tools,
             selcalDebugItem));
 
-        // Contained: the button is the one thing here built on a custom menu category, and an
-        // exception leaving this constructor stops vatSys loading any plugin, and the profile.
-        // That includes a vatSys build without the member AddHowToButton calls, which is raised
-        // as AddHowToButton is compiled - hence a method of its own that is never inlined here.
+        // Contained: an exception leaving this constructor stops vatSys loading any plugin, and
+        // the profile. That includes a vatSys build without a member AddHowToButton names, which
+        // is raised as AddHowToButton is compiled - hence a method of its own that is never
+        // inlined here.
         try
         {
             AddHowToButton();
@@ -498,38 +498,65 @@ public class Plugin : IPlugin
             ShowPopup(notice);
     }
 
-    // "OzServer How-To" in the main menu bar, opening the controller guide in vatSys's own browser
-    // window. Stays when OzServer is disabled: the guide covers that too, and it changes nothing.
+    // "OzServer How-To" under vatSys's Info menu, opening the controller guide in vatSys's own browser
+    // window - beside the profile's own browser entries, which open the same kind of window. Stays
+    // when OzServer is disabled: the guide covers that too, and it changes nothing.
     //
-    // vatSys only lets a plugin add an entry under a category, so the guide is added as the one entry
-    // of a custom "OzServer How-To" category, which vatSys shows as a top-level menu. Once the menu
-    // exists the entry is taken out of it and the header itself opens the guide - a top-level item
-    // with no dropdown raises Click - so it acts as a button. Until then, or if the header can't be
-    // found, the entry under it still works.
+    // It is put into the Info menu by hand. vatSys has an Info category for plugin entries
+    // (CustomToolStripMenuItemCategory.Info), but MainForm.LoadPluginMenuItem looks for a separator
+    // named "infoSeparator" in the Settings menu, finds none, and adds nothing. So the entry waits
+    // for the main window's menu to exist and is appended to Info's dropdown, after the profile's
+    // entries. The separator above those is hidden when the profile has none, and is shown so that
+    // this entry does not run on from "AIS Display".
+    //
+    // If this vatSys has no menu by that name, the entry goes under Tools through the plugin API
+    // instead, so the guide can always be reached.
     //
     // NoInlining: see the call in the constructor.
     [MethodImpl(MethodImplOptions.NoInlining)]
     void AddHowToButton()
     {
-        var entry = new ToolStripMenuItem("Open the OzServer guide");
+        var entry = new ToolStripMenuItem(HowToMenuText);
         entry.Click += (_, _) => OpenHowTo();
-        MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
-            CustomToolStripMenuItemWindowType.Main, HowToMenuText, entry));
 
-        EventHandler? makeButton = null;
-        makeButton = (_, _) =>
+        EventHandler? place = null;
+        place = (_, _) =>
         {
-            if (entry.OwnerItem is not ToolStripMenuItem header)
-                return;
+            // Raised on vatSys's UI thread between messages: nothing may escape it.
+            try
+            {
+                if (Application.OpenForms["MainForm"] is not Form { MainMenuStrip: { } menu })
+                    return;
 
-            Application.Idle -= makeButton;
-            header.DropDownItems.Remove(entry);
-            header.Click += (_, _) => OpenHowTo();
+                Application.Idle -= place;
+
+                if (menu.Items[InfoMenuName] is ToolStripMenuItem info)
+                {
+                    if (info.DropDownItems[InfoSeparatorName] is { } separator)
+                        separator.Visible = true;
+                    info.DropDownItems.Add(entry);
+                    return;
+                }
+
+                ActionLog.Log("Ui", "vatSys's Info menu wasn't found; the OzServer How-To entry is under Tools instead",
+                    new { action = "how_to_under_tools" });
+                MMI.AddCustomMenuItem(new CustomToolStripMenuItem(
+                    CustomToolStripMenuItemWindowType.Main, CustomToolStripMenuItemCategory.Tools, entry));
+            }
+            catch (Exception ex)
+            {
+                Application.Idle -= place;
+                ActionLog.Log("Ui", $"The OzServer How-To entry couldn't be added: {ex.Message}",
+                    new { action = "how_to_button_failed" });
+            }
         };
-        Application.Idle += makeButton;
+        Application.Idle += place;
     }
 
     const string HowToMenuText = "OzServer How-To";
+    // The Info menu and the separator above its browser entries, as vatSys's MainForm names them.
+    const string InfoMenuName = "aISToolStripMenuItem";
+    const string InfoSeparatorName = "infoStripSeparator";
     const string HowToUrl = "https://ozserver.org/how-to";
 
     BaseForm? _howToWindow;
