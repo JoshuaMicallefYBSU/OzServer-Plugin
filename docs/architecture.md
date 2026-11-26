@@ -116,6 +116,7 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 | `LabelState.cs` | Carries cleared level, scratchpad and label data across a handover or reconnect |
 | `TagResumeRecovery.cs` | Restores this controller's own tags after a reconnect |
 | `FdrResumeActivation.cs` | Re-activates and positions other recent flights after a reconnect |
+| `InboundActivation.cs` | Activates pre-active IFR flights approaching held sectors from uncontrolled airspace |
 | `ServerFdrSnapshot.cs` | The most recent server-side flight records, shared by the resume paths |
 | `SectorLocator.cs` | Which sector an aircraft is physically inside |
 | `CoupleAssist.cs` | Couples an activated flight plan to its radar track by callsign |

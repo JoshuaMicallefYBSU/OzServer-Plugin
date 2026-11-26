@@ -37,6 +37,8 @@ public class Plugin : IPlugin
     readonly TagResumeRecovery _tagResumeRecovery;
     // Activates and positions, on reconnect, the flights OzServer still holds that vatSys has not.
     readonly FdrResumeActivation _fdrResumeActivation;
+    // Activates IFR flights approaching held sectors from uncontrolled airspace.
+    readonly InboundActivation _inboundActivation;
     // Puts the tracking controller's "C" on everyone else's copy of the label - see LabelStateMirror.
     readonly LabelStateMirror _labelStateMirror;
     // Couples an activated flight plan to the radar track carrying its callsign when vatSys will not.
@@ -132,6 +134,7 @@ public class Plugin : IPlugin
         // lost moments after a restore - is taken back.
         _fdrSync.TagLost += lost => _tagResumeRecovery.Retake(lost);
         _fdrResumeActivation = new FdrResumeActivation();
+        _inboundActivation = new InboundActivation(_ownershipTracker);
         _labelStateMirror = new LabelStateMirror();
         // After the tracker, whose OwnershipChanged tells it a sector moved.
         _sectorTagHandoff = new SectorTagHandoff(_ownershipTracker, _fdrSync);

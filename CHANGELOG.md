@@ -4,6 +4,18 @@ Every release of the OzServer plugin, newest first. Versions follow `MAJOR.MINOR
 tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same number. Entries up to
 0.3.1 are the notes published with each GitHub release.
 
+## [Unreleased]
+
+### Added
+
+- **Inbound flights are activated automatically.** An IFR flight plan that is still pre-active,
+  airborne outside every OzServer-held sector, is activated once it is within 150 nm of a held
+  sector that its route enters or passes within 50 nm of. vatSys gives it a code, which the pilot
+  is not told (the controller issues it on first contact as usual); no CFL is set and nobody takes
+  the tag. Only the controller holding the first such sector along the route activates it, and
+  every other OzServer controller's copy follows. VFR flight plans, and flights already inside a
+  held sector (such as an IFR departure from inside your airspace), are still activated by hand.
+
 ## [0.3.3] - 2026-11-25
 
 ### Changed

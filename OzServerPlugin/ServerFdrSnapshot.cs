@@ -5,20 +5,24 @@ namespace OzServerPlugin;
 
 // What OzServer last said about each FDR: when it was last updated, and from which sector. Refreshed
 // by FdrResumeActivation's scan (every 20 s) and read by FdrSync's watchdog to tell whether the
-// controller chosen to report an untracked aircraft is doing so - see FdrSync.TakeOverIfStale.
+// controller chosen to report an untracked aircraft is doing so - see FdrSync.TakeOverIfStale - and
+// by InboundActivation, which leaves a flight OzServer already has activated to FdrResumeActivation.
 public static class ServerFdrSnapshot
 {
     public readonly struct Entry
     {
-        public Entry(DateTimeOffset? lastSeenAt, string? authoritySector, int? controllingCid, string? controllingCallsign)
+        public Entry(DateTimeOffset? lastSeenAt, string? authoritySector, int? controllingCid, string? controllingCallsign, string? state)
         {
             ControllingCallsign = controllingCallsign;
             LastSeenAt = lastSeenAt;
             AuthoritySector = authoritySector;
             ControllingCid = controllingCid;
+            State = state;
         }
 
         public DateTimeOffset? LastSeenAt { get; }
+        // vatSys's FDRStates name as the last report had it (STATE_PREACTIVE, STATE_COORDINATED...).
+        public string? State { get; }
         public string? AuthoritySector { get; }
         public int? ControllingCid { get; }
         public string? ControllingCallsign { get; }
@@ -34,7 +38,7 @@ public static class ServerFdrSnapshot
         foreach (var record in records)
         {
             if (!string.IsNullOrEmpty(record.Callsign))
-                entries[record.Callsign] = new Entry(record.LastSeenAt, record.AuthoritySector, record.ControllingCid, record.ControllingCallsign);
+                entries[record.Callsign] = new Entry(record.LastSeenAt, record.AuthoritySector, record.ControllingCid, record.ControllingCallsign, record.State);
         }
 
         lock (Gate)
