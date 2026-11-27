@@ -20,7 +20,7 @@
           FileVersion with the version VATPAC lists, and PluginUpdater compares AssemblyVersion
           with the release tag.
         -->
-        <Version>0.3.5</Version>
+        <Version>0.3.5.1</Version>
 
         <Product>OzServer Plugin</Product>
         <AssemblyTitle>OzServer Plugin</AssemblyTitle>

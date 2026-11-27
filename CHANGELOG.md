@@ -6,6 +6,8 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
 
 ## [Unreleased]
 
+## [0.3.5.1] - 2026-11-27
+
 ### Added
 
 - **Times over waypoints, estimates and holds are saved to OzServer, and come back when you pick
