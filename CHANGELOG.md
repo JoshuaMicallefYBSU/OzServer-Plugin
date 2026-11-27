@@ -6,6 +6,8 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-27
+
 ### Changed
 
 - **A release that is already out when you open vatSys is running by the time vatSys has opened.**
