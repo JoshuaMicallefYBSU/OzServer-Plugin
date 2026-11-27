@@ -51,7 +51,9 @@ public class FdrResumeActivation
     // then puts it back to pre-active, a scan must not re-activate it. Held by reference, not
     // callsign: vatSys deletes a finished FDR after ten minutes and builds a new one when the pilot
     // is seen again, and that new one is a flight to bring in like any other.
-    readonly HashSet<FDP2.FDR> _done = new();
+    readonly WeakSet<FDP2.FDR> _done = new();
+    // How old a list fetched by someone else the scan will take - see ScanAsync.
+    static readonly TimeSpan ScanReuse = TimeSpan.FromSeconds(5);
     DateTime _deadline = DateTime.MinValue;
     DateTime _connectedAt = DateTime.MaxValue;
     int _session;
@@ -59,6 +61,8 @@ public class FdrResumeActivation
 
     public FdrResumeActivation()
     {
+        MemoryBreakdown.Track("FdrResumeActivation.pending", () => _pending.Count);
+
         Network.Connected += (_, _) =>
         {
             int session;
@@ -121,7 +125,10 @@ public class FdrResumeActivation
 
         try
         {
-            var records = await _api.GetAllFlightsAsync();
+            // LabelStateMirror's last fetch if it is this recent, rather than a second copy of the
+            // same list: it fetches every few seconds while there is traffic. The connect pass
+            // (BeginAsync) always fetches its own.
+            var records = await _api.GetAllFlightsAsync(reuseWithin: ScanReuse);
             // FdrSync's watchdog reads this too, so it is refreshed even while the connect pass
             // still owns activation. Not with an answer from a session that has since ended: that
             // would refill what the disconnect cleared, with records that may be another server's.

@@ -57,6 +57,14 @@ public class FdrSync
     {
         _tracker = tracker;
         _flushTimer = new Timer(_ => _ = FlushAsync(), null, FlushInterval, FlushInterval);
+
+        // On the Perf memory line: the collections here that gain an entry per flight.
+        MemoryBreakdown.Track("FdrSync.pending", () => _pending.Count);
+        MemoryBreakdown.Track("FdrSync.held", () => _held.Count);
+        MemoryBreakdown.Track("FdrSync.lastRadarPush", () => _lastRadarPush.Count);
+        MemoryBreakdown.Track("FdrSync.landingChecked", () => _landingChecked.Count);
+        MemoryBreakdown.Track("FdrSync.sentRouteKeys", () => _sentRouteKeys.Count);
+        MemoryBreakdown.Track("FdrSync.labelStateKeys", () => _labelStateKeys.Count);
         _tracker.TagsResumed += (_, callsigns) => NoteResume(callsigns);
 
         // Whatever is still queued belongs to the session that ended. FlushAsync holds it while
@@ -141,7 +149,7 @@ public class FdrSync
     // FDRs this session has cancelled on the server. Held by reference: vatSys keeps a finished FDR
     // for ten minutes and builds a new one if the pilot files again, and that one is reported as
     // usual. Nothing more is sent for a cancelled one unless it is activated again.
-    readonly HashSet<FDP2.FDR> _cancelled = new();
+    readonly WeakSet<FDP2.FDR> _cancelled = new();
     static readonly TimeSpan CancelRecent = TimeSpan.FromSeconds(30);
 
     // The controller who owns a flight cancelled its FDR - Finish in the aircraft menu, or Cancel
@@ -562,7 +570,12 @@ public class FdrSync
             controlling_sector = fdr.ControllingSector?.Name,
             controlling_callsign = Network.Callsign
         });
-        _ = FlushAsync();
+
+        // On a pool thread, as the timer's flushes are. SectorTagHandoff calls this from vatSys's
+        // UI thread, and a flush started there ran its sweeps, its label scan and the batch's
+        // serialisation on it - and, awaiting without ConfigureAwait(false), came back to it for
+        // everything after each request as well.
+        _ = Task.Run(FlushAsync);
     }
 
     public void OnRadarTrackUpdate(RDP.RadarTrack track)

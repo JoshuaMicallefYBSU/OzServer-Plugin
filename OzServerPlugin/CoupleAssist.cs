@@ -34,6 +34,12 @@ public class CoupleAssist
     // When each callsign was first seen moving with no coupled flight plan.
     readonly Dictionary<string, DateTime> _firstSeen = new(StringComparer.OrdinalIgnoreCase);
 
+    public CoupleAssist()
+    {
+        MemoryBreakdown.Track("CoupleAssist.lastTried", () => _lastTried.Count);
+        MemoryBreakdown.Track("CoupleAssist.firstSeen", () => _firstSeen.Count);
+    }
+
     public void OnRadarTrackUpdate(RDP.RadarTrack track)
     {
         if (OzServerMode.Disabled)
@@ -205,7 +211,7 @@ public class CoupleAssist
     // one radar cycle after activation (vatSys's own chance first) an FDR still uncoupled is coupled
     // to the moving return carrying its callsign - see the class comment.
     static readonly TimeSpan AfterActivation = TimeSpan.FromSeconds(6);
-    readonly HashSet<FDP2.FDR> _activationHandled = new();
+    readonly WeakSet<FDP2.FDR> _activationHandled = new();
 
     public void OnFdrUpdate(FDP2.FDR fdr)
     {

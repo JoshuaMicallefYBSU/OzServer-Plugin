@@ -8,10 +8,17 @@ namespace OzServerPlugin;
 // turns such an exception into an entry in the Errors window instead.
 static class UiThread
 {
+    //
+    // Guard also times what it runs, for the Perf line that totals the plugin's share of the UI
+    // thread (PluginWork). A piece run inline from a thread that is not the UI thread - before
+    // the main form exists - is counted with the rest; there are few.
     public static Action Guard(Action action) => () =>
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        long allocated = 0;
         try
         {
+            allocated = PluginWork.Allocated();
             action();
         }
         catch (Exception ex)
@@ -20,6 +27,19 @@ static class UiThread
             // without hiding a different one.
             var site = ex.TargetSite is { } method ? $"{method.DeclaringType?.Name}.{method.Name}" : "unknown";
             ErrorThrottle.Report("ui:" + site, $"Something went wrong in OzServer ({site}): {ex.Message}", ex);
+        }
+        finally
+        {
+            // The measuring must not be the thing that lets an exception out of here.
+            try
+            {
+                PluginWork.Ui(action,
+                    (System.Diagnostics.Stopwatch.GetTimestamp() - started) * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
+                    PluginWork.Allocated() - allocated);
+            }
+            catch (Exception)
+            {
+            }
         }
     };
 }

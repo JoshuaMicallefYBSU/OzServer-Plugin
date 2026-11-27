@@ -28,6 +28,17 @@ namespace OzServerPlugin;
 // 3. Render runs on its own thread and does not catch exceptions caused by map data, so a mistake
 //    here stops the scope drawing permanently. See MutationSafety before changing how maps or
 //    points are published.
+//
+// 4. Every infill a scope paints costs vatSys memory it never gets back. PaintMap opens a Direct2D
+//    geometry sink for each infill of each visible map and does not dispose it, and SharpDX does
+//    not release a COM object from a finalizer unless told to (Configuration.EnableReleaseOnFinalizer,
+//    which vatSys leaves off). Measured against vatSys's own SharpDX: 460 bytes of native memory
+//    for a three-point shape, 2.7 KB for a 200-point one, every time the background is redrawn -
+//    which is every frame of a pan or zoom. That is vatSys's leak, with or without this plugin, but
+//    a layer's pool is all infills: the three fill layers of RequestedSectorOverlay, 64 slots each
+//    and visible all session, added 192 sinks - 88 KB - to every background redraw of every scope
+//    while showing nothing. So a layer is on a scope only while it has shapes to draw
+//    (EnsureVisible), and an empty one costs nothing.
 public sealed class AsdMapLayer
 {
     // All layers are reasserted on one timer: a scope opened after a layer was created has not
@@ -59,6 +70,8 @@ public sealed class AsdMapLayer
     // way. Reassert applies them; without this they waited for the next change of shape, which
     // SetPolygons no longer passes on when the shapes are the same.
     bool _polygonsPending;
+    // Whether EnsureVisible last put the layer on the scopes or took it off. UI thread only.
+    bool _assertedVisible;
     DisplayMaps.Map? _map;
     DisplayMaps.Map.BasePolygon[]? _pool;
 
@@ -123,7 +136,8 @@ public sealed class AsdMapLayer
 
     // The fast path: swaps the points and requests a repaint. Creating the map and asserting its
     // visibility walk every loaded map and every open form, so they are left to the timer - except
-    // on the first call, when the layer has to exist before it can take points.
+    // on the first call, when the layer has to exist before it can take points, and when the layer
+    // goes from empty to drawn or back, which must not wait up to ReassertInterval to show.
     void ApplyNow()
     {
         if (!DisplayMaps.Loaded)
@@ -134,6 +148,10 @@ public sealed class AsdMapLayer
             if (_map == null)
             {
                 EnsureMap();
+                EnsureVisible();
+            }
+            else if (HasShapes() != _assertedVisible)
+            {
                 EnsureVisible();
             }
 
@@ -192,6 +210,12 @@ public sealed class AsdMapLayer
     {
         lock (_lock)
             return _polygonsPending;
+    }
+
+    bool HasShapes()
+    {
+        lock (_lock)
+            return _polygons.Count > 0;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -315,13 +339,22 @@ public sealed class AsdMapLayer
         }
     }
 
-    // Returns whether any scope had to be told to show the layer.
+    // Puts the layer on every radar scope while it has shapes to draw and takes it off them while
+    // it has none - see point 4 of the class comment for why an empty layer must not stay on.
+    // Returns whether any scope had to be told.
+    //
+    // SetMapVisible is what vatSys's own map toggles call: it swaps in new render parameters under
+    // a lock, and the renderer takes one snapshot of them per frame, so a map comes and goes
+    // between frames, never part way through one.
     bool EnsureVisible()
     {
         var changed = false;
         var map = _map;
         if (map == null)
             return false;
+
+        var wanted = HasShapes();
+        _assertedVisible = wanted;
 
         foreach (var asd in AsdControls())
         {
@@ -336,7 +369,8 @@ public sealed class AsdMapLayer
             // The radar scopes only - vatSys's main display and popped-out ASD windows - not a
             // ground (ASMGCS) window, which uses the same control: request shading for an enroute or
             // TMA sector painted orange across YPPH's ground map. Taken off one that already has it.
-            if (IsGroundDisplay(asd))
+            // And off every scope while there is nothing to draw.
+            if (!wanted || IsGroundDisplay(asd))
             {
                 if (visible)
                 {

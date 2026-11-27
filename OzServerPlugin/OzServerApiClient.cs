@@ -366,8 +366,8 @@ public class OzServerFdrUpdateDto
     [JsonProperty("des_lon")] public double? DesLon { get; set; }
 }
 
-// A stored flight record as /fdr/sync returns it: everything that was pushed, plus when the server
-// last heard about it.
+// A stored flight record as /fdr/sync returns it: what was pushed, plus when the server last heard
+// about it. From GetAllFlightsAsync the flight plan fields are left out - see there.
 public class OzServerFdrRecordDto : OzServerFdrUpdateDto
 {
     [JsonProperty("last_seen_at")] public DateTimeOffset? LastSeenAt { get; set; }
@@ -706,10 +706,53 @@ public class OzServerApiClient
     }
 
     // Every flight record this server holds, for FdrResumeActivation (which on reconnect
-    // activates and positions the ones vatSys has not) and LabelStateMirror. The backend leaves
-    // route_points, most of a record's size, out of this list; GetFlightAsync returns it.
-    public Task<List<OzServerFdrRecordDto>> GetAllFlightsAsync() =>
-        GetAsync<List<OzServerFdrRecordDto>>("/fdr/sync", () => new List<OzServerFdrRecordDto>());
+    // activates and positions the ones vatSys has not) and LabelStateMirror.
+    //
+    // Asked for as the state view (?view=state): who holds each flight, its label and where it
+    // is, without the flight plan - the route, remarks, aircraft and aerodromes - which is most of
+    // a record and which neither reader looks at. So a record from this list has those properties
+    // null; GetFlightAsync returns a whole one. This is fetched every few seconds by every
+    // connected plugin, and whole it was the largest thing the plugin allocated. A backend older
+    // than the parameter ignores it and answers in full, which reads the same.
+    //
+    // reuseWithin lets a caller take the list another caller fetched that recently instead of
+    // fetching its own: FdrResumeActivation's scan every 20 seconds rides on LabelStateMirror's
+    // fetch every few. The list and its records are shared then, so no caller changes them.
+    public async Task<List<OzServerFdrRecordDto>> GetAllFlightsAsync(TimeSpan? reuseWithin = null)
+    {
+        if (!OzServerMode.RequestsAllowed)
+            throw new OzServerApiException(OzServerMode.DisabledMessage);
+
+        // One session's list is never handed to another: a different callsign or server is a
+        // different set of records.
+        var (cid, callsign, server) = GetCredentials();
+        var session = $"{cid}|{callsign}|{server}";
+
+        if (reuseWithin is { } window)
+        {
+            lock (FlightsGate)
+            {
+                if (_flights != null && _flightsFor == session && DateTime.UtcNow - _flightsAt <= window)
+                    return _flights;
+            }
+        }
+
+        var flights = await GetAsync<List<OzServerFdrRecordDto>>(
+            "/fdr/sync", () => new List<OzServerFdrRecordDto>(), query: "view=state").ConfigureAwait(false);
+
+        lock (FlightsGate)
+        {
+            _flights = flights;
+            _flightsAt = DateTime.UtcNow;
+            _flightsFor = session;
+        }
+        return flights;
+    }
+
+    static readonly object FlightsGate = new();
+    static List<OzServerFdrRecordDto>? _flights;
+    static DateTime _flightsAt;
+    static string? _flightsFor;
 
     // The Arrival List window's data - see ArrivalListWindow.
     public Task<OzServerArrivalListDto> GetArrivalListAsync(string ades) =>
@@ -751,13 +794,16 @@ public class OzServerApiClient
     public Task PublishAtisAsync(OzServerAtisPublishDto atis) =>
         PutAsync($"/vatsim/atis/{Uri.EscapeDataString(atis.Icao)}", atis);
 
-    async Task<T> GetAsync<T>(string path, Func<T> empty, TimeSpan? timeout = null)
+    // query is further parameters, already encoded ("view=state"); the log names the path alone.
+    async Task<T> GetAsync<T>(string path, Func<T> empty, TimeSpan? timeout = null, string? query = null)
     {
         if (!OzServerMode.RequestsAllowed)
             throw new OzServerApiException(OzServerMode.DisabledMessage);
 
         var (cid, callsign, server) = GetCredentials();
         var url = $"{OzServerSettings.BaseUrl}/api/v1{path}?controller_cid={cid}&controller_callsign={Uri.EscapeDataString(callsign)}&server={Uri.EscapeDataString(server)}";
+        if (!string.IsNullOrEmpty(query))
+            url += "&" + query;
 
         HttpResponseMessage response;
         try
@@ -782,9 +828,9 @@ public class OzServerApiClient
 
         using (response)
         {
-            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
+                var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                 var (message, conflicts) = ParseError(body, (int)response.StatusCode);
                 ActionLog.LogAttempt("GET", path, false, message);
                 throw new OzServerApiException(message, (int)response.StatusCode, conflicts);
@@ -793,8 +839,27 @@ public class OzServerApiClient
             ActionLog.LogAttempt("GET", path, true);
             // An answer means the API is up: a restart announced earlier is over (ApiOutage).
             ApiOutage.End("API answered");
-            return JsonConvert.DeserializeObject<T>(body) ?? empty();
+            return await ReadJsonAsync<T>(path, response.Content).ConfigureAwait(false) ?? empty();
         }
+    }
+
+    // Parses a response from the bytes HttpClient has already buffered, without first making one
+    // string of them. /fdr/sync is every flight on the server and is fetched every few seconds: as
+    // a string it was twice the size of the bytes, and anything over 85 KB goes on the large
+    // object heap, which is only tidied by a full collection and which a 32-bit vatSys has little
+    // room for. The buffer itself is still one such allocation per response.
+    //
+    // The serialiser is the one JsonConvert.DeserializeObject would build, defaults and all.
+    static async Task<T?> ReadJsonAsync<T>(string path, HttpContent content)
+    {
+        using var stream = await content.ReadAsStreamAsync().ConfigureAwait(false);
+        PluginWork.Api(path, stream.CanSeek ? stream.Length : 0);
+
+        using var text = new System.IO.StreamReader(stream, Encoding.UTF8);
+        using var json = new JsonTextReader(text);
+        var serializer = JsonSerializer.CreateDefault();
+        serializer.CheckAdditionalContent = true;
+        return serializer.Deserialize<T>(json);
     }
 
     async Task PostAsync(string path) => await PostRawAsync(path).ConfigureAwait(false);
@@ -843,6 +908,7 @@ public class OzServerApiClient
         using (response)
         {
             var responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            PluginWork.Api(path, responseBody.Length);
             if (!response.IsSuccessStatusCode)
             {
                 var (message, conflicts) = ParseError(responseBody, (int)response.StatusCode);
@@ -882,6 +948,7 @@ public class OzServerApiClient
         using (response)
         {
             var responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            PluginWork.Api(path, responseBody.Length);
             if (!response.IsSuccessStatusCode)
             {
                 var (message, _) = ParseError(responseBody, (int)response.StatusCode);

@@ -35,6 +35,7 @@ public class BadVectorsAtisSync
     // push more than once per broadcast. The controls live for the plugin's lifetime, so nothing
     // is ever removed.
     readonly List<object> _subscribed = new();
+    Type? _pluginType;
 
     // Every station still on the air is pushed again this often - see AtisSync.
     static readonly TimeSpan RefreshInterval = TimeSpan.FromMinutes(20);
@@ -61,9 +62,13 @@ public class BadVectorsAtisSync
                     _ = PushAsync(control, quiet: true);
             }
 
-            var pluginType = AppDomain.CurrentDomain.GetAssemblies()
-                .FirstOrDefault(a => a.GetName().Name == "ATISPlugin")
+            // Kept once found: an assembly is never unloaded. Until then by FullName, which the
+            // runtime caches, rather than GetName(), which builds a new AssemblyName for every
+            // assembly in the process on every pass.
+            _pluginType ??= AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.FullName.StartsWith("ATISPlugin,", StringComparison.Ordinal))
                 ?.GetType("ATISPlugin.Plugin");
+            var pluginType = _pluginType;
             if (pluginType == null)
                 return;
 

@@ -81,7 +81,14 @@ public sealed class ExternalControl
 
     // Every controller vatSys lists, plugin users included - OzServer sorts them out. This session
     // is not in vatSys's list.
-    static List<OzServerNetworkControllerDto> SeenControllers() =>
+    static List<OzServerNetworkControllerDto> SeenControllers()
+    {
+        // Every controller's position is needed many times over in here - see OnePass.
+        using (PrimaryPosition.OnePass())
+            return ListSeenControllers();
+    }
+
+    static List<OzServerNetworkControllerDto> ListSeenControllers() =>
         PrimaryPosition.OnlineRealAtcs()
             .Where(atc => PrimaryPosition.IsControllerCallsign(atc.Callsign))
             .GroupBy(atc => atc.Callsign, StringComparer.OrdinalIgnoreCase)

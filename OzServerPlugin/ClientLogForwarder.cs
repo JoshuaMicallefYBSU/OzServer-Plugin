@@ -46,6 +46,7 @@ public class ClientLogForwarder
 
     public ClientLogForwarder()
     {
+        MemoryBreakdown.Track("ClientLogForwarder.queued", () => _queued.Count);
         ActionLog.StructuredLineWritten += OnLine;
         _timer = new System.Threading.Timer(_ => _ = FlushAsync(), null, FlushInterval, FlushInterval);
     }

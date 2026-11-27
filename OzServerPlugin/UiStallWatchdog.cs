@@ -17,7 +17,8 @@ namespace OzServerPlugin;
 //
 // Also logs the process's memory and handle counts every MemoryEvery (and with each stall), so a
 // slow climb over a long session shows in the logs. ML-SNO_CTR froze 3.5 hours into a session on
-// 16 Nov with nothing to say whether vatSys had run short of memory, GDI handles or neither.
+// 16 Nov with nothing to say whether vatSys had run short of memory, GDI handles or neither. Each
+// memory line is followed by MemoryBreakdown's two, which say what the totals are made of.
 public sealed class UiStallWatchdog
 {
     static readonly TimeSpan Interval = TimeSpan.FromSeconds(2);
@@ -38,9 +39,6 @@ public sealed class UiStallWatchdog
 
     void Probe()
     {
-        if (OzServerMode.Disabled)
-            return;
-
         if (DateTime.UtcNow - _lastMemory >= MemoryEvery)
         {
             _lastMemory = DateTime.UtcNow;
@@ -57,7 +55,27 @@ public sealed class UiStallWatchdog
                 handles = memory.Handles,
                 gen2_collections = GC.CollectionCount(2)
             });
+
+            // What those totals are made of, then what the plugin itself did meanwhile - see
+            // MemoryBreakdown and PluginWork.
+            //
+            // Contained here as well as inside each: this is a timer thread, where an exception
+            // nothing catches ends vatSys, and none of this is worth that.
+            try
+            {
+                MemoryBreakdown.Log(memory.User);
+                PluginWork.Log();
+            }
+            catch (Exception)
+            {
+            }
         }
+
+        // Only the stall probe stops with OzServer disabled. The memory lines above carry on: they
+        // read and write nothing but the log file, and a disabled session is the baseline that
+        // shows whether vatSys grows the same way without the plugin doing anything.
+        if (OzServerMode.Disabled)
+            return;
 
         if (Application.OpenForms["MainForm"] is not Control main || !main.IsHandleCreated)
             return;

@@ -24,8 +24,18 @@ public class PendingSectorGhosts
     // Short, because a slow correction after vatSys's recompute reads as a flicker.
     static readonly TimeSpan ReassertInterval = TimeSpan.FromSeconds(1);
 
+    // The least time between two passes asked for by updates. One queued pass at a time was not
+    // a limit on how often they ran: while a request is pending every update queues the next pass
+    // the moment the last one finishes, and in busy airspace updates arrive tens of times a
+    // second, each pass walking every flight plan on vatSys's UI thread. A ghost vatSys has just
+    // recomputed away is back within this long, which is a frame or two of the scope.
+    static readonly TimeSpan MinGap = TimeSpan.FromMilliseconds(100);
+
     readonly OzServerOwnershipTracker _tracker;
     readonly System.Threading.Timer _timer;
+    // Fires the pass an update asked for less than MinGap after the last one.
+    readonly System.Threading.Timer _deferred;
+    long _lastPass;
     readonly object _lock = new();
 
     // One Apply at a time. vatSys dispatches OnFDRUpdate and OnRadarTrackUpdate through Task.Run
@@ -51,6 +61,20 @@ public class PendingSectorGhosts
 
         _timer = new System.Threading.Timer(_ => RunOnUiThread(Apply), null,
             ReassertInterval, ReassertInterval);
+        _deferred = new System.Threading.Timer(_ =>
+            {
+                // A timer thread: nothing above this would catch a post that fails while the main
+                // form is closing. The one-second timer still makes the pass.
+                try
+                {
+                    PostQueued();
+                }
+                catch (Exception)
+                {
+                    System.Threading.Interlocked.Exchange(ref _queued, 0);
+                }
+            }, null,
+            System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
     }
 
     // Called by the Sectors window whenever staging changes, including when Cancel or closing the
@@ -67,22 +91,33 @@ public class PendingSectorGhosts
     // because Apply writes Track.State, which is vatSys UI state, and these callbacks arrive on
     // pool threads.
     //
-    // Posted only while there is something to paint or hand back, and at most one pass waits on
-    // the UI thread at a time. Posting one per update queued hundreds of passes a second onto
-    // vatSys's UI thread in busy airspace - each forcing a full map redraw while a request was
-    // pending - and froze the scope on slower PCs (ML-BLA_CTR and ML-GUN_CTR, 16 Nov).
+    // Posted only while there is something to paint or hand back, at most one pass waits at a
+    // time, and no sooner than MinGap after the last. Posting one per update queued hundreds of
+    // passes a second onto vatSys's UI thread in busy airspace - each forcing a full map redraw
+    // while a request was pending - and froze the scope on slower PCs (ML-BLA_CTR and ML-GUN_CTR,
+    // 16 Nov).
     public void Reassert()
     {
         if (!_active)
             return;
         if (System.Threading.Interlocked.Exchange(ref _queued, 1) == 1)
             return;
+
+        var sinceLast = TimeSpan.FromSeconds(
+            (System.Diagnostics.Stopwatch.GetTimestamp() - System.Threading.Interlocked.Read(ref _lastPass))
+            / (double)System.Diagnostics.Stopwatch.Frequency);
+        if (sinceLast >= MinGap)
+            PostQueued();
+        else
+            _deferred.Change(MinGap - sinceLast, System.Threading.Timeout.InfiniteTimeSpan);
+    }
+
+    void PostQueued() =>
         RunOnUiThread(() =>
         {
             System.Threading.Interlocked.Exchange(ref _queued, 0);
             Apply();
         });
-    }
 
     // Whether the last pass had anything pending or painted. Read by Reassert from pool threads.
     volatile bool _active;
@@ -100,6 +135,8 @@ public class PendingSectorGhosts
 
         try
         {
+            System.Threading.Interlocked.Exchange(ref _lastPass, System.Diagnostics.Stopwatch.GetTimestamp());
+
             var pending = PendingSectors();
             // Disabled: nothing is pending, so whatever is painted is handed back to vatSys.
             if (OzServerMode.Disabled)
@@ -113,9 +150,9 @@ public class PendingSectorGhosts
 
             var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // One snapshot for the whole pass. FDP2.GetFDRs is vatSys's live collection, mutated
-            // from its own threads, so it is never enumerated directly.
-            var fdrs = FDP2.GetFDRs.ToList();
+            // One snapshot for the whole pass. FDP2.GetFDRs is already a copy of vatSys's list
+            // (FDRs.ToList()), so it is not copied again here.
+            var fdrs = FDP2.GetFDRs;
 
             foreach (var fdr in fdrs)
             {

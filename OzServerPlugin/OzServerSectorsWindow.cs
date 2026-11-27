@@ -1855,6 +1855,12 @@ public class OzServerSectorsWindow : BaseForm
             return;
         }
 
+        // Every listed sector asks what each online controller's position is, to see what is
+        // staffed: about 270 sectors times everyone online, each a walk of Positions.xml, on the
+        // UI thread, every second or two while the window is open. Inside the pass each position
+        // is worked out once - see PrimaryPosition.OnePass.
+        using var pass = PrimaryPosition.OnePass();
+
         // Once for the whole pass, not once per sector - see FindController.
         RefreshOnlineControllerIndex();
 

@@ -48,7 +48,51 @@ public static class PrimaryPosition
     // deep.
     const int MaxDepth = 8;
 
+    // A pass over every controller online asks for the same positions again and again: each
+    // controller's position, then, for each sector in it, every other controller's position to see
+    // what is staffed. ExternalControl does that every 15 seconds, and with C controllers online it
+    // came to about C x C x sectors-per-position walks of Positions.xml - tens of megabytes of
+    // short-lived lists a pass on a busy night. Inside OnePass each position is worked out once.
+    //
+    // Per thread, and only for as long as the scope is open: an answer depends on who is online,
+    // so it is good for one pass and no longer.
+    [ThreadStatic]
+    static Dictionary<string, List<SectorsVolumes.Sector>>? _pass;
+
+    public static IDisposable OnePass()
+    {
+        if (_pass != null)
+            return NoScope.Instance; // already inside one
+        _pass = new Dictionary<string, List<SectorsVolumes.Sector>>(StringComparer.Ordinal);
+        return new PassScope();
+    }
+
+    sealed class PassScope : IDisposable
+    {
+        public void Dispose() => _pass = null;
+    }
+
+    sealed class NoScope : IDisposable
+    {
+        public static readonly NoScope Instance = new();
+        public void Dispose()
+        {
+        }
+    }
+
     public static List<SectorsVolumes.Sector> DefaultSectorsFor(string? callsign)
+    {
+        var pass = _pass;
+        if (pass == null || string.IsNullOrEmpty(callsign))
+            return ComputeDefaultSectorsFor(callsign);
+
+        if (!pass.TryGetValue(callsign!, out var known))
+            pass[callsign!] = known = ComputeDefaultSectorsFor(callsign);
+        // A copy: callers have always been handed a list of their own.
+        return new List<SectorsVolumes.Sector>(known);
+    }
+
+    static List<SectorsVolumes.Sector> ComputeDefaultSectorsFor(string? callsign)
     {
         if (string.IsNullOrEmpty(callsign))
             return new List<SectorsVolumes.Sector>();

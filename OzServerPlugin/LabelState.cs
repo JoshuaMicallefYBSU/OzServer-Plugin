@@ -177,6 +177,8 @@ public sealed class LabelStateMirror
 
     public LabelStateMirror()
     {
+        MemoryBreakdown.Track("LabelStateMirror.applied", () => _applied.Count);
+
         _timer = new System.Threading.Timer(_ => _ = RefreshAsync(), null, FallbackInterval, FallbackInterval);
 
         OzServerEventStream.Shared.EventReceived += name =>

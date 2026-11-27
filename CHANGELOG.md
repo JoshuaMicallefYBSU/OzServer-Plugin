@@ -6,6 +6,17 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
 
 ## [Unreleased]
 
+### Fixed
+
+- **vatSys's memory growing over a long session.** Two things were growing for as long as vatSys
+  stayed open:
+  - The sector request shading sat on the scope all session, even with nothing to shade, and
+    vatSys loses a little memory for every filled shape it paints whenever the scope is panned or
+    zoomed. The shading is now on the scope only while a request is showing.
+  - vatSys keeps every window and menu it has ever opened - each level, time and handoff menu
+    included - after it is closed. OzServer now releases them once a minute.
+- A flight plan vatSys had deleted could be kept in memory for the rest of the session.
+
 ### Added
 
 - **Inbound flights are activated automatically.** An IFR flight plan that is still pre-active,
@@ -15,6 +26,25 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
   the tag. Only the controller holding the first such sector along the route activates it, and
   every other OzServer controller's copy follows. VFR flight plans, and flights already inside a
   held sector (such as an IFR departure from inside your airspace), are still activated by hand.
+- The memory line the log records every 15 minutes is followed by four more: every window in
+  vatSys by the window that owns it and by type, each named with the plugin it belongs to; how
+  many flight plans, radar tracks, maps, loaded assemblies and threads vatSys is holding; the
+  closed windows released; and how much work the plugin itself did - time in its update handlers
+  and on vatSys's display, memory allocated, and how much it fetched from OzServer. A long session
+  that slows down now shows what was growing, and whether the plugin was busy.
+
+### Changed
+
+- The memory lines carry on after **Disable OzServer**, so a disabled session can be compared
+  with a normal one. They are written to the log file only.
+- Less work in the background: the flight list fetched every few seconds no longer carries each
+  flight's plan and route (once OzServer is updated to match), is fetched once rather than by two
+  parts of the plugin separately, and is read without a second full copy of it. The list of
+  controllers online is worked out once per report rather than once per sector per controller, and
+  the Sectors window does the same while it is open.
+- Less work on vatSys's display: while a sector request is pending, the aircraft it would move are
+  re-marked at most ten times a second rather than on every radar and flight plan update, and a
+  handover no longer sends its flight plan update from the display's own thread.
 
 ## [0.3.3] - 2026-11-25
 

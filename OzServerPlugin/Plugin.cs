@@ -110,6 +110,8 @@ public class Plugin : IPlugin
         ErrorReporter.Install();
         // Logs when vatSys's UI thread stalls, whatever is holding it - see UiStallWatchdog.
         _uiStallWatchdog = new UiStallWatchdog();
+        // Lets go of the closed windows vatSys keeps hold of - see ClosedWindowSweep.
+        ClosedWindowSweep.Start();
         // Before anything that writes MMI.SectorsControlled, so its first snapshot predates any
         // change this plugin makes to the list.
         MmiSectorWatch.Install();
@@ -676,6 +678,7 @@ public class Plugin : IPlugin
     static void Isolate(string category, Action work)
     {
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var allocated = PluginWork.Allocated();
         try
         {
             work();
@@ -687,6 +690,9 @@ public class Plugin : IPlugin
         finally
         {
             HandlerTiming.Record(category, started);
+            PluginWork.Handler(category,
+                (System.Diagnostics.Stopwatch.GetTimestamp() - started) * 1000.0 / System.Diagnostics.Stopwatch.Frequency,
+                PluginWork.Allocated() - allocated);
         }
     }
 }
