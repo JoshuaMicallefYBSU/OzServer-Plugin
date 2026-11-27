@@ -52,7 +52,10 @@ public class InboundActivation
     readonly System.Threading.Timer _timer;
     readonly object _gate = new();
     // Held by reference, as FdrResumeActivation's: a new FDR for the same callsign is a new flight.
-    readonly HashSet<FDP2.FDR> _done = new();
+    // A weak set, as that one is: these are inbound flights, many of them long-haul, and a set
+    // that kept each one after vatSys deleted it would hold a megabyte or more apiece until the
+    // next disconnect - see WeakSet. _waitingSince needs none: it is pruned on every scan.
+    readonly WeakSet<FDP2.FDR> _done = new();
     // When this client first found each flight due for activation by another holder.
     readonly Dictionary<FDP2.FDR, DateTime> _waitingSince = new();
     int _session;

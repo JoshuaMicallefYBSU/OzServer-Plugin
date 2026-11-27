@@ -72,7 +72,12 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 | `ClientLogForwarder.cs` | Forwards log lines to `POST /client-logs` |
 | `ErrorThrottle.cs` | Stops a repeating failure flooding the vatSys Errors window |
 | `ErrorReporter.cs` | Copies every error the plugin raises into the log, so it is forwarded to OzServer |
-| `UiThread.cs` | Contains exceptions thrown by work the plugin runs on vatSys's UI thread |
+| `UiThread.cs` | Contains exceptions thrown by work the plugin runs on vatSys's UI thread, and times it |
+| `UiStallWatchdog.cs` | Logs a stalled UI thread and, every 15 minutes, vatSys's memory and handle counts |
+| `MemoryBreakdown.cs` | What those counts are made of: every window by owner and type, and what vatSys is holding |
+| `PluginWork.cs` | The plugin's own share of the work since the last memory line: handler and UI-thread time, allocation, API volume |
+| `ClosedWindowSweep.cs` | Releases the closed windows vatSys keeps registered as message filters and never collects |
+| `WeakSet.cs` | A set of vatSys flight records that does not keep them alive |
 | `MmiSectorWatch.cs` | Logs what removes a sector from `MMI.SectorsControlled` |
 
 ### Sector ownership
