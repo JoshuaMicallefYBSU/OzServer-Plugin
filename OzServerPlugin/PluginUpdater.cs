@@ -292,23 +292,39 @@ public class PluginUpdater
     // start. A window rather than a line in the Errors window, which read as one more error and
     // was left unread for whole sessions.
     //
-    // Called from the timer thread, possibly while vatSys is still starting, so it waits for the
-    // main window before posting to it. If that never appears the Errors window is used after all.
-    static async Task AnnounceAsync(Version installed, Version? running)
-    {
-        var message = UpdateMessage(installed, canRestart: true);
+    // If the main window never appears the Errors window is used after all. vatSys prefixes the
+    // source, so the line reads "OzServer: A new version ...". An OzServerNotice, so it is not
+    // reported as a failure.
+    static Task AnnounceAsync(Version installed, Version? running) =>
+        ShowNoticeAsync(
+            mainForm => new SectorNoticeWindow(
+                UpdateMessage(installed, canRestart: true), NoticeCaption, "Restart", () => RestartVatSys(mainForm)),
+            () => OzErrors.Add(new OzServerNotice(UpdateMessage(installed, canRestart: false).Replace(Environment.NewLine, " ")), "OzServer"));
 
+    // Tells the controller that the version now running was installed as vatSys started
+    // (LaunchHandover), in the same window the restart notice uses. It asks nothing of them, so
+    // its one button is OK - and so a vatSys whose main window never appears is told nothing:
+    // a line in the Errors window would read as something having gone wrong.
+    internal static Task AnnounceAppliedAsync(Version? from) =>
+        ShowNoticeAsync(_ => new SectorNoticeWindow(AppliedMessage(from), NoticeCaption), ifNoMainWindow: null);
+
+    const string NoticeCaption = "OzServer update";
+
+    // Shows a notice over vatSys's main window, once there is one to show it over. Called from the
+    // timer thread, or from Plugin's constructor while vatSys is still behind its splash screen, so
+    // it waits for the main window to be on screen before posting to it.
+    static async Task ShowNoticeAsync(Func<System.Windows.Forms.Form, SectorNoticeWindow> create, Action? ifNoMainWindow)
+    {
         var waitedUntil = DateTime.UtcNow + NoticeWait;
         while (DateTime.UtcNow < waitedUntil)
         {
             try
             {
-                if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form { IsHandleCreated: true, IsDisposed: false } mainForm)
+                if (System.Windows.Forms.Application.OpenForms["MainForm"] is System.Windows.Forms.Form { IsHandleCreated: true, IsDisposed: false, Visible: true } mainForm)
                 {
                     mainForm.BeginInvoke(UiThread.Guard(() =>
                     {
-                        var notice = new SectorNoticeWindow(
-                            message, "OzServer update", "Restart", () => RestartVatSys(mainForm));
+                        var notice = create(mainForm);
                         notice.Show(mainForm);
                         notice.BringToFront();
                     }));
@@ -324,9 +340,7 @@ public class PluginUpdater
             await Task.Delay(500).ConfigureAwait(false);
         }
 
-        // vatSys prefixes the source, so the line reads "OzServer: A new version ...". An
-        // OzServerNotice, so it is not reported as a failure.
-        OzErrors.Add(new OzServerNotice(UpdateMessage(installed, canRestart: false).Replace(Environment.NewLine, " ")), "OzServer");
+        ifNoMainWindow?.Invoke();
     }
 
     // "Restart": closes vatSys and starts it again, so the controller does not have to reopen it by
@@ -379,6 +393,19 @@ public class PluginUpdater
         return $"OzServer {Display(installed)} has been downloaded!" + nl + nl
                + "OzServer has had an update. " + how + " Your AFV Frequencies, Sectors and Aircraft Tags "
                + "will all be saved for when you reconnect." + nl + nl
+               + "Thank you, OzServer Dev Team";
+    }
+
+    // What a controller is told after a launch-time update: it has happened, and asks nothing of
+    // them.
+    static string AppliedMessage(Version? from)
+    {
+        var nl = Environment.NewLine;
+        var was = from != null ? $" from {Display(from)}" : "";
+
+        return $"OzServer {RunningVersionDisplay} has been installed!" + nl + nl
+               + $"OzServer updated itself{was} while vatSys was starting. The new version is already running - "
+               + "there is nothing you need to do." + nl + nl
                + "Thank you, OzServer Dev Team";
     }
 

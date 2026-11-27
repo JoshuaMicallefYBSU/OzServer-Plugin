@@ -9,8 +9,9 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
 ### Changed
 
 - **A release that is already out when you open vatSys is running by the time vatSys has opened.**
-  It is downloaded, verified and started while vatSys is still loading, with no **OzServer update**
-  window and no restart. The check normally adds a fraction of a second to startup; if it gets no
+  It is downloaded, verified and started while vatSys is still loading, with no restart: an
+  **OzServer update** window then says which version was installed, and has only an OK button.
+  The check normally adds a fraction of a second to startup; if it gets no
   answer within 3 seconds, or the download takes more than 10, vatSys opens on the version you have
   and the update is installed in the background as before. A release published while vatSys is open
   still waits for a restart, and still offers one. The first update to arrive this way is the one

@@ -282,6 +282,10 @@ static class Scenarios
         // The update notice, for the version this build is.
         var running = Assembly.GetExecutingAssembly().GetName().Version!;
         await Shoot("update-window", () => Shots.Static(typeof(PluginUpdater), "AnnounceAsync", running, running));
+
+        // The notice after an update that was applied as vatSys started, from the version before.
+        var previous = new Version(running.Major, running.Minor, Math.Max(0, running.Build - 1));
+        await Shoot("update-applied-window", () => Shots.Static(typeof(PluginUpdater), "AnnounceAppliedAsync", previous));
     }
 
     // Opens whatever `open` opens, saves each new window, and closes it again.

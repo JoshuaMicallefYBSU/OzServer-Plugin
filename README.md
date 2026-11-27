@@ -129,8 +129,9 @@ vatSys opens and every five minutes afterwards. The vatSys Launcher can also upd
 is closed. It usually finds the plugin already current.
 
 A release that is already out when you open vatSys is applied while vatSys is starting: it is
-downloaded, verified and running by the time the main window appears, with nothing to click and no
-restart. The check normally adds a fraction of a second to startup. If it gets no answer within
+downloaded, verified and running by the time the main window appears, with no restart. An
+**OzServer update** window then tells you which version was installed; there is nothing to do but
+close it. The check normally adds a fraction of a second to startup. If it gets no answer within
 three seconds, or the download takes more than ten, vatSys opens on the version you have and the
 update carries on in the background.
 

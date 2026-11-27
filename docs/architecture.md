@@ -247,7 +247,9 @@ the same vatSys:
 3. once vatSys has finished loading plugins, the new build takes the old one's place in vatSys's
    own plugin list, so vatSys calls it directly and reports its version
 
-Nothing is shown to the controller; the log records `Updated from v… to v… as vatSys started`. The
+Once the main window is on screen the new build tells the controller, in an **OzServer update**
+window with only an OK button, which version was installed and that nothing is needed from them;
+the log records `Updated from v… to v… as vatSys started`. The
 `.live` copy and the backup stay open for that session and are deleted at a later start. A release
 published later in the same session is installed for the next start as usual, its backup named
 `.backup2`.

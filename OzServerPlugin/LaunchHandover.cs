@@ -114,6 +114,10 @@ static class LaunchHandover
         var from = Version.TryParse(_outgoingVersion, out var outgoingVersion)
             ? PluginUpdater.Display(outgoingVersion)
             : "an earlier version";
+
+        // Told once vatSys's main window is up: the update itself needed nothing from them, but a
+        // plugin that changes under a controller should say so.
+        _ = PluginUpdater.AnnounceAppliedAsync(outgoingVersion);
         ActionLog.Log("Update", $"Updated from {from} to {PluginUpdater.RunningVersionDisplay} as vatSys started - no restart needed.", new
         {
             action = "launch_handover",
