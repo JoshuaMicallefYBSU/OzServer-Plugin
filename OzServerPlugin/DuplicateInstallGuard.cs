@@ -28,26 +28,27 @@ static class DuplicateInstallGuard
     const string RunningCopyKey = "OzServerPlugin.RunningCopy";
     const string AssemblyIdentity = "OzServerPlugin";
 
-    // True for the copy that should run. Called first thing in Plugin's constructor.
+    // True for the copy that should run. Called at the top of Plugin's constructor.
     public static bool TryClaim()
     {
         var self = Assembly.GetExecutingAssembly();
-        var here = Describe(self.GetName().Version, self.Location);
+        var here = Describe(self.GetName().Version, LaunchHandover.InstalledPath);
         string? running;
 
         lock (AppDomain.CurrentDomain)
         {
             running = AppDomain.CurrentDomain.GetData(RunningCopyKey) as string;
-            if (running == null)
+            // A build the claimant itself started, to run in its place (LaunchHandover), is not a
+            // second copy: the claim passes to it.
+            if (running == null || LaunchHandover.Arrived)
+            {
                 AppDomain.CurrentDomain.SetData(RunningCopyKey, here);
+                running = null;
+            }
         }
 
         if (running == null)
-        {
-            // Off the load path: it reads every DLL's metadata under both plugin folders.
-            _ = Task.Run(() => ReportOtherCopies(self.Location));
             return true;
-        }
 
         // Errors.Add directly rather than OzErrors: nothing else in this copy is initialised.
         Report("Installed more than once. Running " + running + "; the copy " + here
@@ -57,6 +58,14 @@ static class DuplicateInstallGuard
 
     const string Advice = "Delete the copy you don't want and restart vatSys. The vatSys Launcher installs OzServer "
                           + @"into Plugins\OzServer-Plugin.";
+
+    // Names the other installed copies, which vatSys ignores. Called by the copy that goes on to
+    // run the session. Off the load path: it reads every DLL's metadata under both plugin folders.
+    public static void ReportOtherCopies()
+    {
+        var runningPath = LaunchHandover.InstalledPath;
+        _ = Task.Run(() => ReportOtherCopies(runningPath));
+    }
 
     static void ReportOtherCopies(string runningPath)
     {

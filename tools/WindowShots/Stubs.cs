@@ -7,6 +7,7 @@ namespace OzServerPlugin;
 public static class OzServerSettings
 {
     public const string BaseUrl = "http://127.0.0.1:9";
+    public const string PluginDownloadPrefix = BaseUrl + "/releases/download/";
 }
 
 // The plugin's log, kept in memory. The real one appends to the controller's ozserver_<date>.txt.

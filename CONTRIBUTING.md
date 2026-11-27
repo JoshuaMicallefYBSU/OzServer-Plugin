@@ -74,9 +74,14 @@ Every installed copy updates itself from this repository's GitHub releases, and 
    (`https://vatpac.org/api/Plugins`), which follows GitHub's *latest* release, and a pre-release
    or a draft is never "latest".
 
-The OzServer API picks a new release up within about five minutes, and each client installs it at
-its next check (as vatSys opens, then every five minutes until an update is installed) and shows
-the controller a window offering to restart vatSys for them. It takes effect the next time that controller starts vatSys.
+The OzServer API picks a new release up within about five minutes. A controller who opens vatSys
+after that is on it at once: the installed build installs and starts it while vatSys is loading.
+A controller already in vatSys gets it at their next check (every five minutes until an update is
+installed), with a window offering to restart vatSys for them, and it takes effect when they do.
+
+Because the installed build starts the new one from inside a running vatSys, run
+`tools\HandoverTest\Run.ps1` before releasing a change to `Plugin`'s constructor, `PluginUpdater` or
+`LaunchHandover` — see [At launch](docs/architecture.md#at-launch).
 
 Things to know:
 

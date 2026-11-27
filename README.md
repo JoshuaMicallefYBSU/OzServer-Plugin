@@ -128,10 +128,15 @@ You only install the plugin once. After that it keeps itself up to date: it chec
 vatSys opens and every five minutes afterwards. The vatSys Launcher can also update it, while vatSys
 is closed. It usually finds the plugin already current.
 
-An update never disturbs a running session. It is downloaded, verified, and put in place for the
-**next vatSys start**. When one has been installed an **OzServer update** window tells you a new
-version has been found. Its **Restart** button closes vatSys and opens it again for you. Because
-the check runs as vatSys opens, that is usually before you have connected.
+A release that is already out when you open vatSys is applied while vatSys is starting: it is
+downloaded, verified and running by the time the main window appears, with nothing to click and no
+restart. The check normally adds a fraction of a second to startup. If it gets no answer within
+three seconds, or the download takes more than ten, vatSys opens on the version you have and the
+update carries on in the background.
+
+A release published while vatSys is open never disturbs the running session. It is downloaded,
+verified, and put in place for the **next vatSys start**, and an **OzServer update** window tells
+you a new version has been found. Its **Restart** button closes vatSys and opens it again for you.
 
 If a new version ever fails to load, the previous one is still beside it as
 `OzServerPlugin.dll.backup` — close vatSys, delete `OzServerPlugin.dll`, and rename the backup

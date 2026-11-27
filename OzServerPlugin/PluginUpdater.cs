@@ -34,9 +34,13 @@ namespace OzServerPlugin;
 //   3. rename the running DLL to .backup and move .update into its place
 //   4. the next vatSys start loads the new DLL and deletes the .backup
 //
-// The running session keeps the version it started with. Neither staging file ends in .dll, so
-// vatSys never tries to load one, and the previous version stays on disk as .backup until a later
-// session has started successfully - recovering from a bad release is renaming that file back.
+// A session keeps the version it started with. Neither staging file ends in .dll, so vatSys never
+// tries to load one, and the previous version stays on disk as .backup until a later session has
+// started successfully - recovering from a bad release is renaming that file back.
+//
+// The one time a session can change version is before it has begun: a release found while vatSys
+// is still starting is installed there and then (InstallNewerAtLaunch) and the session handed to
+// it - see LaunchHandover.
 public class PluginUpdater
 {
     const string Repository = "JoshuaMicallefYBSU/OzServer-Plugin";
@@ -47,7 +51,7 @@ public class PluginUpdater
 
     // The only location a download is accepted from, whichever source named it. A compromised
     // OzServer can choose among published releases but cannot serve a file of its own.
-    const string DownloadPrefix = "https://github.com/" + Repository + "/releases/download/";
+    const string DownloadPrefix = OzServerSettings.PluginDownloadPrefix;
 
     // A release download in full: the prefix, a tag and an asset name, each a plain name. A prefix
     // match alone is not enough - Uri resolves "../" before the request is made, so a URL that
@@ -88,6 +92,21 @@ public class PluginUpdater
     // window: the check can finish while vatSys is still starting.
     static readonly TimeSpan NoticeWait = TimeSpan.FromSeconds(60);
 
+    // How long InstallNewerAtLaunch may hold up vatSys's start: for the answer about the current
+    // release, which every launch waits for, and then for the download, which only a launch that
+    // found a new release does. Past either, vatSys starts on the installed version and CheckAsync
+    // takes over.
+    static readonly TimeSpan LaunchCheckBudget = TimeSpan.FromSeconds(3);
+    static readonly TimeSpan LaunchDownloadBudget = TimeSpan.FromSeconds(10);
+
+    // Set by LaunchHandover when InstallNewerAtLaunch installed a release that the session could
+    // not then be handed to. It is on disk for the next start, like any other install.
+    internal static Version? InstalledAtLaunch;
+
+    // Set when InstallNewerAtLaunch was told there is nothing newer, moments before this updater
+    // was constructed: the check StartupDelay exists for has been made.
+    static bool _currentAtLaunch;
+
     // Held for the plugin's lifetime: vatSys gives a plugin no shutdown hook to dispose it in.
     readonly Timer _timer;
 
@@ -103,10 +122,92 @@ public class PluginUpdater
 
     public PluginUpdater()
     {
-        // The process that held the previous version open has exited, so its backup can go.
-        TryDeleteStaleBackup();
+        // The processes that held earlier versions open have exited, so what they left can go.
+        TryDeleteStaleFiles();
 
-        _timer = new Timer(_ => _ = CheckAsync(), null, StartupDelay, CheckInterval);
+        if (InstalledAtLaunch is { } installed)
+        {
+            // One install per session, and it has been made: nothing is left to check for, only
+            // the controller to tell.
+            _timer = new Timer(_ => { }, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            _ = AnnounceAsync(installed, Assembly.GetExecutingAssembly().GetName().Version);
+            return;
+        }
+
+        _timer = new Timer(_ => _ = CheckAsync(), null, _currentAtLaunch ? CheckInterval : StartupDelay, CheckInterval);
+    }
+
+    // The update check made before the plugin has started anything, so that a release already out
+    // when vatSys is opened can be the one this session runs (LaunchHandover). Finds, downloads,
+    // verifies and installs exactly as CheckAsync does, but waits for each step: the caller is
+    // Plugin's constructor, on vatSys's UI thread, behind the splash screen.
+    //
+    // The version now at installedPath, or null when there is nothing newer, or no answer in
+    // time. Throws for anything CheckAsync would report; CheckAsync, a few seconds later, meets
+    // the same failure and reports it.
+    internal static Version? InstallNewerAtLaunch(string installedPath, Version? current)
+    {
+        // Never disposed: a request this gives up on may still be reading the token.
+        var cancel = new CancellationTokenSource();
+
+        if (!TryWait(() => FindReleaseAsync(cancel.Token), LaunchCheckBudget, cancel, out var release))
+        {
+            ActionLog.Log("Update", $"No answer about the current release within {LaunchCheckBudget.TotalSeconds:0} s of starting; the check carries on in the background.");
+            return null;
+        }
+
+        if (release == null || release.Version.CompareTo(current) <= 0)
+        {
+            _currentAtLaunch = true;
+            return null;
+        }
+
+        // Another vatSys has replaced the file since this one loaded it. CheckAsync knows what to
+        // make of that.
+        if (OnDiskVersion(installedPath) is not { } onDisk || !onDisk.Equals(current))
+            return null;
+
+        var staged = installedPath + ".update";
+        if (!TryWait(async () => { await DownloadAsync(release, staged, cancel.Token).ConfigureAwait(false); return true; },
+                LaunchDownloadBudget, cancel, out _))
+        {
+            ActionLog.Log("Update", $"{release.Version} didn't download within {LaunchDownloadBudget.TotalSeconds:0} s of starting; it will be installed in the background.");
+            return null;
+        }
+
+        if (!IsValidUpgrade(staged, current))
+        {
+            // Left for CheckAsync to download again, discard, and stop checking over.
+            TryDelete(staged);
+            return null;
+        }
+
+        Install(installedPath, staged);
+
+        var installed = OnDiskVersion(installedPath) ?? release.Version;
+        ActionLog.Log("Update", $"Installed {installed} as vatSys started.");
+        return installed;
+    }
+
+    // Runs one step of the launch-time update and waits for it, for no longer than its budget.
+    // The step runs on the thread pool: the thread waiting is vatSys's UI thread, which an await
+    // inside the step must not be left to resume on. False when the budget ran out, and the step
+    // is then cancelled. A step that failed throws here.
+    static bool TryWait<T>(Func<Task<T>> step, TimeSpan budget, CancellationTokenSource cancel, out T result)
+    {
+        result = default!;
+
+        var task = Task.Run(step);
+        if (!task.Wait(budget))
+        {
+            cancel.Cancel();
+            // Its failure, when it comes, is nobody's to handle.
+            task.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            return false;
+        }
+
+        result = task.Result;
+        return true;
     }
 
     async Task CheckAsync()
@@ -114,7 +215,9 @@ public class PluginUpdater
         try
         {
             var current = Assembly.GetExecutingAssembly().GetName().Version;
-            var installedPath = Assembly.GetExecutingAssembly().Location;
+            // Not this assembly's own Location in a build that was handed the session at launch,
+            // which runs from a copy.
+            var installedPath = LaunchHandover.InstalledPath;
 
             // An assembly that was not loaded from a file on disk has nothing to replace.
             if (string.IsNullOrEmpty(installedPath) || !File.Exists(installedPath))
@@ -284,37 +387,39 @@ public class PluginUpdater
         Assembly.GetExecutingAssembly().GetName().Version is { } v ? Display(v) : "";
 
     // "v0.2.3" - the assembly's fourth part is dropped when it is unset or zero.
-    static string Display(Version version) =>
+    internal static string Display(Version version) =>
         "v" + (version.Revision > 0 || version.Build < 0 ? version.ToString() : version.ToString(3));
 
     // OzServer's answer if it gives one, GitHub's otherwise. Null when there is no release to offer.
-    static async Task<Release?> FindReleaseAsync()
+    static async Task<Release?> FindReleaseAsync(CancellationToken cancel = default)
     {
         // A disabled session sends nothing to OzServer, and this is no exception.
         if (!OzServerMode.Disabled)
         {
             try
             {
-                var (answered, release) = await GetOzServerReleaseAsync().ConfigureAwait(false);
+                var (answered, release) = await GetOzServerReleaseAsync(cancel).ConfigureAwait(false);
                 if (answered)
                     return release;
             }
-            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
+            // Not when the caller has given up: there is nobody left to ask GitHub for.
+            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException
+                                       && !cancel.IsCancellationRequested)
             {
                 ActionLog.Log("Update", $"OzServer couldn't be asked for the current release ({ex.Message}); asking GitHub instead.");
             }
         }
 
-        return await GetGitHubReleaseAsync().ConfigureAwait(false);
+        return await GetGitHubReleaseAsync(cancel).ConfigureAwait(false);
     }
 
     // Answered is false when OzServer has nothing usable to say - an older backend without the
     // endpoint, one that has not reached GitHub yet, or a reply naming a download this plugin will
     // not accept - and the caller should ask GitHub instead.
-    static async Task<(bool Answered, Release? Release)> GetOzServerReleaseAsync()
+    static async Task<(bool Answered, Release? Release)> GetOzServerReleaseAsync(CancellationToken cancel)
     {
         using var client = CreateClient();
-        using var response = await client.GetAsync(OzServerSettings.BaseUrl + "/api/v1/plugin/release").ConfigureAwait(false);
+        using var response = await client.GetAsync(OzServerSettings.BaseUrl + "/api/v1/plugin/release", cancel).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
             return (false, null);
 
@@ -339,10 +444,10 @@ public class PluginUpdater
     static string? StringOrNull(JToken? token) =>
         token != null && token.Type == JTokenType.String ? (string?)token : null;
 
-    static async Task<Release?> GetGitHubReleaseAsync()
+    static async Task<Release?> GetGitHubReleaseAsync(CancellationToken cancel)
     {
         using var client = CreateClient();
-        using var response = await client.GetAsync(GitHubReleasesApi).ConfigureAwait(false);
+        using var response = await client.GetAsync(GitHubReleasesApi, cancel).ConfigureAwait(false);
 
         // A repository with no releases answers 404, which is an ordinary state rather than a failure.
         if (response.StatusCode == HttpStatusCode.NotFound)
@@ -426,13 +531,21 @@ public class PluginUpdater
     static bool LooksRewritten(string url) =>
         url.Contains("..") || url.Contains("%") || url.Contains("\\");
 
-    static async Task DownloadAsync(Release release, string destination)
+    static async Task DownloadAsync(Release release, string destination, CancellationToken cancel = default)
     {
         using var client = CreateClient();
         client.MaxResponseContentBufferSize = MaxDownloadBytes;
-        var bytes = await client.GetByteArrayAsync(release.Url).ConfigureAwait(false);
+        // GetAsync rather than GetByteArrayAsync, which cannot be cancelled; otherwise the same
+        // request, and the same failure for anything but a success.
+        using var response = await client.GetAsync(release.Url, cancel).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        var bytes = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
 
         VerifyDownload(bytes, release);
+
+        // A launch that gave up waiting has gone on without this file, and CheckAsync is about to
+        // write the same one.
+        cancel.ThrowIfCancellationRequested();
 
         TryDelete(destination);
 
@@ -516,8 +629,7 @@ public class PluginUpdater
     // a loaded file, where it would refuse a delete or an overwrite.
     static void Install(string installedPath, string staged)
     {
-        var backup = installedPath + ".backup";
-        TryDelete(backup);
+        var backup = FreeBackupPath(installedPath);
 
         // If this throws, nothing has moved and the folder is as it was.
         File.Move(installedPath, backup);
@@ -534,13 +646,39 @@ public class PluginUpdater
         }
     }
 
-    static void TryDeleteStaleBackup()
+    // .backup, or .backup2 and so on when a backup of that name cannot be removed. A session that
+    // was handed over at launch still has the build vatSys loaded open as .backup, and a release
+    // published later in that session needs a name for the build it replaces.
+    static string FreeBackupPath(string installedPath)
+    {
+        for (var n = 1; n <= 9; n++)
+        {
+            var backup = installedPath + ".backup" + (n == 1 ? "" : n.ToString());
+            TryDelete(backup);
+            if (!File.Exists(backup))
+                return backup;
+        }
+
+        throw new IOException("The backups of earlier versions beside the plugin can't be removed.");
+    }
+
+    // The versions earlier sessions replaced, and the copies their launch-time updates ran from
+    // (LaunchHandover). Whatever a running vatSys still has open stays, as TryDelete leaves it -
+    // this session's own included.
+    static void TryDeleteStaleFiles()
     {
         try
         {
-            var installedPath = Assembly.GetExecutingAssembly().Location;
-            if (!string.IsNullOrEmpty(installedPath))
-                TryDelete(installedPath + ".backup");
+            var installedPath = LaunchHandover.InstalledPath;
+            if (string.IsNullOrEmpty(installedPath))
+                return;
+
+            var folder = Path.GetDirectoryName(installedPath)!;
+            var name = Path.GetFileName(installedPath);
+
+            foreach (var file in Directory.GetFiles(folder, name + ".backup*")
+                         .Concat(Directory.GetFiles(folder, LaunchHandover.CopyPattern(name))))
+                TryDelete(file);
         }
         catch
         {

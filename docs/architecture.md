@@ -66,7 +66,8 @@ All source is in [`OzServerPlugin/`](../OzServerPlugin).
 | `OzServerMode.cs` | The session-wide *Disable OzServer* switch |
 | `NetworkIdentity.cs` | The session's CID and callsign |
 | `NetworkServer.cs` | Which network the session is on: live, SweatBox 1 or SweatBox 2 |
-| `PluginUpdater.cs` | Self-update, staged to take effect at the next vatSys start |
+| `PluginUpdater.cs` | Self-update: installed as vatSys starts when a release is already out, otherwise staged for the next start |
+| `LaunchHandover.cs` | Starts a release installed as vatSys starts in place of the build vatSys loaded, so it runs without a restart |
 | `DuplicateInstallGuard.cs` | Reports other installed copies of the plugin, which vatSys silently ignores, and keeps a second loaded copy inert |
 | `ActionLog.cs` | The daily `ozserver_<date>.txt` log |
 | `ClientLogForwarder.cs` | Forwards log lines to `POST /client-logs` |
@@ -184,11 +185,13 @@ All under `{BaseUrl}/api/v1`. Every call carries `controller_cid`, `controller_c
 | Event stream reconnect | 2 s, backing off to 30 s |
 | HTTP timeout | 20 s; 6 s for the ownership sync |
 | Concurrent HTTP connections | 8 |
-| Update check | 3 s after start, then every 5 min until one is installed, with a 30 s timeout; retried after 2 min (up to 3 times) if neither source can be reached |
+| Update check | As vatSys starts, waiting at most 3 s for the answer and 10 s for a download; 3 s after start if that got no answer; then every 5 min until one is installed, with a 30 s timeout; retried after 2 min (up to 3 times) if neither source can be reached |
 
 ## Self-update
 
-`PluginUpdater` keeps the installed DLL current without interrupting a session.
+`PluginUpdater` keeps the installed DLL current without interrupting a session. A release that is
+already out when vatSys is opened runs in that session ([At launch](#at-launch)); one published
+during a session waits for the next start.
 
 **Choosing a release.** The updater asks OzServer (`GET /plugin/release`), which serves a cached
 copy of this repository's GitHub releases. If OzServer cannot answer — it is unreachable, is an
@@ -225,13 +228,48 @@ A successful install is reported once, in an **OzServer update** window whose **
 closes vatSys and opens it again. The vatSys Errors window is used instead only if vatSys's main
 window has not appeared within a minute.
 
+### At launch
+
+vatSys cannot unload the build it loaded — but until that build's `Plugin` constructor has started
+anything, there is nothing of it to stop. So the constructor checks for a release first
+(`PluginUpdater.InstallNewerAtLaunch`), on vatSys's UI thread behind the splash screen, waiting at
+most 3 s for the answer and 10 s for the download. Past either, or on any failure, the installed
+build starts as usual and the ordinary check carries on in the background.
+
+A newer release is verified and installed exactly as above, and `LaunchHandover` then starts it in
+the same vatSys:
+
+1. the installed DLL is copied to `OzServerPlugin.dll.<version>.live` and loaded with
+   `Assembly.LoadFile` — `LoadFrom`, and `LoadFile` on the installed path itself, both hand back
+   the build already loaded
+2. the new build's `Plugin` is constructed, and starts exactly as if vatSys had loaded it; the
+   build vatSys loaded starts nothing, and passes vatSys's calls on
+3. once vatSys has finished loading plugins, the new build takes the old one's place in vatSys's
+   own plugin list, so vatSys calls it directly and reports its version
+
+Nothing is shown to the controller; the log records `Updated from v… to v… as vatSys started`. The
+`.live` copy and the backup stay open for that session and are deleted at a later start. A release
+published later in the same session is installed for the next start as usual, its backup named
+`.backup2`.
+
+If the new build's constructor throws, neither build runs — whatever the new one had started
+cannot be taken back — and the Errors window says to restart vatSys.
+
+The build that hands over is whichever release a controller has installed, and the build it hands
+over to is always newer, so what passes between the two can never change: read the comment at the
+top of `LaunchHandover.cs` before changing that file or the top of `Plugin`'s constructor.
+`tools\HandoverTest\Run.ps1` runs the whole exchange through vatSys's own plugin loader, with a
+local server in place of OzServer and GitHub, and its `-OutgoingSource` builds the installed side
+from a checkout of an earlier release.
+
 ### Alongside the vatSys Launcher
 
 The [vatSys Launcher](https://github.com/badvectors/vatSysLauncher) installs plugins listed by
 VATPAC. It unzips the release zip into `Profiles\<profile>\Plugins\OzServer-Plugin` (the repository
 name), finds the install again by a file named `OzServerPlugin.dll`, and offers an update when that
 file's FileVersion is below the version VATPAC lists for the latest (non-pre-release) GitHub release.
-An update deletes the folder and unzips the new release into it, `.backup` included.
+An update deletes the folder and unzips the new release into it, `.backup` and `.live` files
+included.
 
 The two updaters don't conflict. The self-updater usually gets there first, and the launcher then
 sees a FileVersion at or above its own and offers nothing. Neither can be renamed away from the

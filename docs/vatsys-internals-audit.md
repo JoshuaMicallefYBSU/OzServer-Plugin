@@ -391,6 +391,15 @@ vatSys's own list is left alone (logged under `Arrivals`):**
   `Plugins.cs`'s constructor, no public contract.
 - The one-`try`/`catch`-per-plugin-per-call isolation granularity in `Plugins.cs`'s four dispatch
   methods.
+- `Plugins.instance`, its `Plugin[]` and `AssemblyName[]` fields, and the `IPlugin` field of
+  `vatsys.Plugin.Plugin` — all private, found by type rather than by name. After a launch-time update
+  `LaunchHandover.TakeOverRecord` puts the new build into them in the old one's place. If they change,
+  the old build goes on passing vatSys's calls along and only the version vatSys reports is stale
+  (logged as `launch_handover_record_kept`).
+- `Assembly.LoadFrom` binding a second file with the same assembly name to the build already loaded,
+  and `Assembly.LoadFile` doing the same for the path that build came from — why a launch-time update
+  runs from a `.live` copy. Runtime behaviour rather than vatSys's, but it rests on vatSys using
+  `LoadFrom`.
 - `Assembly.LoadFrom` without shadow-copying (no `AppDomainSetup` anywhere) — the whole basis for
   `PluginUpdater`'s stage-and-rename design. If a future vatSys version shadow-copies plugin assemblies,
   the stage/rename dance becomes unnecessary but stays harmless (`PluginUpdater` already checks the

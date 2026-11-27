@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!--
+      The plugin's own source, built as OzServerPlugin.dll at whatever -p:Version is asked for, with
+      two files left out and replaced (Stubs.cs): the addresses, so that updates come from the test
+      host's local server, and the log, so nothing is written to the controller's real log file.
+
+      -p:PluginSource is the checkout to compile, this one by default. Run.ps1 can point the build
+      that plays the installed version at a checkout of an earlier release, to check that what
+      that release hands over is still what this one expects.
+    -->
+    <PropertyGroup>
+        <TargetFramework>net472</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <LangVersion>latest</LangVersion>
+        <PlatformTarget>x86</PlatformTarget>
+        <AssemblyName>OzServerPlugin</AssemblyName>
+        <RootNamespace>OzServerPlugin</RootNamespace>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <DebugType>none</DebugType>
+        <!-- vatSys's own Newtonsoft.Json conflict, as in the plugin's build. -->
+        <NoWarn>$(NoWarn);MSB3277</NoWarn>
+        <PluginSource Condition="'$(PluginSource)' == ''">$(MSBuildThisFileDirectory)..\..\..</PluginSource>
+        <VatSysPath Condition="'$(VatSysPath)' == ''">$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Sawbe\vatSys@Path)</VatSysPath>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="$(PluginSource)\OzServerPlugin\**\*.cs"
+                 Exclude="$(PluginSource)\OzServerPlugin\obj\**;$(PluginSource)\OzServerPlugin\bin\**;$(PluginSource)\OzServerPlugin\Secrets.cs;$(PluginSource)\OzServerPlugin\OzServerSettings.cs;$(PluginSource)\OzServerPlugin\ActionLog.cs"
+                 LinkBase="Plugin" />
+        <Reference Include="vatSys"><HintPath>$(VatSysPath)\bin\vatSys.exe</HintPath><Private>False</Private></Reference>
+        <Reference Include="VATSYSControls"><HintPath>$(VatSysPath)\bin\VATSYSControls.dll</HintPath><Private>False</Private></Reference>
+        <Reference Include="Newtonsoft.Json"><HintPath>$(VatSysPath)\bin\Newtonsoft.Json.dll</HintPath><Private>False</Private></Reference>
+        <Reference Include="RossCarlson.Vatsim.Network"><HintPath>$(VatSysPath)\bin\RossCarlson.Vatsim.Network.dll</HintPath><Private>False</Private></Reference>
+        <Reference Include="System.IO.Compression" />
+        <Reference Include="System.IO.Compression.FileSystem" />
+        <Reference Include="System.ComponentModel.Composition" />
+        <Reference Include="System.Drawing" />
+        <Reference Include="System.Net.Http" />
+        <Reference Include="System.Windows.Forms" />
+    </ItemGroup>
+
+</Project>

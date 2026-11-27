@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!--
+      Checks the update a launch applies to itself (LaunchHandover) without opening vatSys or
+      touching a release: it runs vatSys's own plugin loader over a scratch folder, with a local
+      server playing OzServer and the release downloads. Nothing reaches OzServer, and nothing is
+      written to the controller's log or plugin folder.
+
+        tools\HandoverTest\Run.ps1
+
+      builds three test versions of the plugin (Build\TestBuild.csproj) and this host, then runs
+      every scenario and prints what each left running and on disk.
+    -->
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net472</TargetFramework>
+        <LangVersion>latest</LangVersion>
+        <!-- vatSys.exe is x86, and is loaded into this process. -->
+        <PlatformTarget>x86</PlatformTarget>
+        <AssemblyName>HandoverTest</AssemblyName>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <OutputPath>bin\</OutputPath>
+        <DebugType>none</DebugType>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- The test builds' own project, compiled separately. -->
+        <Compile Remove="Build\**" />
+        <Reference Include="System.Windows.Forms" />
+    </ItemGroup>
+
+</Project>

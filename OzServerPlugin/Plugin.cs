@@ -21,7 +21,7 @@ public class Plugin : IPlugin
     // What the hidden built-in entry is renamed to once our own entry takes over SectorsMenuItemName.
     const string HiddenSectorsMenuItemName = "sectorsToolStripMenuItem_hiddenByOzServer";
 
-    string IPlugin.Name => Name;
+    string IPlugin.Name => _successor?.Name ?? Name;
 
     OzServerSectorsWindow? _sectorsWindow;
     // Constructed at load, unlike the lazily created windows above: they must work whether or not
@@ -90,19 +90,40 @@ public class Plugin : IPlugin
     readonly List<ToolStripItem> _ozServerMenuItems = new();
     ToolStripMenuItem? _disableItem;
 
-    // Set on a second installed copy, which does nothing for the session - see DuplicateInstallGuard.
+    // Set on a copy that does nothing for the session: a second installed one (see
+    // DuplicateInstallGuard), or the build vatSys loaded once a newer one runs in its place.
     readonly bool _inactive;
+
+    // On the build vatSys loaded, the newer build it handed the session to as vatSys started, which
+    // vatSys's calls are passed on to - see LaunchHandover. Null in every other build.
+    readonly IPlugin? _successor;
 
     // An inactive copy returns before assigning the fields below; nothing reads them when it is.
 #pragma warning disable CS8618
     public Plugin()
     {
-        // Before anything else: a second copy must not start a single timer or touch vatSys.
+        // Before anything else: whether an older build started this one decides where "installed"
+        // is for everything below.
+        LaunchHandover.Receive();
+
+        // A second copy must not start a single timer or touch vatSys.
         if (!DuplicateInstallGuard.TryClaim())
         {
             _inactive = true;
             return;
         }
+
+        // A release already out is installed and started here, in this build's place. Before
+        // anything of this build is started, because nothing started here can be stopped again.
+        if (LaunchHandover.TryHandOver(this, out _successor))
+        {
+            _inactive = true;
+            return;
+        }
+
+        // By the build that runs the session, so other copies are named once and beside the
+        // version that is actually running.
+        DuplicateInstallGuard.ReportOtherCopies();
 
         // First, so every decision logged below is forwarded from the outset.
         _clientLogForwarder = new ClientLogForwarder();
@@ -313,6 +334,9 @@ public class Plugin : IPlugin
             sectorsMenuItem.Item.Name = SectorsMenuItemName;
         };
         Application.Idle += repositionUnderSectors;
+
+        // Last, so only a build that has started takes the older one's place in vatSys.
+        LaunchHandover.Complete(this);
     }
 #pragma warning restore CS8618
 
@@ -643,6 +667,12 @@ public class Plugin : IPlugin
 
     public void OnFDRUpdate(FDP2.FDR updated)
     {
+        if (_successor != null)
+        {
+            _successor.OnFDRUpdate(updated);
+            return;
+        }
+
         if (_inactive || OzServerMode.Disabled)
             return;
 
@@ -665,6 +695,12 @@ public class Plugin : IPlugin
 
     public void OnRadarTrackUpdate(RDP.RadarTrack updated)
     {
+        if (_successor != null)
+        {
+            _successor.OnRadarTrackUpdate(updated);
+            return;
+        }
+
         if (_inactive || OzServerMode.Disabled)
             return;
 
