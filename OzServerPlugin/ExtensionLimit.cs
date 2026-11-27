@@ -21,6 +21,9 @@ namespace OzServerPlugin;
 // press (AfvSectorClaimer.CheckActive), the Sectors window (OzServerSectorsWindow.StageSectorChange)
 // and a request (OzServerOwnershipTracker.RequestHeldSectorAsync). Never on a logon, a resume or a
 // handover the controller did not ask for, and never by taking anything away.
+//
+// Only for a controller logged on as a CTR or FSS position: any other logon (APP, TWR and the rest)
+// is not limited and its hours are never looked up.
 static class ExtensionLimit
 {
     const double ExperiencedHours = 150;
@@ -57,7 +60,7 @@ static class ExtensionLimit
             if (cid == 0)
                 await Task.Delay(500);
         }
-        if (cid == 0 || session != _session)
+        if (cid == 0 || session != _session || !AppliesToThisConnection)
             return;
 
         try
@@ -79,9 +82,14 @@ static class ExtensionLimit
         }
     }
 
-    public static bool IsEnroute(SectorsVolumes.Sector sector) =>
-        sector.Callsign is { } callsign
+    public static bool IsEnroute(SectorsVolumes.Sector sector) => IsEnrouteCallsign(sector.Callsign);
+
+    static bool IsEnrouteCallsign(string callsign) =>
+        callsign != null
         && (callsign.EndsWith("_CTR", StringComparison.OrdinalIgnoreCase) || callsign.EndsWith("_FSS", StringComparison.OrdinalIgnoreCase));
+
+    // Whether this session logged on as a CTR or FSS position, the only logons the limit applies to.
+    static bool AppliesToThisConnection => IsEnrouteCallsign(Network.Callsign);
 
     // The enroute positions among `held`: each sector not covered by another of them.
     public static List<SectorsVolumes.Sector> Positions(IEnumerable<SectorsVolumes.Sector> held)
@@ -94,9 +102,12 @@ static class ExtensionLimit
 
     // Whether adding `sector` to what is `held` stays within the limit. Anything that does not add
     // a position - TMA or tower airspace, a sector already covered, a group taking in positions
-    // already held - is always allowed.
+    // already held - is always allowed, as is anything for a logon that is not CTR or FSS.
     public static bool Allows(SectorsVolumes.Sector sector, IEnumerable<SectorsVolumes.Sector> held)
     {
+        if (!AppliesToThisConnection)
+            return true;
+
         var before = held.ToList();
         var after = Positions(before.Append(sector)).Count;
         return after <= MaxPositions || after <= Positions(before).Count;

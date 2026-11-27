@@ -17,6 +17,10 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
   still waits for a restart, and still offers one. The first update to arrive this way is the one
   after this release: it is the installed version that does it.
 
+- **The enroute sector limit only applies when you log on as a CTR or FSS position.** Logged on
+  as anything else (APP, TWR and the rest), you can add enroute sectors without the 4 or 6
+  extension limit, and your VATSIM hours at C1 and above are not looked up.
+
 ## [0.3.4] - 2026-11-27
 
 ### Fixed
