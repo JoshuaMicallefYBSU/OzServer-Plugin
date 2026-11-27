@@ -1639,6 +1639,7 @@ public class FdrSync
             return; // being re-parsed on vatSys's thread; the next update gets it
         }
 
+        var holds = Holds(segments);
         var points = new List<OzServerRoutePointDto>();
         var nextIndex = 0;
         for (var i = 0; i < segments.Count; i++)
@@ -1655,7 +1656,10 @@ public class FdrSync
             {
                 Name = segment.Intersection.Name ?? "",
                 Lat = Math.Round(segment.Intersection.LatLong.Latitude, 4),
-                Lon = Math.Round(segment.Intersection.LatLong.Longitude, 4)
+                Lon = Math.Round(segment.Intersection.LatLong.Longitude, 4),
+                Ato = RouteTime(segment.ATO),
+                Est = segment.IsPETO ? RouteTime(segment.ETO) : null,
+                Hold = holds.TryGetValue(i, out var hold) ? hold : null
             };
 
             // A sector crossing, not a waypoint: vatSys inserts a ZPOINT segment wherever the
@@ -1684,7 +1688,10 @@ public class FdrSync
 
         dto.RouteNextIndex = Math.Min(nextIndex, points.Count - 1);
 
-        var key = string.Join(";", points.Select(p => $"{p.Name},{p.Lat},{p.Lon},{p.Sector}"));
+        // The times too, so a new ATO, estimate or hold is sent - an estimate to the minute, as
+        // vatSys's strips show it.
+        var key = string.Join(";", points.Select(p =>
+            $"{p.Name},{p.Lat},{p.Lon},{p.Sector},{p.Ato:yyyyMMddHHmmss},{p.Est:yyyyMMddHHmm},{p.Hold}"));
         lock (_lock)
         {
             if (!force && _sentRouteKeys.TryGetValue(fdr.Callsign, out var sent) && sent == key)
@@ -1693,6 +1700,52 @@ public class FdrSync
         }
 
         dto.RoutePoints = points;
+        // BuildFdrDto has already worked out ClearanceKnown: the tracking controller, label adopted.
+        dto.RouteTimesKnown = fdr.IsTrackedByMe && dto.ClearanceKnown;
+    }
+
+    // A route time as vatSys keeps it, or null for its "none" (MinValue, MaxValue - see LandingTime).
+    // vatSys works in UTC; marked so, it is sent with its Z.
+    internal static DateTime? RouteTime(DateTime time) =>
+        time.Year > 2000 && time.Year < 3000 ? DateTime.SpecifyKind(time, DateTimeKind.Utc) : null;
+
+    // The holds on a route, as segment index of the hold fix -> seconds held there.
+    //
+    // vatSys keeps no record of a hold. Its Hold command (the waypoint menu, FDP2.Hold) sets an
+    // estimate at the hold fix (its own ETO) and another at the next waypoint (that one's ETO plus
+    // the hold), and disarms MPR on both, where an estimate on its own (FDP2.SetPETO) leaves MPR
+    // armed. SetPETO keeps the system's estimate in SETO whenever an estimate moves the time by
+    // 150 s or more. So a hold reads back as a waypoint not yet passed with an estimate, MPR
+    // disarmed, and that estimate at least 150 s after the system's: the hold is the difference,
+    // and its fix the nearest point before it with an estimate and MPR disarmed.
+    const double MinHoldSeconds = 150;
+
+    internal static Dictionary<int, int> Holds(IList<FDP2.FDR.ExtractedRoute.Segment> segments)
+    {
+        var holds = new Dictionary<int, int>();
+        for (var j = 1; j < segments.Count; j++)
+        {
+            var exit = segments[j];
+            if (exit == null || exit.Type != FDP2.FDR.ExtractedRoute.Segment.SegmentTypes.WAYPOINT
+                || !exit.IsPETO || exit.MPRArmed || RouteTime(exit.ATO) != null
+                || RouteTime(exit.ETO) is not { } eto || RouteTime(exit.SETO) is not { } seto)
+                continue;
+            var held = (eto - seto).TotalSeconds;
+            if (held < MinHoldSeconds)
+                continue;
+
+            for (var i = j - 1; i >= 0; i--)
+            {
+                var fix = segments[i];
+                if (fix == null || fix.Type == FDP2.FDR.ExtractedRoute.Segment.SegmentTypes.TRIAL || !fix.IsPETO)
+                    continue;
+                if (!fix.MPRArmed)
+                    holds[i] = (int)(Math.Round(held / 60) * 60);
+                break;
+            }
+        }
+
+        return holds;
     }
 
     // The estimate for the last point of the route - the landing time vatSys's own Arrival List

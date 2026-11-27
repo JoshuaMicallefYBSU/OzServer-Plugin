@@ -6,6 +6,15 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
 
 ## [Unreleased]
 
+### Added
+
+- **Times over waypoints, estimates and holds are saved to OzServer, and come back when you pick
+  a tag up.** Each route point now carries the time the aircraft passed it, any estimate set for
+  it (entered by a controller or received by EST), and a hold placed there with vatSys's Hold
+  command, with how long it is. When a tag becomes yours (on pickup, sector change or reconnect),
+  whatever your vatSys does not already have is put back: passed points, then holds, then
+  estimates. Nothing you already have is changed. The live map shows all of it.
+
 ## [0.3.5] - 2026-11-27
 
 ### Changed

@@ -356,6 +356,12 @@ public class OzServerFdrUpdateDto
     // route_points of the next waypoint to be flown, sent on every full FDR push.
     [JsonProperty("route_points")] public List<OzServerRoutePointDto>? RoutePoints { get; set; }
     [JsonProperty("route_next_index")] public int? RouteNextIndex { get; set; }
+    // Whether route_points' estimates and holds are stated as fact, so one left out is cleared:
+    // only from the tracking controller's client once it has put the record's times back
+    // (RouteTimesRestore, with the label). Otherwise the backend keeps the stored ones. Times over
+    // passed points are kept either way.
+    [JsonProperty("route_times_known")] public bool? RouteTimesKnown { get; set; }
+    public bool ShouldSerializeRouteTimesKnown() => RoutePoints != null && RouteTimesKnown == true;
 
     // The aerodromes' positions, from vatSys's airport data. The map shows an FDR that has not
     // departed at its departure aerodrome and a completed one at its destination; neither
@@ -396,6 +402,19 @@ public class OzServerRoutePointDto
     public bool ShouldSerializeVolume() => Volume != null;
     public bool ShouldSerializeSector() => Sector != null;
     public bool ShouldSerializeSectorCallsign() => SectorCallsign != null;
+
+    // The times vatSys keeps for this point (see FdrSync.FillRoute), each left out when it has none:
+    //   ato   when the aircraft passed it (Segment.ATO)
+    //   est   an estimate set for it (Segment.IsPETO, with its ETO): one a controller entered, one
+    //         received by EST, or either end of a hold
+    //   hold  on a hold fix, how long the aircraft holds there, in seconds (FdrSync.Holds)
+    // Put back on a tag this controller picks up by RouteTimesRestore.
+    [JsonProperty("ato")] public DateTime? Ato { get; set; }
+    [JsonProperty("est")] public DateTime? Est { get; set; }
+    [JsonProperty("hold")] public int? Hold { get; set; }
+    public bool ShouldSerializeAto() => Ato != null;
+    public bool ShouldSerializeEst() => Est != null;
+    public bool ShouldSerializeHold() => Hold != null;
 }
 
 // One airport's Arrival List (GET /arrivals/:ades, and the answer to a reorder) - see

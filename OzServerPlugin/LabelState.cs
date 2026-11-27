@@ -104,6 +104,10 @@ public static class LabelStateRestore
             }
         }
 
+        // Times over passed waypoints, estimates and holds - see RouteTimesRestore.
+        if (stored.RoutePoints is { Count: > 0 } points && RouteTimesRestore.Apply(fdr, points) is { } times)
+            applied.Add(times);
+
         return applied.Count > 0 ? string.Join(", ", applied) : null;
     }
 
