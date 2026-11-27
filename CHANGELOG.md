@@ -21,6 +21,13 @@ tagged `v<version>` on GitHub, and the plugin DLL's FileVersion is the same numb
   as anything else (APP, TWR and the rest), you can add enroute sectors without the 4 or 6
   extension limit, and your VATSIM hours at C1 and above are not looked up.
 
+### Fixed
+
+- **A cleared level taken off a tag came back as the flight's RFL on other scopes.** When the
+  controller tracking a tag set its CFL to NONE - an arrival cleared for the approach, say - every
+  other OzServer scope showed the label empty for a few seconds and then filled it with the
+  requested level, so an aircraft on final could show 360. The label now stays empty.
+
 ## [0.3.4] - 2026-11-27
 
 ### Fixed

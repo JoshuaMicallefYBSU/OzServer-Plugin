@@ -297,10 +297,18 @@ public sealed class LabelStateMirror
                     changed = true;
                 }
             }
-            else if (last.CflSeen)
+            else if (last.CflSeen && (fdr.CFLUpper != -1 || fdr.CFLLower != -1))
             {
-                // What vatSys itself does on being told a level was cleared (a TempAlt of 0).
-                FDP2.SetCFL(fdr, -1, fdr.RFL, fdr.CFLVisual, false);
+                // No cleared level, as the level menu's NONE leaves it (CFLMenu: SetCFL -1, -1) and
+                // as vatSys shows it on every other scope, which are sent that -1.
+                //
+                // Not the RFL. That is what vatSys does with a TempAlt of 0, but 0 is what it sends
+                // for a cleared level equal to the RFL (Network.SendCFL), not for none - and such a
+                // level reaches the record as a level. Set to the RFL, OCI325 showed 360 on final
+                // into YMML seconds after approach took its level off; and where the tag is tracked
+                // outside OzServer, FdrSync.FillOutsideLabel then reported that 360 as the tracking
+                // controller's own, so the record held it too.
+                FDP2.SetCFL(fdr, -1, -1, fdr.CFLVisual, false);
                 changed = true;
             }
             last.CflLower = record.CflLower;
